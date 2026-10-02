@@ -40,6 +40,7 @@ pub const CONTENT_SESSION_RESET_INIT: u8 = ContentType::SessionResetInit as u8;
 pub const CONTENT_SESSION_PING: u8 = ContentType::SessionPing as u8;
 /// A profile card riding beside a message; never a bubble (`framed_side_channel: contact_card`).
 pub const CONTENT_CONTACT_CARD: u8 = ContentType::ContactCard as u8;
+pub const CONTENT_PROFILE: u8 = ContentType::Profile as u8;
 /// "I could not read your message", answered by the core; never a bubble.
 pub const CONTENT_DECRYPTION_ERROR: u8 = ContentType::DecryptionError as u8;
 pub const CONTENT_SESSION_READY: u8 = ContentType::SessionReady as u8;
@@ -135,6 +136,7 @@ pub fn disposition(content_type: u8) -> Disposition {
         | CONTENT_SESSION_PING
         | CONTENT_SESSION_READY
         | CONTENT_CONTACT_CARD
+        | CONTENT_PROFILE
         | CONTENT_DECRYPTION_ERROR => Disposition::SilentControl,
         _ => Disposition::NotCarried,
     }
