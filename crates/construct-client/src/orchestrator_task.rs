@@ -561,6 +561,13 @@ async fn dispatch(
             // Calls not yet implemented in TUI.
         }
 
+        Action::ControlFrameDecrypted { content_type, .. } => {
+            // A silent control frame the core named (receipt, heartbeat, card, profile, retired
+            // ping/ready). The TUI handles none of them yet; it must only never show one, which
+            // it did until core 0.30 named them: each arrived as MessageDecrypted.
+            tracing::debug!(content_type, "control frame — not handled by the TUI");
+        }
+
         Action::MessageQueuedPendingInit { .. } => {}
 
         // ── Persistence ─────────────────────────────────────────────────────
