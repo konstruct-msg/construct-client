@@ -16,14 +16,13 @@
 //! Session ping: byte 5 = `SESSION_PING` (25), payload = `SessionControl` protobuf.
 
 use prost::Message;
-use uuid::Uuid;
 
 use crate::proto::core::v1::ContentType;
 use crate::proto::messaging::v1::{MessageContent, TextMessage, message_content};
 
-pub const MAGIC: &[u8; 4] = b"KNST";
-pub const VERSION: u8 = 0x01;
-pub const HEADER_SIZE: usize = 30;
+/// The header is the core's (`construct_core::knst`); its length is named here for the tests.
+#[cfg(test)]
+const HEADER_SIZE: usize = construct_core::knst::HEADER_LEN;
 
 /// Byte-5 values, derived from the generated enum rather than typed out again.
 ///
@@ -57,24 +56,17 @@ pub fn encode_text(text: &str, message_id: &str) -> Vec<u8> {
     frame_whole(&content.encode_to_vec(), CONTENT_E2EE_SIGNAL, message_id)
 }
 
-/// Single-frame KNST (never split). Matches iOS `ChunkedMessageCodec.frameWhole`.
+/// Single-frame KNST (never split) — the core's `knst::frame_whole`, the one writer of the frame
+/// for every client since core 0.31. A message id that is not a UUID frames as the nil id, as
+/// this function always has.
 pub fn frame_whole(payload: &[u8], content_type: u8, message_id: &str) -> Vec<u8> {
-    let uuid = Uuid::parse_str(message_id).unwrap_or_else(|_| Uuid::nil());
-    let mut out = Vec::with_capacity(HEADER_SIZE + payload.len());
-    out.extend_from_slice(MAGIC);
-    out.push(VERSION);
-    out.push(content_type);
-    out.extend_from_slice(uuid.as_bytes());
-    out.extend_from_slice(&0u16.to_be_bytes()); // chunk_index
-    out.extend_from_slice(&1u16.to_be_bytes()); // total_chunks
-    out.extend_from_slice(&(payload.len() as u32).to_be_bytes());
-    out.extend_from_slice(payload);
-    out
+    let id = construct_core::knst::message_id_bytes(message_id).unwrap_or([0; 16]);
+    construct_core::knst::frame_whole(payload, content_type, &id).unwrap_or_default()
 }
 
 /// True when `data` already has a KNST v1 header (do not double-wrap).
 pub fn is_frame(data: &[u8]) -> bool {
-    data.len() >= HEADER_SIZE && data.starts_with(MAGIC) && data[4] == VERSION
+    construct_core::knst::Frame::parse(data).is_some()
 }
 
 /// Displayable chat text from a decrypted plaintext buffer.
@@ -86,14 +78,14 @@ pub fn decode_text(plaintext: &[u8]) -> String {
     if !is_frame(plaintext) {
         return String::from_utf8_lossy(plaintext).into_owned();
     }
-    let content_type = plaintext[5];
-    if is_silent_type(content_type) {
+    let Some(frame) = construct_core::knst::Frame::parse(plaintext) else {
+        return String::from_utf8_lossy(plaintext).into_owned();
+    };
+    if is_silent_type(frame.content_type) {
         return String::new();
     }
-    let payload_len =
-        u32::from_be_bytes(plaintext[26..30].try_into().unwrap_or([0, 0, 0, 0])) as usize;
-    let raw = &plaintext[HEADER_SIZE..];
-    let payload = raw.get(..payload_len.min(raw.len())).unwrap_or(raw);
+    let length = (frame.plaintext_length as usize).min(frame.payload.len());
+    let payload = &frame.payload[..length];
 
     if let Ok(content) = MessageContent::decode(payload)
         && let Some(message_content::Content::Text(text_msg)) = content.content
@@ -149,6 +141,7 @@ fn is_silent_type(content_type: u8) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use uuid::Uuid;
 
     #[test]
     fn text_frame_round_trips() {
