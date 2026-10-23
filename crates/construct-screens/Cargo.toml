@@ -1,0 +1,26 @@
+[package]
+name = "construct-screens"
+description = "The Konstruct screens, drawn with Ratatui: one interface for the terminal and the desktop window"
+license = "MPL-2.0"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.96"
+repository = "https://github.com/konstruct-msg/construct-client"
+
+[features]
+default = ["post-quantum"]
+post-quantum = ["construct-client/post-quantum"]
+
+# A shell supplies the input and the surface; nothing here opens a terminal or a window.
+# Key types come through ratatui's crossterm re-export, so both shells name the same ones.
+[dependencies]
+construct-client = { path = "../construct-client" }
+ratatui = "0.30"
+qrcode = { version = "0.14", default-features = false }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+zeroize = { version = "1", features = ["std"] }
+uuid = { version = "1", features = ["v4"] }
+tracing = "0.1"
