@@ -384,6 +384,18 @@ impl App {
                 }
                 self.invite = Some(result);
             }
+            ClientEvent::LinkCode(code) => {
+                self.device_link.own_token = Some(code);
+                self.device_link.set_status(
+                    "On your phone: Konstruct → Settings → Devices → scan this code",
+                    false,
+                );
+            }
+            ClientEvent::LinkFailed(reason) => {
+                self.device_link.own_token = None;
+                self.device_link
+                    .set_status(format!("{reason}   Enter=show a new code"), true);
+            }
             ClientEvent::LoggedOut => self.reset_after_logout(),
             ClientEvent::Notice(text) => self.status = text,
         }
@@ -578,9 +590,10 @@ impl App {
             KeyCode::Char('c') if key.modifiers == KeyModifiers::CONTROL => {
                 self.running = false;
             }
-            // Tab switches to device-link flow
+            // Tab: link this device to an account on a phone — show a code for it to scan.
             KeyCode::Tab | KeyCode::BackTab => {
                 self.device_link = DeviceLinkScreen::new();
+                self.client.send(ClientCommand::LinkByQr);
                 self.screen = Screen::DeviceLink;
             }
             KeyCode::Enter => {
@@ -643,19 +656,38 @@ impl App {
     }
 
     fn handle_device_link(&mut self, key: KeyEvent) {
+        use crate::screens::device_link::DeviceLinkTab;
         match key.code {
-            KeyCode::Esc | KeyCode::Char('q') if key.modifiers == KeyModifiers::NONE => {
+            KeyCode::Esc => {
+                self.client.send(ClientCommand::CancelLink);
+                self.screen = Screen::Onboarding;
+            }
+            KeyCode::Char('q')
+                if key.modifiers == KeyModifiers::NONE
+                    && self.device_link.tab == DeviceLinkTab::Show =>
+            {
+                self.client.send(ClientCommand::CancelLink);
                 self.screen = Screen::Onboarding;
             }
             KeyCode::Char('c') if key.modifiers == KeyModifiers::CONTROL => {
                 self.running = false;
             }
-            KeyCode::Enter => {
+            KeyCode::Tab | KeyCode::BackTab => self.device_link.toggle_tab(),
+            // A code that failed or expired: show a new one.
+            KeyCode::Enter
+                if self.device_link.tab == DeviceLinkTab::Show
+                    && self.device_link.own_token.is_none() =>
+            {
+                self.device_link.set_status("Making a new code…", false);
+                self.client.send(ClientCommand::LinkByQr);
+            }
+            KeyCode::Enter if self.device_link.tab == DeviceLinkTab::Scan => {
                 let token = self.device_link.token.trim().to_string();
                 if token.is_empty() {
                     self.device_link
                         .set_status("Paste the link token first", true);
                 } else {
+                    self.client.send(ClientCommand::CancelLink);
                     self.device_link.clear_status();
                     self.client.send(ClientCommand::LinkDevice { token });
                     self.screen = Screen::Connecting("Confirming device link…".into());

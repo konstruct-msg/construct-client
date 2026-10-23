@@ -24,3 +24,7 @@ pub const KEY_SPK_AGE: &str = "/shared.proto.services.v1.KeyService/GetSignedPre
 pub const KEY_ROTATE_SPK: &str = "/shared.proto.services.v1.KeyService/RotateSignedPreKey";
 pub const MESSAGING_SEND: &str = "/shared.proto.services.v1.MessagingService/SendMessage";
 pub const AUTH_APPROVE_JOIN: &str = "/shared.proto.services.v1.AuthService/ApproveJoinRequest";
+pub const DEVICE_SUBMIT_JOIN: &str =
+    "/shared.proto.services.v1.DeviceLinkService/SubmitJoinRequest";
+pub const DEVICE_CHECK_JOIN: &str =
+    "/shared.proto.services.v1.DeviceLinkService/CheckJoinRequestStatus";

@@ -13,6 +13,9 @@
 //! `--approve <device id>` lets a device that asked to join (the `id` of its link code) become a
 //! device of this account — what the phone does when it scans the code.
 //!
+//! `--link` instead of `--username`: become a new device of an existing account — print the
+//! `konstruct://link-to-me` code for the phone to scan, then wait for its approval.
+//!
 //! `--find <username or invite link>` instead of `--add`: a username is looked up (only accounts
 //! that made themselves discoverable are found), an invite link is redeemed; either is added and
 //! sent to.
@@ -31,6 +34,8 @@ struct Args {
     add: Option<String>,
     find: Option<String>,
     send: Option<String>,
+    link: bool,
+    approve: Option<String>,
     wait_secs: u64,
 }
 
@@ -41,6 +46,8 @@ fn parse_args() -> Args {
         add: None,
         find: None,
         send: None,
+        link: false,
+        approve: None,
         wait_secs: 30,
     };
     let mut it = std::env::args().skip(1);
@@ -52,6 +59,8 @@ fn parse_args() -> Args {
             "--add" => args.add = Some(value()),
             "--find" => args.find = Some(value()),
             "--send" => args.send = Some(value()),
+            "--link" => args.link = true,
+            "--approve" => args.approve = Some(value()),
             "--wait" => args.wait_secs = value().parse().expect("--wait takes seconds"),
             other => panic!("unknown flag {other}"),
         }
@@ -92,7 +101,10 @@ async fn main() {
         };
         match event {
             ClientEvent::AuthFailed { reason, no_session } => {
-                if no_session && let Some(username) = &args.username {
+                if no_session && args.link {
+                    println!("LINKING");
+                    client.send(ClientCommand::LinkByQr);
+                } else if no_session && let Some(username) = &args.username {
                     println!("REGISTERING {username}");
                     client.send(ClientCommand::Register {
                         username: username.clone(),
@@ -163,6 +175,11 @@ async fn main() {
             ClientEvent::MessageQueued { message_id, .. } => println!("QUEUED {message_id}"),
             ClientEvent::RegistrationStep(step) => println!("STEP {step:?}"),
             ClientEvent::Notice(n) => println!("NOTICE {n}"),
+            ClientEvent::LinkCode(code) => {
+                started = true;
+                println!("LINK_CODE {code}");
+            }
+            ClientEvent::LinkFailed(e) => println!("LINK_FAILED {e}"),
             _ => {}
         }
     }

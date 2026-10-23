@@ -136,7 +136,7 @@ enum OrchestratorCommand {
 enum Outbound {
     /// To another account: sealed, on the connection without a token.
     Sealed {
-        inner: SealedInner,
+        inner: Box<SealedInner>,
         local_id: String,
     },
     /// A copy to one of our own devices: identified, on the authenticated connection.
@@ -827,7 +827,10 @@ impl Task {
         };
         let inner = sealing::sealed_inner(&account, device, body, content_type);
         self.sealed_tx
-            .send(Outbound::Sealed { inner, local_id })
+            .send(Outbound::Sealed {
+                inner: Box::new(inner),
+                local_id,
+            })
             .map_err(|_| "sealed sender worker stopped".to_string())
     }
 

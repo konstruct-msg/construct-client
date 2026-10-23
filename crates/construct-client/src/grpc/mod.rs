@@ -25,8 +25,9 @@ mod stream;
 pub(crate) mod users;
 
 pub use auth::{
-    authenticate_device, confirm_device_link, device_public_keys, get_pow_challenge, refresh_token,
-    register_device,
+    AuthTokens, JoinRequest, JoinStatus, approve_join_request, authenticate_device,
+    check_join_request, confirm_device_link, device_public_keys, get_pow_challenge, refresh_token,
+    register_device, submit_join_request,
 };
 pub use client::GrpcClient;
 pub use error::GrpcError;
