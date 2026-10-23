@@ -117,6 +117,8 @@ pub enum SessionState {
 }
 
 /// Detect what kind of session file exists without loading keys.
+/// What session file from before the local store is on disk. Read once, to move it in
+/// (`client::auth::migrate_legacy`).
 pub fn detect_session() -> SessionState {
     let Ok(path) = session_path() else {
         return SessionState::None;
@@ -138,7 +140,7 @@ pub fn detect_session() -> SessionState {
 
 /// Argon2id: passphrase + salt → 32-byte master key.
 /// Parameters tuned for Raspberry Pi 4 (32 MB memory, 3 iterations, 1 thread).
-fn derive_master_key(passphrase: &[u8], salt: &[u8]) -> Result<Zeroizing<[u8; 32]>> {
+pub(crate) fn derive_master_key(passphrase: &[u8], salt: &[u8]) -> Result<Zeroizing<[u8; 32]>> {
     let params =
         Params::new(32_768, 3, 1, Some(32)).map_err(|e| anyhow::anyhow!("Argon2 params: {e}"))?;
     let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
@@ -179,16 +181,6 @@ pub fn open_session_key(passphrase: &[u8]) -> Result<Option<SessionKey>> {
     Ok(Some(SessionKey { keys, master_salt }))
 }
 
-/// Create a **fresh** `SessionKey` for a brand-new account.
-/// Generates a random 16-byte master salt and derives all keys from it.
-pub fn create_session_key(passphrase: &[u8]) -> Result<SessionKey> {
-    let mut master_salt = [0u8; 16];
-    OsRng.fill_bytes(&mut master_salt);
-    let master = derive_master_key(passphrase, &master_salt)?;
-    let keys = derive_keys_from_master(&master)?;
-    Ok(SessionKey { keys, master_salt })
-}
-
 /// Read the Argon2id master salt from `session.enc` without decrypting the session.
 /// Used to derive keys before decryption.
 pub fn read_master_salt() -> Result<Option<[u8; 16]>> {
@@ -212,39 +204,6 @@ pub fn read_master_salt() -> Result<Option<[u8; 16]>> {
 }
 
 // ── Encryption helpers ─────────────────────────────────────────────────────────
-
-/// Save session encrypted with the provided `SessionKey`.
-/// Uses the `master_salt` from `sk` (constant per identity) and a fresh AES-GCM nonce.
-pub fn save_session_encrypted(session: &Session, sk: &SessionKey) -> Result<()> {
-    let mut nonce_bytes = [0u8; 12];
-    OsRng.fill_bytes(&mut nonce_bytes);
-
-    let cipher = Aes256Gcm::new_from_slice(sk.keys.session.as_ref())
-        .map_err(|_| anyhow::anyhow!("AES-GCM init failed"))?;
-
-    let mut plaintext = serde_json::to_vec(session)?;
-    let nonce = Nonce::from_slice(&nonce_bytes);
-    let ciphertext = cipher
-        .encrypt(nonce, plaintext.as_ref())
-        .map_err(|_| anyhow::anyhow!("AES-GCM encrypt failed"))?;
-    plaintext.zeroize();
-
-    let enc = EncryptedSession {
-        v: 1,
-        salt: B64.encode(sk.master_salt),
-        nonce: B64.encode(nonce_bytes),
-        ciphertext: B64.encode(ciphertext),
-    };
-
-    let path = session_path()?;
-    std::fs::write(&path, serde_json::to_string(&enc)?)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
-    }
-    Ok(())
-}
 
 /// Decrypt and load the session using the provided `SessionKey`.
 /// Returns `None` if the session file doesn't exist.
@@ -341,19 +300,6 @@ pub fn load_session() -> Result<Option<Session>> {
     }
     let data = std::fs::read_to_string(&path)?;
     Ok(Some(serde_json::from_str(&data)?))
-}
-
-pub fn save_session(session: &Session) -> Result<()> {
-    let path = session_path()?;
-    // Permissions: owner read/write only
-    let json = serde_json::to_string_pretty(session)?;
-    std::fs::write(&path, json)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
-    }
-    Ok(())
 }
 
 pub fn clear_session() -> Result<()> {

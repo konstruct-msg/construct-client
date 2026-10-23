@@ -2,7 +2,7 @@
 //! message stream is subscribed for.
 
 use super::{Client, ClientEvent, Inbox};
-use crate::storage::StoredContact;
+use crate::local_store::StoredContact;
 
 /// One FindUser hit.
 #[derive(Debug, Clone)]
@@ -88,7 +88,7 @@ impl Client {
 
     /// Store a person, subscribe the stream to them, and tell the orchestrator.
     pub(super) fn add_contact(&mut self, user_id: String, username: String) {
-        if let Some(ref storage) = self.read_storage {
+        if let Some(ref storage) = self.store {
             let _ = storage.upsert_contact(&StoredContact {
                 user_id: user_id.clone(),
                 display_name: username.clone(),
@@ -107,11 +107,7 @@ impl Client {
 
     /// Remove a person and their messages.
     pub(super) fn delete_contact(&mut self, peer_id: String) {
-        if let Some(Err(e)) = self
-            .read_storage
-            .as_ref()
-            .map(|s| s.delete_contact(&peer_id))
-        {
+        if let Some(Err(e)) = self.store.as_ref().map(|s| s.delete_contact(&peer_id)) {
             return self.emit(ClientEvent::Notice(format!("Delete failed: {e}")));
         }
         if let Some(ref orch) = self.orch_handle {
@@ -128,7 +124,7 @@ impl Client {
             return;
         };
         let stream_cursor = self
-            .read_storage
+            .store
             .as_ref()
             .and_then(|storage| storage.load_stream_cursor().ok().flatten());
         let _ = stream_tx.try_send(crate::streaming::StreamCmd::Subscribe(

@@ -11,7 +11,7 @@
 
 use std::collections::HashMap;
 
-use crate::storage::Storage;
+use crate::local_store::LocalStore;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PeerDevice {
@@ -25,7 +25,7 @@ pub struct PeerDevices {
 }
 
 impl PeerDevices {
-    pub fn load(storage: &Storage) -> Self {
+    pub fn load(storage: &LocalStore) -> Self {
         let rows = storage.peer_devices().unwrap_or_else(|e| {
             tracing::warn!(error = %e, "failed to load peer devices");
             Vec::new()
@@ -72,7 +72,7 @@ impl PeerDevices {
     /// supplied the pair could otherwise file their key under someone else's device.
     pub fn record(
         &mut self,
-        storage: &Storage,
+        storage: &LocalStore,
         user_id: &str,
         device_id: &str,
         identity_key: &[u8],
@@ -100,7 +100,7 @@ impl PeerDevices {
     /// (it just gave a bundle) stays even when the list omits it. Returns the dropped ids.
     pub fn reconcile(
         &mut self,
-        storage: &Storage,
+        storage: &LocalStore,
         user_id: &str,
         active_devices: &[String],
         keep: &[String],
@@ -108,22 +108,23 @@ impl PeerDevices {
         if active_devices.is_empty() {
             return Vec::new();
         }
-        let dropped: Vec<String> = self
-            .devices_of(user_id)
-            .into_iter()
-            .filter(|d| !active_devices.contains(d) && !keep.contains(d))
-            .collect();
+        let mut retained: Vec<String> = active_devices.to_vec();
+        retained.extend(keep.iter().cloned());
+        let dropped = storage
+            .retain_peer_devices(user_id, &retained)
+            .unwrap_or_else(|e| {
+                tracing::warn!(%user_id, error = %e, "failed to prune peer devices");
+                Vec::new()
+            });
         for device_id in &dropped {
-            self.forget(storage, device_id);
+            self.by_device.remove(device_id);
         }
         dropped
     }
 
-    pub fn forget(&mut self, storage: &Storage, device_id: &str) {
+    /// Drop `device_id` from memory. Its row goes with its contact (`LocalStore::delete_contact`).
+    pub fn forget(&mut self, device_id: &str) {
         self.by_device.remove(device_id);
-        if let Err(e) = storage.delete_peer_device(device_id) {
-            tracing::warn!(%device_id, error = %e, "failed to delete peer device");
-        }
     }
 }
 
@@ -140,7 +141,7 @@ mod tests {
 
     #[test]
     fn a_device_id_that_does_not_derive_from_its_key_is_refused() {
-        let storage = Storage::open_in_memory().unwrap();
+        let storage = LocalStore::open_in_memory().unwrap();
         let mut peers = PeerDevices::default();
         let (key_a, _) = key(1);
         let (_, id_b) = key(2);
@@ -152,7 +153,7 @@ mod tests {
 
     #[test]
     fn recorded_devices_survive_a_reload() {
-        let storage = Storage::open_in_memory().unwrap();
+        let storage = LocalStore::open_in_memory().unwrap();
         let mut peers = PeerDevices::default();
         let (key_a, id_a) = key(1);
         assert!(peers.record(&storage, "alice", &id_a, &key_a));
@@ -165,7 +166,7 @@ mod tests {
 
     #[test]
     fn reconcile_drops_inactive_devices_but_keeps_one_that_just_gave_a_bundle() {
-        let storage = Storage::open_in_memory().unwrap();
+        let storage = LocalStore::open_in_memory().unwrap();
         let mut peers = PeerDevices::default();
         let (key_a, id_a) = key(1);
         let (key_b, id_b) = key(2);
@@ -191,7 +192,7 @@ mod tests {
 
     #[test]
     fn an_empty_active_list_prunes_nothing() {
-        let storage = Storage::open_in_memory().unwrap();
+        let storage = LocalStore::open_in_memory().unwrap();
         let mut peers = PeerDevices::default();
         let (key_a, id_a) = key(1);
         peers.record(&storage, "alice", &id_a, &key_a);

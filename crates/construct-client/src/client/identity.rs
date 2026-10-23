@@ -18,7 +18,7 @@ impl Client {
             return self.emit(ClientEvent::Notice("Identity key not available".into()));
         };
         let theirs = self
-            .read_storage
+            .store
             .as_ref()
             .and_then(|s| s.get_contact_by_id(&contact_id).ok().flatten())
             .filter(|c| !c.identity_key_b64.is_empty())

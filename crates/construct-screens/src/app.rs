@@ -18,7 +18,7 @@ use construct_client::{
     FindStarted,
     bridge::BridgeEvent,
     config::{SessionState, TransportConfig},
-    storage::StoredContact,
+    local_store::StoredContact,
 };
 
 use crate::{

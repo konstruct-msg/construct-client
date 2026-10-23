@@ -14,12 +14,12 @@ use tracing::{debug, info, warn};
 
 use crate::grpc::framing::{decode_frame, encode_frame};
 use crate::grpc::{GrpcClient, open_message_stream};
+use crate::local_store::LocalStore;
 use crate::proto::core::v1::{Envelope, envelope::MessageIdType};
 use crate::proto::services::v1::{
     Heartbeat, MessageStreamRequest, MessageStreamResponse, SubscribeRequest,
     message_stream_request, message_stream_response,
 };
-use crate::storage::Storage;
 
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(25);
 
@@ -75,7 +75,7 @@ pub struct CursorTracker {
 }
 
 impl CursorTracker {
-    pub fn load(storage: &Storage) -> Self {
+    pub fn load(storage: &LocalStore) -> Self {
         let committed = storage.load_stream_cursor().ok().flatten();
         Self {
             committed: Arc::new(Mutex::new(committed)),
@@ -96,7 +96,7 @@ impl CursorTracker {
         }
     }
 
-    pub fn commit(&self, storage: &Storage, message_id: &str) {
+    pub fn commit(&self, storage: &LocalStore, message_id: &str) {
         let cursor = self
             .pending
             .lock()
@@ -106,11 +106,11 @@ impl CursorTracker {
     }
 
     #[allow(dead_code)]
-    pub fn commit_direct(&self, storage: &Storage, cursor: Option<String>) {
+    pub fn commit_direct(&self, storage: &LocalStore, cursor: Option<String>) {
         self.persist(storage, cursor.filter(|c| !c.is_empty()));
     }
 
-    fn persist(&self, storage: &Storage, cursor: Option<String>) {
+    fn persist(&self, storage: &LocalStore, cursor: Option<String>) {
         let Some(cursor) = cursor else {
             return;
         };

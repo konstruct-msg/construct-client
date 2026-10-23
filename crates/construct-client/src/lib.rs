@@ -14,12 +14,13 @@ pub mod config;
 mod grpc;
 mod invite;
 mod knst;
+mod local_data;
+pub mod local_store;
 mod orchestrator_task;
 mod peers;
 mod prekeys;
 mod proto;
 mod sealing;
-pub mod storage;
 mod streaming;
 mod trust;
 

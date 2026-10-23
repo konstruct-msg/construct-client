@@ -29,6 +29,10 @@ strips `Co-authored-by` lines; that is intended. The pre-push hook runs fmt and 
 - **Everything handed to the core is a device id; everything shown or addressed on the server is
   an account id.** `peers.rs` is the one map between them.
 - **Every send to another account is sealed.** There is no unsealed send path.
+- **The local store is `construct-store`'s; this repository has no schema.** `local_store.rs` maps
+  the client's calls onto it, `local_data.rs` owns the directory: one process at a time
+  (`konstruct.lock`), the store key in the OS key store, else from a passphrase (Argon2id, salt
+  beside the database), else a key file (`--no-encrypt`). Logout wipes the store and its key.
 
 ## Working rules
 
