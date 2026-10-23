@@ -124,7 +124,12 @@ mod tests {
     #[test]
     fn a_copy_without_the_routing_header_is_not_placed() {
         let plaintext =
-            crate::knst::frame_whole(b"just text", crate::knst::CONTENT_SENDER_SYNC, ID);
+            // Longer than the header, so only the magic can tell it is not one.
+            crate::knst::frame_whole(
+                b"a sender from before the routing header",
+                crate::knst::CONTENT_SENDER_SYNC,
+                ID,
+            );
         assert_eq!(read(&plaintext), Copy::Unsupported("no routing header"));
     }
 

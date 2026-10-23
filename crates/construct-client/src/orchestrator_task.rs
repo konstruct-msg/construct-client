@@ -39,8 +39,8 @@ use crate::proto::core::v1::{ContentType, Envelope, SealedInner, envelope::Messa
 use crate::sealing::{self, Opened, SealedBody};
 use crate::streaming::CursorTracker;
 
-/// How long the account's own device set is trusted before it is asked again.
-const OWN_DEVICES_RECHECK: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+/// How long an account's device set is trusted before it is asked again.
+const DEVICES_RECHECK: std::time::Duration = std::time::Duration::from_secs(10 * 60);
 
 /// A certificate this close to its expiry is fetched again before it is used.
 const CERTIFICATE_REFRESH_AHEAD_SECS: i64 = 5 * 60;
@@ -267,8 +267,8 @@ struct Task {
     /// `peers` once the session opens from them, and the address a DECRYPTION_ERROR goes back
     /// to if it does not.
     pending_certificates: HashMap<String, (String, Vec<u8>)>,
-    /// When the account's own device set was last asked of the server.
-    own_devices_checked: Option<tokio::time::Instant>,
+    /// When each account's device set was last asked of the server.
+    devices_checked: HashMap<String, tokio::time::Instant>,
 }
 
 impl Task {
@@ -301,7 +301,7 @@ impl Task {
             peers,
             certificate: None,
             pending_certificates: HashMap::new(),
-            own_devices_checked: None,
+            devices_checked: HashMap::new(),
         }
     }
 
@@ -664,26 +664,43 @@ impl Task {
             .collect()
     }
 
-    /// The devices of `account` a message goes to, each with a session. Devices without one get
-    /// a bundle from the server (all of the account's when none is known yet) and a session
-    /// opened from it. A device whose session cannot be opened is left out with a warning.
+    /// The devices of `account` a message goes to, each with a session (see `refresh_devices`).
     async fn recipient_devices(&mut self, account: &str) -> Result<Vec<String>, String> {
+        self.refresh_devices(account).await?;
+        Ok(self
+            .peers
+            .devices_of(account)
+            .into_iter()
+            .filter(|d| *d != self.identity.device_id && self.orchestrator.has_active_session(d))
+            .collect())
+    }
+
+    /// Bring `account`'s device set up to date and give each device a session.
+    ///
+    /// The set is asked of the server when nothing is known, when a known device has no session,
+    /// or every `DEVICES_RECHECK` — a device the account gained since (a desktop linked to the
+    /// phone) is otherwise never written to. That ask spends no one-time prekeys; only devices
+    /// that need a session are asked again for a bundle that does.
+    async fn refresh_devices(&mut self, account: &str) -> Result<(), String> {
         let known = self.peers.devices_of(account);
-        let missing: Vec<String> = known
-            .iter()
-            .filter(|d| !self.orchestrator.has_session_for_sending(d))
-            .cloned()
-            .collect();
-        if known.is_empty() || !missing.is_empty() {
-            let fetched = crate::grpc::get_pre_key_bundles(&self.grpc, account, missing, true)
-                .await
-                .map_err(|e| format!("GetPreKeyBundles: {e}"))?;
-            let fetched_ids: Vec<String> = fetched
-                .bundles
-                .iter()
-                .map(|b| b.device_id.clone())
-                .collect();
-            for bundle in &fetched.bundles {
+        let missing = known.iter().any(|d| {
+            *d != self.identity.device_id && !self.orchestrator.has_session_for_sending(d)
+        });
+        let stale = self
+            .devices_checked
+            .get(account)
+            .is_none_or(|at| at.elapsed() >= DEVICES_RECHECK);
+        if !known.is_empty() && !missing && !stale {
+            return Ok(());
+        }
+        self.devices_checked
+            .insert(account.to_string(), tokio::time::Instant::now());
+        let listed = crate::grpc::get_pre_key_bundles(&self.grpc, account, Vec::new(), false)
+            .await
+            .map_err(|e| format!("GetPreKeyBundles: {e}"))?;
+        let listed_ids: Vec<String> = listed.bundles.iter().map(|b| b.device_id.clone()).collect();
+        for bundle in &listed.bundles {
+            if bundle.device_id != self.identity.device_id {
                 self.peers.record(
                     &self.storage,
                     account,
@@ -691,31 +708,34 @@ impl Task {
                     &bundle.bundle.x3dh.identity_public,
                 );
             }
-            let dropped = self.peers.reconcile(
-                &self.storage,
-                account,
-                &fetched.active_devices,
-                &fetched_ids,
-            );
-            if !dropped.is_empty() {
-                tracing::info!(%account, ?dropped, "devices no longer active");
-            }
-            for bundle in fetched.bundles {
-                if self.orchestrator.has_session_for_sending(&bundle.device_id) {
-                    continue;
-                }
-                let device = bundle.device_id.clone();
-                if let Err(e) = self.open_session(bundle).await {
-                    tracing::warn!(%account, %device, error = %e, "device left out of the send");
-                }
-            }
         }
-        Ok(self
+        let dropped =
+            self.peers
+                .reconcile(&self.storage, account, &listed.active_devices, &listed_ids);
+        if !dropped.is_empty() {
+            tracing::info!(%account, ?dropped, "devices no longer active");
+        }
+        let need: Vec<String> = self
             .peers
             .devices_of(account)
             .into_iter()
-            .filter(|d| self.orchestrator.has_active_session(d))
-            .collect())
+            .filter(|d| {
+                *d != self.identity.device_id && !self.orchestrator.has_session_for_sending(d)
+            })
+            .collect();
+        if need.is_empty() {
+            return Ok(());
+        }
+        let fetched = crate::grpc::get_pre_key_bundles(&self.grpc, account, need, true)
+            .await
+            .map_err(|e| format!("GetPreKeyBundles: {e}"))?;
+        for bundle in fetched.bundles {
+            let device = bundle.device_id.clone();
+            if let Err(e) = self.open_session(bundle).await {
+                tracing::warn!(%account, %device, error = %e, "device left out of the send");
+            }
+        }
+        Ok(())
     }
 
     /// Open an INITIATOR session with a fetched bundle's device.
@@ -955,48 +975,11 @@ impl Task {
         }
     }
 
-    /// Our other devices, each with a session. The set is asked of the server at most every ten
-    /// minutes; a single-device account then costs one request per ten minutes, not one per send.
+    /// Our other devices, each with a session (see `refresh_devices`).
     async fn own_siblings(&mut self) -> Vec<String> {
         let me = self.identity.user_id.clone();
-        let fresh = self
-            .own_devices_checked
-            .is_some_and(|at| at.elapsed() < OWN_DEVICES_RECHECK);
-        if !fresh {
-            self.own_devices_checked = Some(tokio::time::Instant::now());
-            match crate::grpc::get_pre_key_bundles(&self.grpc, &me, Vec::new(), false).await {
-                Ok(fetched) => {
-                    let ids: Vec<String> = fetched
-                        .bundles
-                        .iter()
-                        .map(|b| b.device_id.clone())
-                        .collect();
-                    for bundle in &fetched.bundles {
-                        if bundle.device_id != self.identity.device_id {
-                            self.peers.record(
-                                &self.storage,
-                                &me,
-                                &bundle.device_id,
-                                &bundle.bundle.x3dh.identity_public,
-                            );
-                        }
-                    }
-                    self.peers
-                        .reconcile(&self.storage, &me, &fetched.active_devices, &ids);
-                    for bundle in fetched.bundles {
-                        if bundle.device_id == self.identity.device_id
-                            || self.orchestrator.has_session_for_sending(&bundle.device_id)
-                        {
-                            continue;
-                        }
-                        let device = bundle.device_id.clone();
-                        if let Err(e) = self.open_session(bundle).await {
-                            tracing::warn!(%device, error = %e, "own device left out of copies");
-                        }
-                    }
-                }
-                Err(e) => tracing::warn!(error = %e, "own device set unavailable"),
-            }
+        if let Err(e) = self.refresh_devices(&me).await {
+            tracing::warn!(error = %e, "own device set unavailable");
         }
         self.peers
             .devices_of(&me)
@@ -1633,7 +1616,7 @@ mod tests {
 
         task.adopt_writer(writer);
         task.adopt_writer(writer);
-        task.adopt_writer("alice"); // ourselves
+        task.adopt_writer(OWN_ACCOUNT); // ourselves
         task.adopt_writer("bob-device"); // not an account id
 
         assert!(matches!(
@@ -1818,6 +1801,8 @@ mod tests {
         )
     }
 
+    const OWN_ACCOUNT: &str = "753f79af-ede4-432c-9fcd-41deb5a35f0e";
+
     fn test_task() -> Task {
         let client = ClassicClient::<ClassicSuiteProvider>::new()
             .expect("test ClassicClient should initialize");
@@ -1836,7 +1821,7 @@ mod tests {
             cursor,
             Vec::new(),
             LocalIdentity {
-                user_id: "alice".into(),
+                user_id: OWN_ACCOUNT.into(),
                 device_id: "device-a".into(),
                 identity_secret: vec![1u8; 32],
                 signing_secret: vec![2u8; 32],
