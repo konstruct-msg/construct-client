@@ -143,6 +143,10 @@ pub struct LocalIdentity {
     pub device_id: String,
     /// X25519 identity secret, to open a certificate box (`sealing::open_sealed_inner`).
     pub identity_secret: Vec<u8>,
+    /// Ed25519 signing secret, to bind the hybrid identity when prekeys are published.
+    pub signing_secret: Vec<u8>,
+    /// A saved prekey blob was missing: the server's one-time prekeys are replaced.
+    pub replace_prekeys: bool,
 }
 
 /// Spawn the orchestrator task and return a handle to it.
@@ -283,6 +287,11 @@ impl Task {
         mut rx: mpsc::UnboundedReceiver<IncomingEvent>,
         mut cmd_rx: mpsc::UnboundedReceiver<OrchestratorCommand>,
     ) {
+        // Before anything is sent: a peer can open a session only to prekeys the server holds.
+        if let Err(e) = self.publish_prekeys().await {
+            tracing::error!(error = %e, "prekey publish failed");
+            self.ui_error(format!("[PREKEYS] {e}"));
+        }
         loop {
             tokio::select! {
                 maybe_cmd = cmd_rx.recv() => {
@@ -297,6 +306,30 @@ impl Task {
                 }
             }
         }
+    }
+
+    async fn publish_prekeys(&mut self) -> Result<(), String> {
+        let Some(publish) = crate::prekeys::prepare_publish(
+            &mut self.orchestrator,
+            &self.storage,
+            &self.identity.device_id,
+            &self.identity.signing_secret,
+            self.identity.replace_prekeys,
+        )?
+        else {
+            return Ok(());
+        };
+        let (upload, kyber_spk_id, rotating) = publish.into_parts();
+        let result =
+            crate::grpc::upload_prekeys_full(&self.grpc, &self.identity.device_id, upload).await;
+        crate::prekeys::finish_publish(
+            &mut self.orchestrator,
+            &self.storage,
+            &self.identity.device_id,
+            kyber_spk_id,
+            rotating,
+            result,
+        )
     }
 
     /// Hand `event` to the core and carry out everything it answers, including the events those
@@ -834,6 +867,10 @@ impl Task {
                     tracing::warn!(%contact_id, "trusted server key is required to open receiving session");
                 }
                 if let Some(device) = &opened.opened_device {
+                    crate::prekeys::save_after_responder_init(
+                        &mut self.orchestrator,
+                        &self.storage,
+                    );
                     match self.pending_certificates.remove(device) {
                         Some((account, key)) => {
                             self.peers.record(&self.storage, &account, device, &key);
@@ -1408,6 +1445,8 @@ mod tests {
             LocalIdentity {
                 device_id: "device-a".into(),
                 identity_secret: vec![1u8; 32],
+                signing_secret: vec![2u8; 32],
+                replace_prekeys: false,
             },
             self_tx,
         )

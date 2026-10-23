@@ -14,10 +14,7 @@ impl Client {
         use crate::orchestrator_task::spawn_orchestrator_task;
         use crate::storage::Storage;
         use crate::streaming::{CursorTracker, spawn_stream_worker};
-        use construct_core::{
-            crypto::{client_api::ClassicClient, suites::classic::ClassicSuiteProvider},
-            orchestration::orchestrator::Orchestrator,
-        };
+        use construct_core::orchestration::orchestrator::Orchestrator;
 
         let decode = |hex_str: &str| {
             hex::decode(hex_str).map_err(|e| format!("Orchestrator key decode error: {e}"))
@@ -31,16 +28,7 @@ impl Client {
         // Ratchet decryption still happens inside the orchestrator.
         let identity_secret_for_sealed = identity_secret.clone();
 
-        let core_client = ClassicClient::<ClassicSuiteProvider>::from_keys(
-            identity_secret,
-            signing_secret,
-            spk_secret,
-            spk_sig,
-        )
-        .map_err(|e| format!("Orchestrator init error: {e}"))?;
-        // The core's id for us is this device's, as every peer's core knows us: it enters the ratchet's
-        // associated data and the envelope keys (iOS passes the same, `SessionAddressing.localIdentity`).
-        let mut orchestrator = Orchestrator::new(core_client, self.device_id.clone());
+        let signing_secret_for_prekeys = signing_secret.clone();
 
         // Two connections: the orchestrator writes, queries read.
         let (storage, read_storage) = if let Some(ref sk) = self.session_key {
@@ -53,6 +41,21 @@ impl Client {
             (Ok(s1), Ok(s2)) => (s1, s2),
             (Err(e), _) | (_, Err(e)) => return Err(format!("Storage open error: {e}")),
         };
+
+        let core_client = crate::prekeys::restore_client(
+            &storage,
+            identity_secret,
+            signing_secret,
+            spk_secret,
+            spk_sig,
+        )
+        .map_err(|e| format!("Orchestrator init error: {e}"))?;
+        // The core's id for us is this device's, as every peer's core knows us: it enters the
+        // ratchet's associated data and the envelope keys (iOS passes the same,
+        // `SessionAddressing.localIdentity`).
+        let mut orchestrator = Orchestrator::new(core_client, self.device_id.clone());
+        let prekeys_whole = crate::prekeys::restore_prekeys(&mut orchestrator, &storage)
+            .map_err(|e| format!("Prekey restore error: {e}"))?;
 
         let contacts = read_storage.get_contacts().unwrap_or_else(|e| {
             tracing::warn!("Failed to load contacts: {e}");
@@ -91,8 +94,7 @@ impl Client {
             }
         }
 
-        // OTPKs and our identity key before the orchestrator moves into its task.
-        let otpks = orchestrator.generate_otpks(100).unwrap_or_default();
+        // Our identity key before the orchestrator moves into its task.
         self.our_identity_key = orchestrator
             .get_registration_bundle_fields()
             .ok()
@@ -120,6 +122,8 @@ impl Client {
             crate::orchestrator_task::LocalIdentity {
                 device_id: self.device_id.clone(),
                 identity_secret: identity_secret_for_sealed,
+                signing_secret: signing_secret_for_prekeys,
+                replace_prekeys: !prekeys_whole,
             },
         );
         {
@@ -137,18 +141,6 @@ impl Client {
         // AppLaunched triggers the session GC / prewarm sweep.
         orch_handle.send(construct_core::orchestration::actions::IncomingEvent::AppLaunched);
         self.orch_handle = Some(orch_handle.clone());
-
-        if !otpks.is_empty() {
-            tracing::info!("OTPKs generated: {} keys", otpks.len());
-            let did = self.device_id.clone();
-            let grpc = self.grpc.clone();
-            tokio::spawn(async move {
-                grpc.set_device_id(Some(did.clone()));
-                if let Err(e) = crate::grpc::upload_pre_keys(&grpc, &did, otpks, false).await {
-                    tracing::warn!("OTPK upload failed: {e}");
-                }
-            });
-        }
 
         inbound::spawn_relay(
             stream_rx,

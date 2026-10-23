@@ -7,8 +7,8 @@ use prost::Message;
 
 use crate::proto::core::v1::CryptoSuite;
 use crate::proto::services::v1::{
-    GetPreKeyBundlesRequest, GetPreKeyBundlesResponse, OneTimePreKey, PreKeyBundle,
-    UploadPreKeysRequest, UploadPreKeysResponse,
+    GetPreKeyBundlesRequest, GetPreKeyBundlesResponse, KyberOneTimePreKey, KyberSignedPreKeyUpload,
+    OneTimePreKey, PreKeyBundle, UploadPreKeysRequest, UploadPreKeysResponse,
 };
 
 use super::client::GrpcClient;
@@ -103,23 +103,59 @@ fn fetched_bundle(
     })
 }
 
-pub async fn upload_pre_keys(
+/// Everything a device publishes beside its registration: one-time prekeys of both kinds, the
+/// Kyber signed prekey, and the hybrid identity with the signatures binding it.
+pub struct PrekeyUpload {
+    pub one_time: Vec<(u32, Vec<u8>)>,
+    pub kyber_one_time: Vec<construct_core::crypto::kyber_prekeys::KyberPrekeyUpload>,
+    pub kyber_spk: construct_core::crypto::kyber_prekeys::KyberPrekeyUpload,
+    pub hybrid_identity: Vec<u8>,
+    /// Ed25519 by the device signing key over `build_hybrid_identity_bind_message`.
+    pub hybrid_identity_signature: Vec<u8>,
+    /// The hybrid key over the classic signed prekey (`sign_hybrid_prekey`).
+    pub signed_pre_key_hybrid_signature: Vec<u8>,
+}
+
+/// `UploadPreKeys` replacing the server's one-time prekeys with these, as iOS publishes after
+/// registration (`KyberPrekeyService.publish`). The Kyber SPK's hybrid signature goes in field
+/// 17, not inside field 13.
+pub async fn upload_prekeys_full(
     client: &GrpcClient,
     device_id: &str,
-    keys: Vec<(u32, Vec<u8>)>,
-    replace_existing: bool,
-) -> Result<u32, GrpcError> {
-    let pre_keys = keys
-        .into_iter()
-        .map(|(key_id, public_key)| OneTimePreKey {
-            key_id,
-            public_key: public_key.into(),
-        })
-        .collect();
+    upload: PrekeyUpload,
+) -> Result<(), GrpcError> {
     let req = UploadPreKeysRequest {
         device_id: device_id.to_string(),
-        pre_keys,
-        replace_existing,
+        pre_keys: upload
+            .one_time
+            .into_iter()
+            .map(|(key_id, public_key)| OneTimePreKey {
+                key_id,
+                public_key: public_key.into(),
+            })
+            .collect(),
+        replace_existing: true,
+        kyber_pre_keys: upload
+            .kyber_one_time
+            .into_iter()
+            .map(|k| KyberOneTimePreKey {
+                key_id: k.key_id,
+                public_key: k.public_key.into(),
+                signature: k.signature.into(),
+                created_at: k.created_at,
+                hybrid_signature: k.hybrid_signature.into(),
+            })
+            .collect(),
+        kyber_signed_pre_key: Some(KyberSignedPreKeyUpload {
+            key_id: upload.kyber_spk.key_id,
+            public_key: upload.kyber_spk.public_key.into(),
+            signature: upload.kyber_spk.signature.into(),
+            created_at: upload.kyber_spk.created_at,
+        }),
+        hybrid_identity_key: Some(upload.hybrid_identity.into()),
+        hybrid_identity_signature: Some(upload.hybrid_identity_signature.into()),
+        signed_pre_key_hybrid_signature: Some(upload.signed_pre_key_hybrid_signature.into()),
+        kyber_signed_pre_key_hybrid_signature: Some(upload.kyber_spk.hybrid_signature.into()),
         ..Default::default()
     };
     let bytes = client
@@ -127,7 +163,10 @@ pub async fn upload_pre_keys(
         .await?;
     let resp = UploadPreKeysResponse::decode(bytes.as_slice())
         .map_err(|e| GrpcError::transport(format!("UploadPreKeys decode: {e}")))?;
-    Ok(resp.pre_key_count)
+    if !resp.success {
+        return Err(GrpcError::transport("UploadPreKeys: not accepted"));
+    }
+    Ok(())
 }
 
 fn bundle_to_x3dh(bundle: PreKeyBundle, verifying_key: Vec<u8>) -> X3DHPublicKeyBundle {
