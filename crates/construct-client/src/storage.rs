@@ -134,6 +134,22 @@ impl Storage {
                 created_at INTEGER NOT NULL DEFAULT (unixepoch())
             );
             CREATE INDEX IF NOT EXISTS idx_records_table ON records(table_name);
+
+            -- The seam between the server's accounts and the core's devices: which device belongs
+            -- to which account, under which X25519 identity key (decisions/a-peer-is-a-set-of-devices).
+            CREATE TABLE IF NOT EXISTS peer_devices (
+                device_id    TEXT PRIMARY KEY NOT NULL,
+                user_id      TEXT NOT NULL,
+                identity_key BLOB NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_peer_devices_user ON peer_devices(user_id);
+
+            -- The id the server gave a message we sent -> our id for it. A delivery receipt names
+            -- the server's.
+            CREATE TABLE IF NOT EXISTS server_message_ids (
+                server_id  TEXT PRIMARY KEY NOT NULL,
+                local_id   TEXT NOT NULL
+            );
         ",
         )?;
 
@@ -296,6 +312,59 @@ impl Storage {
             |row| row.get(0),
         )?;
         Ok(count > 0)
+    }
+
+    // ── Peer devices ──────────────────────────────────────────────────────────
+
+    /// File `device_id` under `user_id`. The id must derive from `identity_key`; the caller
+    /// checked it (a bundle, or a certificate a session opened from).
+    pub fn upsert_peer_device(
+        &self,
+        user_id: &str,
+        device_id: &str,
+        identity_key: &[u8],
+    ) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO peer_devices (device_id, user_id, identity_key)
+             VALUES (?1, ?2, ?3)",
+            params![device_id, user_id, identity_key],
+        )?;
+        Ok(())
+    }
+
+    /// Every filed device: `(user_id, device_id, identity_key)`.
+    pub fn peer_devices(&self) -> Result<Vec<(String, String, Vec<u8>)>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT user_id, device_id, identity_key FROM peer_devices")?;
+        let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    pub fn delete_peer_device(&self, device_id: &str) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM peer_devices WHERE device_id = ?1",
+            params![device_id],
+        )?;
+        Ok(())
+    }
+
+    // ── Server message ids ────────────────────────────────────────────────────
+
+    pub fn record_server_message_id(&self, server_id: &str, local_id: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO server_message_ids (server_id, local_id) VALUES (?1, ?2)",
+            params![server_id, local_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn local_message_id(&self, server_id: &str) -> Result<Option<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT local_id FROM server_message_ids WHERE server_id = ?1")?;
+        let mut rows = stmt.query(params![server_id])?;
+        Ok(rows.next()?.map(|r| r.get(0)).transpose()?)
     }
 
     // ── Contact / message deletion ───────────────────────────────────────────

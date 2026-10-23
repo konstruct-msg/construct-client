@@ -8,7 +8,6 @@ use prost::Message;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
-use crate::proto::core::v1::Envelope;
 use crate::proto::services::v1::{MessageStreamRequest, SubscribeRequest, message_stream_request};
 
 use super::client::{GrpcClient, apply_auth_headers, check_grpc_status, send_h2_data};
@@ -30,15 +29,6 @@ impl MessageStream {
             .send(frame)
             .await
             .map_err(|_| GrpcError::transport("MessageStream send channel closed"))
-    }
-
-    pub async fn send_envelope(&self, envelope: Envelope) -> Result<(), GrpcError> {
-        let req = MessageStreamRequest {
-            request: Some(message_stream_request::Request::Send(envelope)),
-            request_id: uuid_v4(),
-            attempt_id: None,
-        };
-        self.send_frame(encode_frame(&req.encode_to_vec())).await
     }
 }
 

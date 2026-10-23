@@ -15,3 +15,8 @@ pub const KEY_COUNT: &str = "/shared.proto.services.v1.KeyService/GetPreKeyCount
 pub const MESSAGING_STREAM: &str = "/shared.proto.services.v1.MessagingService/MessageStream";
 pub const USER_FIND: &str = "/shared.proto.services.v1.UserService/FindUser";
 pub const INVITE_ACCEPT: &str = "/shared.proto.services.v1.InviteService/AcceptInvite";
+pub const KEY_GET_BUNDLES: &str = "/shared.proto.services.v1.KeyService/GetPreKeyBundles";
+pub const AUTH_SENDER_CERT: &str = "/shared.proto.services.v1.AuthService/GetSenderCertificate";
+pub const MESSAGING_SEND_SEALED: &str =
+    "/shared.proto.services.v1.MessagingService/SendSealedMessage";
+pub const SERVER_TRUST: &str = "/shared.proto.services.v1.ServerTrustService/GetServerTrust";

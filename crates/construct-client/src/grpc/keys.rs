@@ -7,8 +7,8 @@ use prost::Message;
 
 use crate::proto::core::v1::CryptoSuite;
 use crate::proto::services::v1::{
-    GetPreKeyBundleRequest, GetPreKeyBundleResponse, OneTimePreKey, UploadPreKeysRequest,
-    UploadPreKeysResponse,
+    GetPreKeyBundlesRequest, GetPreKeyBundlesResponse, OneTimePreKey, PreKeyBundle,
+    UploadPreKeysRequest, UploadPreKeysResponse,
 };
 
 use super::client::GrpcClient;
@@ -20,24 +20,53 @@ pub struct FetchedPreKeyBundle {
     pub device_id: String,
 }
 
-pub async fn get_pre_key_bundle(
+/// The bundles of an account's devices — of `device_ids` only, or of every device when empty —
+/// and the devices the server counts as active (`GetPreKeyBundlesResponse.active_devices`).
+pub struct DeviceBundles {
+    pub bundles: Vec<FetchedPreKeyBundle>,
+    pub active_devices: Vec<String>,
+}
+
+/// `GetPreKeyBundles`. Each bundle's device id must derive from its identity key; one that does
+/// not is left out with a warning, so a server cannot file a key under another device.
+pub async fn get_pre_key_bundles(
     client: &GrpcClient,
     user_id: &str,
-) -> Result<FetchedPreKeyBundle, GrpcError> {
-    let req = GetPreKeyBundleRequest {
+    device_ids: Vec<String>,
+    consume_one_time_prekey: bool,
+) -> Result<DeviceBundles, GrpcError> {
+    let req = GetPreKeyBundlesRequest {
         user_id: user_id.to_string(),
-        consume_one_time_prekey: Some(true),
+        device_ids,
+        consume_one_time_prekey: Some(consume_one_time_prekey),
         ..Default::default()
     };
     let bytes = client
-        .unary(paths::KEY_GET_BUNDLE, &req.encode_to_vec())
+        .unary(paths::KEY_GET_BUNDLES, &req.encode_to_vec())
         .await?;
-    let resp = GetPreKeyBundleResponse::decode(bytes.as_slice())
-        .map_err(|e| GrpcError::transport(format!("GetPreKeyBundle decode: {e}")))?;
-    let b = resp
-        .bundle
-        .as_ref()
-        .ok_or_else(|| GrpcError::transport("no bundle in response"))?;
+    let resp = GetPreKeyBundlesResponse::decode(bytes.as_slice())
+        .map_err(|e| GrpcError::transport(format!("GetPreKeyBundles decode: {e}")))?;
+    let mut bundles = Vec::new();
+    for device in resp.bundles {
+        let Some(bundle) = device.bundle else {
+            continue;
+        };
+        match fetched_bundle(device.device_id, bundle, device.verifying_key.to_vec()) {
+            Ok(fetched) => bundles.push(fetched),
+            Err(e) => tracing::warn!(error = %e, "bundle left out"),
+        }
+    }
+    Ok(DeviceBundles {
+        bundles,
+        active_devices: resp.active_devices,
+    })
+}
+
+fn fetched_bundle(
+    device_id: String,
+    b: PreKeyBundle,
+    verifying_key: Vec<u8>,
+) -> Result<FetchedPreKeyBundle, GrpcError> {
     let kyber = KyberBundleKeys {
         pre_key_id: b.kyber_pre_key_id,
         pre_key_public: b.kyber_pre_key.as_ref().map(|v| v.to_vec()),
@@ -61,8 +90,7 @@ pub async fn get_pre_key_bundle(
         hybrid_identity_key: b.hybrid_identity_key.as_ref().map(|v| v.to_vec()),
         hybrid_identity_signature: b.hybrid_identity_signature.as_ref().map(|v| v.to_vec()),
     };
-    let device_id = resp.device_id.clone();
-    let x3dh = bundle_to_x3dh(resp)?;
+    let x3dh = bundle_to_x3dh(b, verifying_key);
     let derived_device_id = construct_core::device_id::derive_device_id(&x3dh.identity_public);
     if device_id != derived_device_id {
         return Err(GrpcError::transport(
@@ -102,10 +130,7 @@ pub async fn upload_pre_keys(
     Ok(resp.pre_key_count)
 }
 
-fn bundle_to_x3dh(resp: GetPreKeyBundleResponse) -> Result<X3DHPublicKeyBundle, GrpcError> {
-    let bundle = resp
-        .bundle
-        .ok_or_else(|| GrpcError::transport("no bundle in response"))?;
+fn bundle_to_x3dh(bundle: PreKeyBundle, verifying_key: Vec<u8>) -> X3DHPublicKeyBundle {
     let cs = bundle.crypto_suite;
     let suite_id = if cs == CryptoSuite::HybridKyber1024X25519 as i32
         || cs == CryptoSuite::HybridKyber768X25519 as i32
@@ -114,11 +139,11 @@ fn bundle_to_x3dh(resp: GetPreKeyBundleResponse) -> Result<X3DHPublicKeyBundle, 
     } else {
         SuiteID::CLASSIC
     };
-    Ok(X3DHPublicKeyBundle {
+    X3DHPublicKeyBundle {
         identity_public: bundle.identity_key.to_vec(),
         signed_prekey_public: bundle.signed_pre_key.to_vec(),
         signature: bundle.signed_pre_key_signature.to_vec(),
-        verifying_key: resp.verifying_key.to_vec(),
+        verifying_key,
         suite_id,
         one_time_prekey_public: bundle.one_time_pre_key.map(|b| b.to_vec()),
         one_time_prekey_id: bundle.one_time_pre_key_id,
@@ -126,5 +151,5 @@ fn bundle_to_x3dh(resp: GetPreKeyBundleResponse) -> Result<X3DHPublicKeyBundle, 
         spk_rotation_epoch: bundle.spk_rotation_epoch,
         kyber_spk_uploaded_at: bundle.kyber_spk_uploaded_at.unwrap_or(0) as u64,
         kyber_spk_rotation_epoch: bundle.kyber_spk_rotation_epoch.unwrap_or(0),
-    })
+    }
 }

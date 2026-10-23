@@ -27,9 +27,8 @@ impl Client {
         let spk_secret = decode(&session.spk_key_hex)?;
         let spk_sig = decode(&session.spk_sig_hex)?;
 
-        // The stream relay must unseal SealedInner.sender_cert_ciphertext before it can recover
-        // the sender. Keep a private-key copy at that boundary; Double Ratchet decryption still
-        // happens inside the orchestrator.
+        // The task opens a certificate box (`SealedInner.sender_cert_ciphertext`) with it; Double
+        // Ratchet decryption still happens inside the orchestrator.
         let identity_secret_for_sealed = identity_secret.clone();
 
         let core_client = ClassicClient::<ClassicSuiteProvider>::from_keys(
@@ -39,7 +38,9 @@ impl Client {
             spk_sig,
         )
         .map_err(|e| format!("Orchestrator init error: {e}"))?;
-        let mut orchestrator = Orchestrator::new(core_client, self.user_id.clone());
+        // The core's id for us is this device's, as every peer's core knows us: it enters the ratchet's
+        // associated data and the envelope keys (iOS passes the same, `SessionAddressing.localIdentity`).
+        let mut orchestrator = Orchestrator::new(core_client, self.device_id.clone());
 
         // Two connections: the orchestrator writes, queries read.
         let (storage, read_storage) = if let Some(ref sk) = self.session_key {
@@ -71,7 +72,14 @@ impl Client {
             Ok(_) => {}
             Err(e) => tracing::warn!(error = %e, "failed to load orchestrator coordination state"),
         }
-        for contact_id in &contact_ids {
+        // Sessions are the core's, keyed by device.
+        let devices: Vec<String> = read_storage
+            .peer_devices()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(_, device_id, _)| device_id)
+            .collect();
+        for contact_id in &devices {
             match read_storage.secure_load(&format!("session_{contact_id}")) {
                 Ok(Some(data)) => {
                     if let Err(error) = orchestrator.import_session_cfe(contact_id, &data) {
@@ -96,19 +104,36 @@ impl Client {
 
         let (stream_tx, stream_rx) =
             spawn_stream_worker(self.grpc.clone(), contact_ids.clone(), cursor.clone());
-        self.stream_tx = Some(stream_tx.clone());
+        self.stream_tx = Some(stream_tx);
 
+        // Sealed sends and the server's trust material go on a connection that never carries
+        // the token.
+        let anonymous = crate::grpc::GrpcClient::new(&self.server_url);
         let orch_handle = spawn_orchestrator_task(
             orchestrator,
             storage,
-            stream_tx,
             self.events.clone(),
             self.grpc.clone(),
+            anonymous.clone(),
             cursor.clone(),
             contact_ids,
-            self.user_id.clone(),
-            self.device_id.clone(),
+            crate::orchestrator_task::LocalIdentity {
+                device_id: self.device_id.clone(),
+                identity_secret: identity_secret_for_sealed,
+            },
         );
+        {
+            let orch = orch_handle.clone();
+            tokio::spawn(async move {
+                match crate::grpc::get_server_trust_delegations(&anonymous).await {
+                    Ok(delegations) if !delegations.is_empty() => {
+                        orch.server_delegations(delegations)
+                    }
+                    Ok(_) => {}
+                    Err(e) => tracing::warn!(error = %e, "GetServerTrust failed"),
+                }
+            });
+        }
         // AppLaunched triggers the session GC / prewarm sweep.
         orch_handle.send(construct_core::orchestration::actions::IncomingEvent::AppLaunched);
         self.orch_handle = Some(orch_handle.clone());
@@ -131,7 +156,6 @@ impl Client {
             cursor,
             self.events.clone(),
             self.inbox.clone(),
-            identity_secret_for_sealed,
         );
         Ok(contacts)
     }
