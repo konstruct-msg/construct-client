@@ -1,0 +1,4 @@
+# Match construct-core. rustup installs this channel on first cargo invocation.
+[toolchain]
+channel = "1.96.0"
+components = ["rustfmt", "clippy"]

@@ -1,0 +1,43 @@
+# Rust build output
+/target
+
+# Cargo lock override
+# (Cargo.lock IS committed for binaries — do not add it here)
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+.Spotlight-V100
+.Trashes
+
+# Linux
+*~
+.nfs*
+
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# Editor / IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.envrc
+
+# Local session data (never commit keys or sessions)
+~/.local/share/construct-tui/
+session.json
+session.json.enc
+*.session
+
+# Environment overrides
+.env
+.env.local
+
+# Local dev Cargo path overrides (never commit — breaks CI)
+.cargo/config.toml
