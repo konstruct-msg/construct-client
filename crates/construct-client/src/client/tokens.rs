@@ -2,10 +2,7 @@
 //! token is refused, and re-saving the session with the new tokens.
 
 use super::{AuthMsg, Client, ClientEvent, Inbox, auth::AuthSuccess};
-use crate::{
-    bridge::TokenRefreshMsg,
-    config::{self, Session},
-};
+use crate::{bridge::TokenRefreshMsg, config::Session};
 
 impl Client {
     pub(super) fn refresh_token_now(&self) {
@@ -103,10 +100,8 @@ impl Client {
         // Keep the in-memory copy fresh so token refreshes need no disk read.
         self.current_session = Some(session.clone());
         self.start_token_refresh(&session);
-        if let Some(ref sk) = self.session_key {
-            let _ = config::save_session_encrypted(&session, sk);
-        } else if self.no_encrypt {
-            let _ = config::save_session(&session);
+        if let Err(e) = self.save_session(&session) {
+            tracing::warn!(error = %e, "refreshed tokens not saved");
         }
     }
 }

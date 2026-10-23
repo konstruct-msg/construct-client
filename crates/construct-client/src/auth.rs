@@ -15,7 +15,7 @@ use ed25519_dalek::Signer;
 use tokio::sync::mpsc;
 use tokio::time::{Duration, sleep};
 
-use crate::config::{Session, load_session, save_session};
+use crate::config::Session;
 use crate::grpc::GrpcClient;
 
 /// Each step of registration, sent to the UI as it progresses.
@@ -58,32 +58,6 @@ pub struct AuthResult {
     /// encrypted-session restore (contains refreshed tokens). `None` for plaintext restores
     /// (those handle their own persistence in `try_restore_session`).
     pub session: Option<crate::config::Session>,
-}
-
-/// Try to authenticate using a saved session.
-/// Returns `None` if no session file exists.
-pub async fn try_restore_session(client: &GrpcClient) -> Result<Option<AuthResult>> {
-    let Some(session) = load_session()? else {
-        return Ok(None);
-    };
-
-    let result = authenticate_saved_session(session.clone(), client).await?;
-
-    // Refresh stored tokens
-    let mut updated = session.clone();
-    updated.access_token = result.access_token.clone();
-    if let Some(ref sess) = result.session {
-        updated.refresh_token = sess.refresh_token.clone();
-        updated.expires_at = sess.expires_at;
-    }
-    save_session(&updated)?;
-
-    Ok(Some(AuthResult {
-        user_id: result.user_id,
-        device_id: result.device_id,
-        access_token: result.access_token,
-        session: Some(updated),
-    }))
 }
 
 /// Register a brand-new device and save the resulting session.

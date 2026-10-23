@@ -28,7 +28,7 @@ impl Client {
     /// The last `limit` stored messages with one person, oldest first.
     pub(super) fn load_history(&self, peer_id: String, limit: usize) {
         let messages = self
-            .read_storage
+            .store
             .as_ref()
             .and_then(|s| s.get_messages(&peer_id, limit).ok())
             .unwrap_or_default();

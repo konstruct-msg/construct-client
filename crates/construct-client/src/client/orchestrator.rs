@@ -2,7 +2,7 @@
 //! restored sessions, the message stream, the orchestrator task and the inbound relay.
 
 use super::{Client, inbound};
-use crate::{config::Session, storage::StoredContact};
+use crate::{config::Session, local_store::StoredContact};
 
 impl Client {
     /// Construct the Orchestrator, open storage, spawn the stream worker and the orchestrator
@@ -12,7 +12,6 @@ impl Client {
         session: Session,
     ) -> Result<Vec<StoredContact>, String> {
         use crate::orchestrator_task::spawn_orchestrator_task;
-        use crate::storage::Storage;
         use crate::streaming::{CursorTracker, spawn_stream_worker};
         use construct_core::orchestration::orchestrator::Orchestrator;
 
@@ -30,17 +29,13 @@ impl Client {
 
         let signing_secret_for_prekeys = signing_secret.clone();
 
-        // Two connections: the orchestrator writes, queries read.
-        let (storage, read_storage) = if let Some(ref sk) = self.session_key {
-            let db_key = sk.keys.database.as_ref();
-            (Storage::open(db_key), Storage::open(db_key))
-        } else {
-            (Storage::open_unencrypted(), Storage::open_unencrypted())
-        };
-        let (storage, read_storage) = match (storage, read_storage) {
-            (Ok(s1), Ok(s2)) => (s1, s2),
-            (Err(e), _) | (_, Err(e)) => return Err(format!("Storage open error: {e}")),
-        };
+        // One store, shared with the orchestrator task; it serialises its own writes.
+        let storage = self
+            .store
+            .clone()
+            .ok_or("the store is not open")?
+            .for_account(&self.user_id);
+        let read_storage = storage.clone();
 
         let core_client = crate::prekeys::restore_client(
             &storage,
@@ -101,7 +96,7 @@ impl Client {
             .map(|fields| fields.identity_public);
 
         let cursor = CursorTracker::load(&read_storage);
-        self.read_storage = Some(read_storage);
+        self.store = Some(read_storage);
         self.contact_ids = contact_ids.clone();
 
         let (stream_tx, stream_rx) =

@@ -33,10 +33,10 @@ use tokio::task::AbortHandle;
 
 use crate::bridge::BridgeEvent;
 use crate::grpc::{GrpcClient, SenderCertificate};
+use crate::local_store::LocalStore;
 use crate::peers::PeerDevices;
 use crate::proto::core::v1::{ContentType, Envelope, SealedInner, envelope::MessageIdType};
 use crate::sealing::{self, Opened, SealedBody};
-use crate::storage::Storage;
 use crate::streaming::CursorTracker;
 
 /// A certificate this close to its expiry is fetched again before it is used.
@@ -161,7 +161,7 @@ pub struct LocalIdentity {
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_orchestrator_task(
     orchestrator: Orchestrator,
-    storage: Storage,
+    storage: LocalStore,
     internal_tx: mpsc::UnboundedSender<crate::client::ClientEvent>,
     grpc: GrpcClient,
     anonymous: GrpcClient,
@@ -231,7 +231,7 @@ fn spawn_sealed_sender(
 
 struct Task {
     orchestrator: Orchestrator,
-    storage: Storage,
+    storage: LocalStore,
     internal_tx: mpsc::UnboundedSender<crate::client::ClientEvent>,
     grpc: GrpcClient,
     sealed_tx: mpsc::UnboundedSender<OutboundSealed>,
@@ -253,7 +253,7 @@ impl Task {
     #[allow(clippy::too_many_arguments)]
     fn new(
         mut orchestrator: Orchestrator,
-        storage: Storage,
+        storage: LocalStore,
         internal_tx: mpsc::UnboundedSender<crate::client::ClientEvent>,
         grpc: GrpcClient,
         sealed_tx: mpsc::UnboundedSender<OutboundSealed>,
@@ -388,7 +388,7 @@ impl Task {
                     tracing::warn!(%key, error = %e, "forget_contact: failed to delete session key");
                 }
             }
-            self.peers.forget(&self.storage, &device);
+            self.peers.forget(&device);
         }
         self.known_contacts.remove(contact_id);
         self.save_orchestrator_state();
@@ -931,7 +931,7 @@ impl Task {
                     &self.storage,
                     &self.cursor,
                     &message_id,
-                    crate::storage::StoredMessage {
+                    crate::local_store::StoredMessage {
                         id: message_id.clone(),
                         peer_id: account.clone(),
                         text: text.clone(),
@@ -1120,10 +1120,10 @@ fn direct_envelope_message_id(envelope: &Envelope) -> &str {
 }
 
 fn persist_inbound(
-    storage: &Storage,
+    storage: &LocalStore,
     cursor: &CursorTracker,
     message_id: &str,
-    msg: crate::storage::StoredMessage,
+    msg: crate::local_store::StoredMessage,
 ) {
     if storage.store_inbound_message(&msg).is_ok() {
         cursor.commit(storage, message_id);
@@ -1324,7 +1324,7 @@ mod tests {
     fn a_receipt_names_the_server_id_and_marks_our_message_delivered() {
         let task = test_task();
         task.storage
-            .store_message(&crate::storage::StoredMessage {
+            .store_message(&crate::local_store::StoredMessage {
                 id: "local-1".into(),
                 peer_id: "bob".into(),
                 text: "hi".into(),
@@ -1477,7 +1477,7 @@ mod tests {
         let client = ClassicClient::<ClassicSuiteProvider>::new()
             .expect("test ClassicClient should initialize");
         let orchestrator = Orchestrator::new(client, "device-a".to_string());
-        let storage = Storage::open_in_memory().expect("in-memory storage opens");
+        let storage = LocalStore::open_in_memory().expect("in-memory storage opens");
         let cursor = CursorTracker::load(&storage);
         let (internal_tx, _internal_rx) = mpsc::unbounded_channel();
         let (self_tx, _self_rx) = mpsc::unbounded_channel();

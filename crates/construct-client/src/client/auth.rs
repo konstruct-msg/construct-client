@@ -31,55 +31,148 @@ pub(crate) struct AuthSuccess {
     pub(super) pending_save: Option<Session>,
 }
 
+/// Where the session (keys and tokens) lives in the store.
+const SESSION_KEY: &str = "account.session";
+
 impl Client {
-    /// Restore a plaintext session from disk (legacy / `--no-encrypt` path).
-    pub(super) fn restore_from_disk(&self) {
-        let inbox = self.inbox.clone();
-        let grpc = self.grpc.clone();
-        tokio::spawn(async move {
-            let msg = match crate::auth::try_restore_session(&grpc).await {
-                Ok(Some(result)) => {
-                    let full = result
-                        .session
-                        .clone()
-                        .expect("try_restore_session always returns session");
-                    AuthMsg::Success(Box::new(AuthSuccess {
-                        user_id: result.user_id,
-                        device_id: result.device_id,
-                        access_token: result.access_token,
-                        full_session: full,
-                        pending_save: None, // already saved inside try_restore_session
-                    }))
-                }
-                Ok(None) => AuthMsg::Failure(NO_SESSION.into()),
-                Err(e) => AuthMsg::Failure(format!("{e:#}")),
-            };
-            let _ = inbox.send(Inbox::Auth(msg));
+    /// Lock the data directory, once per process. Another shell holding it is a failure.
+    fn data_dir(&mut self) -> Result<&crate::local_data::DataDir, String> {
+        if self.data.is_none() {
+            self.data =
+                Some(crate::local_data::DataDir::open_default().map_err(|e| format!("{e:#}"))?);
+        }
+        Ok(self.data.as_ref().expect("set above"))
+    }
+
+    fn fail(&self, reason: String) {
+        self.emit(ClientEvent::AuthFailed {
+            reason,
+            no_session: false,
         });
     }
 
-    /// Open the encrypted session with a passphrase and authenticate it.
-    pub(super) fn unlock(&mut self, passphrase: &[u8]) {
-        let session = match config::open_session_key(passphrase) {
-            Ok(Some(sk)) => match config::load_session_encrypted(&sk) {
-                Ok(Some(session)) => {
-                    self.session_key = Some(sk);
-                    session
-                }
-                Ok(None) => return self.emit(ClientEvent::UnlockFailed("No session found".into())),
-                Err(e) => {
-                    return self.emit(ClientEvent::UnlockFailed(format!("Session corrupted: {e}")));
-                }
-            },
-            Ok(None) => return self.emit(ClientEvent::UnlockFailed("No session found".into())),
-            Err(_) => {
-                return self.emit(ClientEvent::UnlockFailed(
-                    "Wrong passphrase or corrupted session".into(),
-                ));
-            }
+    /// Take `store` as this account's and read its session.
+    fn adopt_store(&mut self, store: construct_store::Store) -> Result<Session, String> {
+        let store = crate::local_store::LocalStore::new(store, "");
+        let session = store
+            .secure_load(SESSION_KEY)
+            .map_err(|e| format!("{e:#}"))?
+            .ok_or("the store holds no session")?;
+        let session: Session =
+            serde_json::from_slice(&session).map_err(|e| format!("session unreadable: {e}"))?;
+        self.store = Some(store.for_account(&session.user_id));
+        Ok(session)
+    }
+
+    /// Start with what is on disk without asking for anything: a store whose key the OS key
+    /// store or a key file keeps, or a plaintext session from before the store.
+    pub(super) fn restore_from_disk(&mut self) {
+        use crate::local_data::KeyKeeping;
+        let data = match self.data_dir() {
+            Ok(data) => data,
+            Err(e) => return self.fail(e),
         };
-        self.emit(ClientEvent::Account(self.account_info()));
-        self.authenticate_saved(session);
+        match data.existing() {
+            Some(KeyKeeping::KeyStore | KeyKeeping::KeyFile) => {
+                let session = data
+                    .open_store()
+                    .map_err(|e| format!("{e:#}"))
+                    .and_then(|store| self.adopt_store(store));
+                match session {
+                    Ok(session) => self.authenticate_saved(session),
+                    Err(e) => self.fail(e),
+                }
+            }
+            Some(KeyKeeping::Passphrase) => self.fail("this store needs its passphrase".into()),
+            None => match config::load_session() {
+                Ok(Some(session)) => {
+                    let key_file = self.no_encrypt;
+                    match self.migrate_legacy(session, key_file, None) {
+                        Ok(session) => self.authenticate_saved(session),
+                        Err(e) => self.fail(e),
+                    }
+                }
+                Ok(None) => self.emit(ClientEvent::AuthFailed {
+                    reason: NO_SESSION.into(),
+                    no_session: true,
+                }),
+                Err(e) => self.fail(format!("{e:#}")),
+            },
+        }
+    }
+
+    /// Open the store with its passphrase — or, from before the store, the encrypted session
+    /// file — and authenticate.
+    pub(super) fn unlock(&mut self, passphrase: &[u8]) {
+        use crate::local_data::KeyKeeping;
+        let data = match self.data_dir() {
+            Ok(data) => data,
+            Err(e) => return self.emit(ClientEvent::UnlockFailed(e)),
+        };
+        let session = match data.existing() {
+            Some(KeyKeeping::Passphrase) => data
+                .open_store_with_passphrase(passphrase)
+                .map_err(|e| format!("{e:#}"))
+                .and_then(|store| self.adopt_store(store)),
+            None => match config::open_session_key(passphrase)
+                .and_then(|sk| sk.map(|sk| config::load_session_encrypted(&sk)).transpose())
+            {
+                Ok(Some(Some(session))) => self.migrate_legacy(session, false, Some(passphrase)),
+                Ok(_) => Err("No session found".into()),
+                Err(_) => Err("Wrong passphrase or corrupted session".into()),
+            },
+            Some(_) => Err("this store opens without a passphrase".into()),
+        };
+        match session {
+            Ok(session) => {
+                self.unlocked_by_passphrase = true;
+                self.emit(ClientEvent::Account(self.account_info()));
+                self.authenticate_saved(session);
+            }
+            Err(e) => self.emit(ClientEvent::UnlockFailed(e)),
+        }
+    }
+
+    /// A session from before the store: make the store (the OS key store keeps its key, else the
+    /// passphrase the session was under, else a key file), move the session in, delete the old
+    /// files. The old database is not carried over: its sessions reopen from the peers' next
+    /// messages, its history is gone (pre-release; TODO 218 stage 2).
+    fn migrate_legacy(
+        &mut self,
+        session: Session,
+        key_file: bool,
+        passphrase: Option<&[u8]>,
+    ) -> Result<Session, String> {
+        let data = self.data_dir()?;
+        let store = match data.create_store(key_file).map_err(|e| format!("{e:#}"))? {
+            Some(store) => store,
+            None => match passphrase {
+                Some(p) => data
+                    .create_store_with_passphrase(p)
+                    .map_err(|e| format!("{e:#}"))?,
+                None => data
+                    .create_store(true)
+                    .map_err(|e| format!("{e:#}"))?
+                    .ok_or("no way to keep the store key")?,
+            },
+        };
+        data.remove_legacy_database();
+        self.store = Some(crate::local_store::LocalStore::new(store, &session.user_id));
+        self.save_session(&session)?;
+        if let Err(e) = config::clear_session() {
+            tracing::warn!(error = %e, "old session file not removed");
+        }
+        tracing::info!("session moved into the local store");
+        Ok(session)
+    }
+
+    /// Write the session into the store.
+    pub(super) fn save_session(&self, session: &Session) -> Result<(), String> {
+        let store = self.store.as_ref().ok_or("no store open")?;
+        let bytes = serde_json::to_vec(session).map_err(|e| e.to_string())?;
+        store
+            .secure_save(SESSION_KEY, &bytes)
+            .map_err(|e| format!("{e:#}"))
     }
 
     /// Authenticate a session already decrypted in memory.
@@ -197,26 +290,30 @@ impl Client {
         self.emit(ClientEvent::Account(self.account_info()));
 
         let Some(session) = pending_save else {
-            // Already saved (restore-from-disk path) — start right away.
             return self.start(full_session);
         };
         self.start_token_refresh(&session);
 
-        if let Some(ref sk) = self.session_key {
-            // Keys already derived (unlock path, or link/register with existing keys).
-            match config::save_session_encrypted(&session, sk) {
-                Ok(()) => self.start(full_session),
-                Err(e) => self.emit(ClientEvent::SaveFailed(format!("Save failed: {e}"))),
+        if self.store.is_none() {
+            // A new account: make its store. Without an OS key store, wait for a passphrase.
+            let key_file = self.no_encrypt;
+            let created = self
+                .data_dir()
+                .and_then(|data| data.create_store(key_file).map_err(|e| format!("{e:#}")));
+            match created {
+                Ok(Some(store)) => {
+                    self.store = Some(crate::local_store::LocalStore::new(store, &session.user_id))
+                }
+                Ok(None) => {
+                    self.pending_session = Some(session);
+                    return self.emit(ClientEvent::NeedsPassphrase);
+                }
+                Err(e) => return self.emit(ClientEvent::SaveFailed(format!("Save failed: {e}"))),
             }
-        } else if self.no_encrypt {
-            match config::save_session(&session) {
-                Ok(()) => self.start(full_session),
-                Err(e) => self.emit(ClientEvent::SaveFailed(format!("Save failed: {e}"))),
-            }
-        } else {
-            // New registration — wait for a passphrase before opening the encrypted database.
-            self.pending_session = Some(session);
-            self.emit(ClientEvent::NeedsPassphrase);
+        }
+        match self.save_session(&session) {
+            Ok(()) => self.start(full_session),
+            Err(e) => self.emit(ClientEvent::SaveFailed(format!("Save failed: {e}"))),
         }
     }
 
@@ -236,22 +333,26 @@ impl Client {
         let Some(session) = self.pending_session.take() else {
             return;
         };
-        let sk = match config::create_session_key(passphrase) {
-            Ok(sk) => sk,
+        let created = self.data_dir().and_then(|data| {
+            data.create_store_with_passphrase(passphrase)
+                .map_err(|e| format!("{e:#}"))
+        });
+        match created {
+            Ok(store) => {
+                self.store = Some(crate::local_store::LocalStore::new(store, &session.user_id))
+            }
             Err(e) => {
                 self.pending_session = Some(session);
                 return self.emit(ClientEvent::PassphraseFailed(format!(
-                    "Key derivation failed: {e}"
+                    "Store not made: {e}"
                 )));
             }
-        };
-        if let Err(e) = config::save_session_encrypted(&session, &sk) {
-            self.pending_session = Some(session);
+        }
+        if let Err(e) = self.save_session(&session) {
             return self.emit(ClientEvent::PassphraseFailed(format!("Save failed: {e}")));
         }
-        self.session_key = Some(sk);
+        self.unlocked_by_passphrase = true;
         self.emit(ClientEvent::Account(self.account_info()));
-        // The orchestrator waited for this: the database key comes from the passphrase.
         match self.current_session.clone() {
             Some(full) => self.start(full),
             None => self.emit(ClientEvent::Started(Vec::new())),
@@ -260,16 +361,22 @@ impl Client {
 
     /// Clear the session from disk and stop everything running for it.
     pub(super) fn logout(&mut self) {
-        if let Err(e) = config::clear_session() {
-            return self.emit(ClientEvent::Notice(format!("Logout error: {e}")));
-        }
         // Dropping the handle stops the orchestrator task; the stream worker is told.
         self.orch_handle = None;
         if let Some(ref tx) = self.stream_tx.take() {
             let _ = tx.try_send(crate::streaming::StreamCmd::Shutdown);
         }
-        if let Some(ref storage) = self.read_storage {
-            let _ = storage.clear_stream_cursor();
+        // Signing out wipes the device (decisions/sign-out-wipes-the-device.md): the store's
+        // files and its key. The task's handle may still be closing; the files go regardless.
+        let store = self.store.take();
+        let wiped = self
+            .data_dir()
+            .and_then(|data| data.wipe(store).map_err(|e| format!("{e:#}")));
+        if let Err(e) = wiped {
+            self.emit(ClientEvent::Notice(format!("Logout error: {e}")));
+        }
+        if let Err(e) = config::clear_session() {
+            tracing::warn!(error = %e, "old session file not removed");
         }
         self.grpc.set_token(None);
         self.grpc.set_device_id(None);
@@ -277,8 +384,7 @@ impl Client {
         tokio::spawn(async move {
             grpc.invalidate_h3().await;
         });
-        self.read_storage = None;
-        self.session_key = None;
+        self.unlocked_by_passphrase = false;
         self.current_session = None;
         self.pending_session = None;
         self.our_identity_key = None;

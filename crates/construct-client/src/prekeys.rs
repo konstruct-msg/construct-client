@@ -17,7 +17,7 @@ use construct_core::crypto::suites::classic::ClassicSuiteProvider;
 use construct_core::orchestration::orchestrator::Orchestrator;
 use ed25519_dalek::Signer;
 
-use crate::storage::Storage;
+use crate::local_store::LocalStore;
 
 const KEY_RECORD: &str = "crypto_private_keys";
 const ONE_TIME_PREKEYS: &str = "crypto_otpks";
@@ -33,7 +33,7 @@ const CLASSIC_SPK_SUITE: u8 = 0x01;
 /// The core's client: from the saved key record, or — the first launch after this code — from
 /// the four classic secrets the session file holds.
 pub fn restore_client(
-    storage: &Storage,
+    storage: &LocalStore,
     identity: Vec<u8>,
     signing: Vec<u8>,
     spk: Vec<u8>,
@@ -50,7 +50,10 @@ pub fn restore_client(
 /// Restore the prekeys into a fresh orchestrator, then make sure the hybrid key exists and the
 /// key record that carries it is saved. Returns whether the blobs were all there (a missing or
 /// unreadable one means the server's one-time prekeys must be replaced, not appended to).
-pub fn restore_prekeys(orchestrator: &mut Orchestrator, storage: &Storage) -> Result<bool, String> {
+pub fn restore_prekeys(
+    orchestrator: &mut Orchestrator,
+    storage: &LocalStore,
+) -> Result<bool, String> {
     let mut whole = true;
     match storage.secure_load(ONE_TIME_PREKEYS) {
         Ok(Some(blob)) => {
@@ -75,21 +78,24 @@ pub fn restore_prekeys(orchestrator: &mut Orchestrator, storage: &Storage) -> Re
     Ok(whole)
 }
 
-pub fn save_key_record(orchestrator: &Orchestrator, storage: &Storage) -> Result<(), String> {
+pub fn save_key_record(orchestrator: &Orchestrator, storage: &LocalStore) -> Result<(), String> {
     let record = orchestrator.export_private_keys_cfe()?;
     storage
         .secure_save(KEY_RECORD, &record)
         .map_err(|e| format!("key record save: {e}"))
 }
 
-pub fn save_one_time_prekeys(orchestrator: &Orchestrator, storage: &Storage) -> Result<(), String> {
+pub fn save_one_time_prekeys(
+    orchestrator: &Orchestrator,
+    storage: &LocalStore,
+) -> Result<(), String> {
     let blob = orchestrator.export_otpks_cfe()?;
     storage
         .secure_save(ONE_TIME_PREKEYS, &blob)
         .map_err(|e| format!("one-time prekeys save: {e}"))
 }
 
-pub fn save_kyber_prekeys(orchestrator: &Orchestrator, storage: &Storage) -> Result<(), String> {
+pub fn save_kyber_prekeys(orchestrator: &Orchestrator, storage: &LocalStore) -> Result<(), String> {
     let blob = orchestrator.export_kyber_prekeys_cfe()?;
     storage
         .secure_save(KYBER_PREKEYS, &blob)
@@ -98,7 +104,7 @@ pub fn save_kyber_prekeys(orchestrator: &Orchestrator, storage: &Storage) -> Res
 
 /// After a responder session opened: a consumed Kyber one-time prekey and a consumed classic one
 /// are gone from the core, and must be gone from the saved blobs before anything else happens.
-pub fn save_after_responder_init(orchestrator: &mut Orchestrator, storage: &Storage) {
+pub fn save_after_responder_init(orchestrator: &mut Orchestrator, storage: &LocalStore) {
     if let Some(blob) = orchestrator.take_kyber_prekeys_to_persist()
         && let Err(e) = storage.secure_save(KYBER_PREKEYS, &blob)
     {
@@ -121,7 +127,7 @@ pub struct Publish {
 /// replacement is asked for. Every secret is saved before its public half can leave.
 pub fn prepare_publish(
     orchestrator: &mut Orchestrator,
-    storage: &Storage,
+    storage: &LocalStore,
     device_id: &str,
     signing_secret: &[u8],
     force_replace: bool,
@@ -182,7 +188,7 @@ pub fn prepare_publish(
 /// rotation back when the server refused it (not on a transport error: it may have arrived).
 pub fn finish_publish(
     orchestrator: &mut Orchestrator,
-    storage: &Storage,
+    storage: &LocalStore,
     device_id: &str,
     kyber_spk_id: u32,
     rotating: bool,
@@ -230,7 +236,7 @@ mod tests {
 
     #[test]
     fn the_kem_identity_survives_a_relaunch() {
-        let storage = Storage::open_in_memory().unwrap();
+        let storage = LocalStore::open_in_memory().unwrap();
         let mut first = orchestrator();
         restore_prekeys(&mut first, &storage).unwrap();
         let hybrid = first
@@ -246,7 +252,7 @@ mod tests {
 
     #[test]
     fn kyber_prekeys_survive_a_relaunch() {
-        let storage = Storage::open_in_memory().unwrap();
+        let storage = LocalStore::open_in_memory().unwrap();
         let mut first = orchestrator();
         restore_prekeys(&mut first, &storage).unwrap();
         let spk = first.begin_kyber_spk_rotation().unwrap();
@@ -268,14 +274,14 @@ mod tests {
 
     #[test]
     fn a_first_launch_without_blobs_asks_for_replacement() {
-        let storage = Storage::open_in_memory().unwrap();
+        let storage = LocalStore::open_in_memory().unwrap();
         let mut orchestrator = orchestrator();
         assert!(!restore_prekeys(&mut orchestrator, &storage).unwrap());
     }
 
     #[test]
     fn missing_one_time_prekeys_alone_ask_for_replacement() {
-        let storage = Storage::open_in_memory().unwrap();
+        let storage = LocalStore::open_in_memory().unwrap();
         let mut first = orchestrator();
         restore_prekeys(&mut first, &storage).unwrap();
         first.begin_kyber_spk_rotation().unwrap();

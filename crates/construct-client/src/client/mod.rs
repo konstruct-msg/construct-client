@@ -23,9 +23,9 @@ use zeroize::Zeroizing;
 use crate::{
     auth::RegistrationStep,
     bridge::{BridgeEvent, TokenRefreshMsg},
-    config::{Session, SessionKey, SessionState, TransportConfig},
+    config::{Session, SessionState, TransportConfig},
     grpc::GrpcClient,
-    storage::{StoredContact, StoredMessage},
+    local_store::{StoredContact, StoredMessage},
 };
 
 /// What a front end asks the client to do.
@@ -173,7 +173,13 @@ pub fn spawn(cfg: ClientConfig, events: mpsc::UnboundedSender<ClientEvent>) -> C
 /// What is on disk: an encrypted session, a plaintext one, or none. Read before the client is
 /// asked for anything, to choose the first screen.
 pub fn stored_session_state() -> SessionState {
-    crate::config::detect_session()
+    use crate::local_data::{KeyKeeping, default_dir, existing_in};
+    match default_dir().and_then(|dir| existing_in(&dir)) {
+        Some(KeyKeeping::Passphrase) => SessionState::Encrypted,
+        Some(KeyKeeping::KeyStore | KeyKeeping::KeyFile) => SessionState::Plaintext,
+        // Nothing in the store yet: a session file from before it, if any.
+        None => crate::config::detect_session(),
+    }
 }
 
 /// Configuration derived from the config file and CLI overrides.
@@ -194,9 +200,13 @@ pub(crate) struct Client {
     events: mpsc::UnboundedSender<ClientEvent>,
     /// Where background work started here reports back.
     inbox: mpsc::UnboundedSender<Inbox>,
-    /// Derived key material for the active session (zeroized on drop / logout). `None` in
-    /// `--no-encrypt` mode or before a passphrase is entered.
-    session_key: Option<SessionKey>,
+    /// The data directory, locked while this client runs.
+    data: Option<crate::local_data::DataDir>,
+    /// The account's store: its session, keys, sessions with peers, messages. Shared with the
+    /// orchestrator task.
+    store: Option<crate::local_store::LocalStore>,
+    /// The store was opened (or made) with a passphrase.
+    unlocked_by_passphrase: bool,
     /// The decrypted session in memory — re-saved on token refresh without a disk read.
     current_session: Option<Session>,
     /// A new session waiting for its passphrase before it is saved.
@@ -208,8 +218,6 @@ pub(crate) struct Client {
     our_identity_key: Option<Vec<u8>>,
     orch_handle: Option<crate::orchestrator_task::OrchestratorHandle>,
     stream_tx: Option<mpsc::Sender<crate::streaming::StreamCmd>>,
-    /// Read connection for queries (messages, contacts); the orchestrator holds the writer.
-    read_storage: Option<crate::storage::Storage>,
     /// The people the stream is subscribed for, in the order they were added.
     contact_ids: Vec<String>,
 }
@@ -228,7 +236,9 @@ impl Client {
             pq_active: cfg.pq_active,
             events,
             inbox,
-            session_key: None,
+            data: None,
+            store: None,
+            unlocked_by_passphrase: false,
             current_session: None,
             pending_session: None,
             user_id: String::new(),
@@ -237,7 +247,6 @@ impl Client {
             our_identity_key: None,
             orch_handle: None,
             stream_tx: None,
-            read_storage: None,
             contact_ids: Vec::new(),
         }
     }
@@ -285,7 +294,7 @@ impl Client {
             pq_active: self.pq_active,
             user_id: self.user_id.clone(),
             device_id: self.device_id.clone(),
-            has_session_key: self.session_key.is_some(),
+            has_session_key: self.unlocked_by_passphrase,
         }
     }
 }
