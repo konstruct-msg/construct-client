@@ -119,6 +119,11 @@ pub async fn confirm_device_link(
         link_token: link_token.to_string(),
         device_id: device_id.to_string(),
         public_keys: Some(public_keys),
+        // Left empty on purpose: the proof is an HMAC under the secret the old device's QR code
+        // carries (core `device_link_key_proof`), and this link flow takes only the token. Empty
+        // is what the protocol defines for a client older than device certificates; carrying the
+        // secret is TODO 218 stage 4 (this device as the iPhone's second device).
+        link_key_proof: Default::default(),
     };
     let bytes = client
         .unary(paths::DEVICE_CONFIRM_LINK, &req.encode_to_vec())
