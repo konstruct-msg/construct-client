@@ -187,7 +187,7 @@ struct InboundEnvelope {
     wire_payload: Vec<u8>,
     content_type: u8,
     is_sealed: bool,
-    sender_certificate: Option<construct_core::crypto::sealed_sender::SenderCertificate>,
+    sender_certificate: Option<Box<construct_core::crypto::sealed_sender::SenderCertificate>>,
 }
 
 fn resolve_inbound_envelope(
@@ -241,15 +241,19 @@ fn resolve_inbound_envelope(
         wire_payload,
         content_type: content_type_to_u8(inner.content_type),
         is_sealed: true,
-        sender_certificate: Some(construct_core::crypto::sealed_sender::SenderCertificate {
-            user_id: cert.sender_user_id,
-            domain: cert.sender_domain,
-            identity_key: cert.sender_identity_key.to_vec(),
-            device_id: cert.sender_device_id,
-            issued_at: cert.issued_at,
-            expires_at: cert.expires_at,
-            signature: cert.server_signature.to_vec(),
-        }),
+        sender_certificate: Some(Box::new(
+            construct_core::crypto::sealed_sender::SenderCertificate {
+                user_id: cert.sender_user_id,
+                domain: cert.sender_domain,
+                identity_key: cert.sender_identity_key.to_vec(),
+                device_id: cert.sender_device_id,
+                issued_at: cert.issued_at,
+                expires_at: cert.expires_at,
+                signature: cert.server_signature.to_vec(),
+                server_kid: cert.server_kid.to_vec(),
+                server_signature_hybrid: cert.server_signature_hybrid.to_vec(),
+            },
+        )),
     })
 }
 
@@ -308,6 +312,8 @@ mod tests {
             issued_at: 1,
             expires_at: 2,
             server_signature: vec![3u8; 64].into(),
+            server_kid: vec![5u8; 16].into(),
+            server_signature_hybrid: vec![6u8; 3373].into(),
         };
         let sealed_cert = construct_core::crypto::sealed_sender::seal_to_x25519_public(
             &cert.encode_to_vec(),
@@ -350,5 +356,11 @@ mod tests {
         assert_eq!(resolved.wire_payload, wire_payload);
         assert_eq!(resolved.content_type, 13);
         assert!(resolved.is_sealed);
+        // The core checks the hybrid signature by the delegated server key; both reach it.
+        let core_cert = resolved
+            .sender_certificate
+            .expect("sealed envelope carries a cert");
+        assert_eq!(core_cert.server_kid, vec![5u8; 16]);
+        assert_eq!(core_cert.server_signature_hybrid, vec![6u8; 3373]);
     }
 }

@@ -166,7 +166,8 @@ pub async fn register_new_device(
         construct_core::pow::compute_pow(&challenge_for_pow, difficulty)
     })
     .await
-    .context("PoW computation panicked")?;
+    .context("PoW computation panicked")?
+    .context("PoW")?;
     tracing::info!(nonce = solution.nonce, "PoW solved");
 
     step(RegistrationStep::Registering);

@@ -85,7 +85,10 @@ impl Client {
 
         // OTPKs and our identity key before the orchestrator moves into its task.
         let otpks = orchestrator.generate_otpks(100).unwrap_or_default();
-        self.our_identity_key = orchestrator.identity_public_key_bytes().ok();
+        self.our_identity_key = orchestrator
+            .get_registration_bundle_fields()
+            .ok()
+            .map(|fields| fields.identity_public);
 
         let cursor = CursorTracker::load(&read_storage);
         self.read_storage = Some(read_storage);
