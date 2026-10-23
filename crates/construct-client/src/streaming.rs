@@ -160,7 +160,11 @@ async fn run_worker(
             Err(mpsc::error::TryRecvError::Empty) => {}
         }
 
-        client.invalidate_h3().await;
+        // A new connection only after a failed one: the first open shares the connection the
+        // unary calls are on, and dropping it under them broke them.
+        if attempt > 0 {
+            client.invalidate_h3().await;
+        }
         let since = cursor.committed();
         let (frame_tx, mut frame_rx) = mpsc::unbounded_channel();
         let open = open_message_stream(&client, subscribed_users.clone(), since, move |frame| {

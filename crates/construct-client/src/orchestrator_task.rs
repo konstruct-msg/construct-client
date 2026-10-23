@@ -976,6 +976,15 @@ impl Task {
                 if let Err(error) = self.storage.secure_save_or_delete(&key, data.as_ref()) {
                     tracing::error!(%key, %error, "secure store save failed");
                 }
+                // A session's envelope keys live in the orchestrator state (the envelope book),
+                // not in the session record; a session restored without them is refused
+                // (SESSION_PREDATES_ENVELOPE). The core does not ask for this save itself.
+                if matches!(
+                    slot,
+                    construct_core::orchestration::actions::SecureStoreSlot::Session { .. }
+                ) {
+                    self.save_orchestrator_state();
+                }
             }
             Action::DuplicateDropped { message_id } => {
                 self.cursor.commit(&self.storage, &message_id)
@@ -1050,16 +1059,10 @@ impl Task {
             }
 
             // ── UI notifications ─────────────────────────────────────────────────
-            Action::NotifyNewMessage { chat_id, preview } => {
-                let peer_id = self.account_of(&chat_id);
-                let _ = self.internal_tx.send(crate::client::ClientEvent::Bridge(
-                    BridgeEvent::NewMessage {
-                        peer_id,
-                        message_id: String::new(),
-                        text: preview,
-                        timestamp_ms: now_ms(),
-                    },
-                ));
+            // A notification hint beside a `MessageDecrypted` the screens already got; its preview
+            // is the raw plaintext (KNST frame), so shown as a message it made a second bubble.
+            Action::NotifyNewMessage { chat_id, .. } => {
+                tracing::debug!(device = %chat_id, "new message notification hint");
             }
 
             Action::NotifySessionCreated { contact_id } => {
@@ -1380,6 +1383,51 @@ mod tests {
         assert_eq!(direct.message_ids, vec!["server-9".to_string()]);
         assert_eq!(direct.recipient_user_id, "bob");
         assert_eq!(direct.sender_device_id, "device-a");
+    }
+
+    #[tokio::test]
+    async fn a_session_save_saves_the_envelope_book_with_it() {
+        use construct_core::orchestration::actions::SecureStoreSlot;
+        let mut task = test_task();
+        let mut follow_ups = Vec::new();
+
+        task.dispatch(
+            Action::SaveToSecureStore {
+                slot: SecureStoreSlot::Session {
+                    contact_id: "bob-device".into(),
+                },
+                data: vec![1, 2, 3].into(),
+            },
+            &mut follow_ups,
+        )
+        .await;
+
+        assert!(
+            task.storage
+                .secure_load("construct.orchestrator_state")
+                .unwrap()
+                .is_some(),
+            "without the orchestrator state the session restores with no envelope keys"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_notification_hint_is_not_a_second_message() {
+        let (internal_tx, mut internal_rx) = mpsc::unbounded_channel();
+        let mut task = test_task();
+        task.internal_tx = internal_tx;
+        let mut follow_ups = Vec::new();
+
+        task.dispatch(
+            Action::NotifyNewMessage {
+                chat_id: "bob-device".into(),
+                preview: "KNST raw frame".into(),
+            },
+            &mut follow_ups,
+        )
+        .await;
+
+        assert!(internal_rx.try_recv().is_err());
     }
 
     fn stream_context(
