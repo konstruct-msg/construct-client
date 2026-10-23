@@ -39,6 +39,9 @@ use crate::proto::core::v1::{ContentType, Envelope, SealedInner, envelope::Messa
 use crate::sealing::{self, Opened, SealedBody};
 use crate::streaming::CursorTracker;
 
+/// How long an account's device set is trusted before it is asked again.
+const DEVICES_RECHECK: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+
 /// A certificate this close to its expiry is fetched again before it is used.
 const CERTIFICATE_REFRESH_AHEAD_SECS: i64 = 5 * 60;
 
@@ -129,16 +132,23 @@ enum OrchestratorCommand {
     },
 }
 
-/// One sealed send, queued for the worker that sends them in order.
-struct OutboundSealed {
-    inner: SealedInner,
-    local_id: String,
+/// One send, queued for the worker that sends them in order.
+enum Outbound {
+    /// To another account: sealed, on the connection without a token.
+    Sealed {
+        inner: Box<SealedInner>,
+        local_id: String,
+    },
+    /// A copy to one of our own devices: identified, on the authenticated connection.
+    OwnCopy { envelope: Box<Envelope> },
 }
 
 // ── Startup ───────────────────────────────────────────────────────────────────
 
 /// What the task needs about this device.
 pub struct LocalIdentity {
+    /// Our account: copies between our devices name it as both sender and recipient.
+    pub user_id: String,
     /// This device: the core's id for us (`derive_device_id(identity_key)`).
     pub device_id: String,
     /// X25519 identity secret, to open a certificate box (`sealing::open_sealed_inner`).
@@ -176,7 +186,7 @@ pub fn spawn_orchestrator_task(
         cmd_tx: cmd_tx.clone(),
     };
 
-    let sealed_tx = spawn_sealed_sender(anonymous, cmd_tx, internal_tx.clone());
+    let sealed_tx = spawn_sender(anonymous, grpc.clone(), cmd_tx, internal_tx.clone());
     let mut task = Task::new(
         orchestrator,
         storage,
@@ -193,33 +203,43 @@ pub fn spawn_orchestrator_task(
     handle
 }
 
-/// Sends sealed inners one at a time, in the order queued: two copies to one device must reach
-/// the server in the order their ratchet wrote them.
-fn spawn_sealed_sender(
+/// Sends one at a time, in the order queued: two copies to one device must reach the server in
+/// the order their ratchet wrote them.
+fn spawn_sender(
     anonymous: GrpcClient,
+    authenticated: GrpcClient,
     cmd_tx: mpsc::UnboundedSender<OrchestratorCommand>,
     internal_tx: mpsc::UnboundedSender<crate::client::ClientEvent>,
-) -> mpsc::UnboundedSender<OutboundSealed> {
-    let (tx, mut rx) = mpsc::unbounded_channel::<OutboundSealed>();
+) -> mpsc::UnboundedSender<Outbound> {
+    let (tx, mut rx) = mpsc::unbounded_channel::<Outbound>();
     tokio::spawn(async move {
         while let Some(outbound) = rx.recv().await {
-            match crate::grpc::send_sealed_message(&anonymous, &outbound.inner).await {
-                Ok(server_id) => {
-                    tracing::info!(
-                        local_id = %outbound.local_id,
-                        %server_id,
-                        "sealed message sent"
-                    );
-                    let _ = cmd_tx.send(OrchestratorCommand::Sent {
-                        server_id,
-                        local_id: outbound.local_id,
-                    });
+            match outbound {
+                Outbound::Sealed { inner, local_id } => {
+                    match crate::grpc::send_sealed_message(&anonymous, &inner).await {
+                        Ok(server_id) => {
+                            tracing::info!(%local_id, %server_id, "sealed message sent");
+                            let _ = cmd_tx.send(OrchestratorCommand::Sent {
+                                server_id,
+                                local_id,
+                            });
+                        }
+                        Err(e) => {
+                            tracing::warn!(%local_id, error = %e, "sealed send failed");
+                            let _ = internal_tx.send(crate::client::ClientEvent::Bridge(
+                                BridgeEvent::Error(format!("[SEND_FAILED] {e}")),
+                            ));
+                        }
+                    }
                 }
-                Err(e) => {
-                    tracing::warn!(local_id = %outbound.local_id, error = %e, "sealed send failed");
-                    let _ = internal_tx.send(crate::client::ClientEvent::Bridge(
-                        BridgeEvent::Error(format!("[SEND_FAILED] {e}")),
-                    ));
+                // Best effort, as on iOS: a copy that does not arrive costs a bubble on the other
+                // device, not the message.
+                Outbound::OwnCopy { envelope } => {
+                    let id = direct_envelope_message_id(&envelope).to_owned();
+                    match crate::grpc::send_own_device_copy(&authenticated, *envelope).await {
+                        Ok(()) => tracing::info!(%id, "own-device copy sent"),
+                        Err(e) => tracing::warn!(%id, error = %e, "own-device copy not sent"),
+                    }
                 }
             }
         }
@@ -234,7 +254,7 @@ struct Task {
     storage: LocalStore,
     internal_tx: mpsc::UnboundedSender<crate::client::ClientEvent>,
     grpc: GrpcClient,
-    sealed_tx: mpsc::UnboundedSender<OutboundSealed>,
+    sealed_tx: mpsc::UnboundedSender<Outbound>,
     cursor: CursorTracker,
     identity: LocalIdentity,
     self_tx: mpsc::UnboundedSender<IncomingEvent>,
@@ -247,6 +267,8 @@ struct Task {
     /// `peers` once the session opens from them, and the address a DECRYPTION_ERROR goes back
     /// to if it does not.
     pending_certificates: HashMap<String, (String, Vec<u8>)>,
+    /// When each account's device set was last asked of the server.
+    devices_checked: HashMap<String, tokio::time::Instant>,
 }
 
 impl Task {
@@ -256,7 +278,7 @@ impl Task {
         storage: LocalStore,
         internal_tx: mpsc::UnboundedSender<crate::client::ClientEvent>,
         grpc: GrpcClient,
-        sealed_tx: mpsc::UnboundedSender<OutboundSealed>,
+        sealed_tx: mpsc::UnboundedSender<Outbound>,
         cursor: CursorTracker,
         known_contacts: Vec<String>,
         identity: LocalIdentity,
@@ -279,6 +301,7 @@ impl Task {
             peers,
             certificate: None,
             pending_certificates: HashMap::new(),
+            devices_checked: HashMap::new(),
         }
     }
 
@@ -431,9 +454,12 @@ impl Task {
     async fn handle_envelope(&mut self, envelope: &Envelope, stream_cursor: Option<String>) {
         let message_id = direct_envelope_message_id(envelope).to_owned();
         let Some(sealed) = envelope.sealed_sender.as_ref() else {
-            // Only an account's own devices send unsealed (SENDER_SYNC); this client is not a
-            // linked device yet (TODO 218, stage 4).
-            tracing::warn!(%message_id, "unsealed delivery dropped: own-device traffic is not handled");
+            // Only an account's own devices send unsealed: a copy of a message sent elsewhere.
+            if envelope.content_type == ContentType::SenderSync as i32 {
+                self.handle_own_copy(envelope).await;
+            } else {
+                tracing::warn!(%message_id, content_type = envelope.content_type, "unsealed delivery dropped");
+            }
             self.cursor.commit_direct(&self.storage, stream_cursor);
             return;
         };
@@ -561,18 +587,15 @@ impl Task {
     }
 
     async fn handle_stream_message(&mut self, event: IncomingEvent, context: StreamMessageContext) {
+        // A delivery from an account with no contact row is taken in: a device linked to an
+        // account starts with no contacts at all. Its writer becomes a contact once a message
+        // from it decrypts (`adopt_writer`).
         if !self.known_contacts.contains(&context.contact_id) {
-            self.cursor
-                .commit_direct(&self.storage, context.stream_cursor.clone());
-            tracing::warn!(
+            tracing::info!(
                 contact_id = %context.contact_id,
                 message_id = %context.message_id,
-                content_type = context.content_type,
-                msg_num = context.msg_num,
-                stream_cursor = ?context.stream_cursor,
-                "dropped stream message from unknown contact"
+                "delivery from an account that is not a contact"
             );
-            return;
         }
 
         if should_drop_stale_session_replay(&context, &self.session_established_at_ms) {
@@ -624,7 +647,11 @@ impl Task {
         let plaintext = if crate::knst::is_frame(&plaintext) || plaintext.first() == Some(&0) {
             plaintext
         } else {
-            crate::knst::encode_text(&String::from_utf8_lossy(&plaintext), &message_id)
+            // Text from the screens: kept in the transcript, copied to our other devices.
+            let text = String::from_utf8_lossy(&plaintext).into_owned();
+            self.keep_sent(&contact_id, &message_id, &text);
+            self.send_own_copies(&contact_id, &message_id, &text).await;
+            crate::knst::encode_text(&text, &message_id)
         };
         devices
             .into_iter()
@@ -637,26 +664,43 @@ impl Task {
             .collect()
     }
 
-    /// The devices of `account` a message goes to, each with a session. Devices without one get
-    /// a bundle from the server (all of the account's when none is known yet) and a session
-    /// opened from it. A device whose session cannot be opened is left out with a warning.
+    /// The devices of `account` a message goes to, each with a session (see `refresh_devices`).
     async fn recipient_devices(&mut self, account: &str) -> Result<Vec<String>, String> {
+        self.refresh_devices(account).await?;
+        Ok(self
+            .peers
+            .devices_of(account)
+            .into_iter()
+            .filter(|d| *d != self.identity.device_id && self.orchestrator.has_active_session(d))
+            .collect())
+    }
+
+    /// Bring `account`'s device set up to date and give each device a session.
+    ///
+    /// The set is asked of the server when nothing is known, when a known device has no session,
+    /// or every `DEVICES_RECHECK` — a device the account gained since (a desktop linked to the
+    /// phone) is otherwise never written to. That ask spends no one-time prekeys; only devices
+    /// that need a session are asked again for a bundle that does.
+    async fn refresh_devices(&mut self, account: &str) -> Result<(), String> {
         let known = self.peers.devices_of(account);
-        let missing: Vec<String> = known
-            .iter()
-            .filter(|d| !self.orchestrator.has_session_for_sending(d))
-            .cloned()
-            .collect();
-        if known.is_empty() || !missing.is_empty() {
-            let fetched = crate::grpc::get_pre_key_bundles(&self.grpc, account, missing, true)
-                .await
-                .map_err(|e| format!("GetPreKeyBundles: {e}"))?;
-            let fetched_ids: Vec<String> = fetched
-                .bundles
-                .iter()
-                .map(|b| b.device_id.clone())
-                .collect();
-            for bundle in &fetched.bundles {
+        let missing = known.iter().any(|d| {
+            *d != self.identity.device_id && !self.orchestrator.has_session_for_sending(d)
+        });
+        let stale = self
+            .devices_checked
+            .get(account)
+            .is_none_or(|at| at.elapsed() >= DEVICES_RECHECK);
+        if !known.is_empty() && !missing && !stale {
+            return Ok(());
+        }
+        self.devices_checked
+            .insert(account.to_string(), tokio::time::Instant::now());
+        let listed = crate::grpc::get_pre_key_bundles(&self.grpc, account, Vec::new(), false)
+            .await
+            .map_err(|e| format!("GetPreKeyBundles: {e}"))?;
+        let listed_ids: Vec<String> = listed.bundles.iter().map(|b| b.device_id.clone()).collect();
+        for bundle in &listed.bundles {
+            if bundle.device_id != self.identity.device_id {
                 self.peers.record(
                     &self.storage,
                     account,
@@ -664,31 +708,34 @@ impl Task {
                     &bundle.bundle.x3dh.identity_public,
                 );
             }
-            let dropped = self.peers.reconcile(
-                &self.storage,
-                account,
-                &fetched.active_devices,
-                &fetched_ids,
-            );
-            if !dropped.is_empty() {
-                tracing::info!(%account, ?dropped, "devices no longer active");
-            }
-            for bundle in fetched.bundles {
-                if self.orchestrator.has_session_for_sending(&bundle.device_id) {
-                    continue;
-                }
-                let device = bundle.device_id.clone();
-                if let Err(e) = self.open_session(bundle).await {
-                    tracing::warn!(%account, %device, error = %e, "device left out of the send");
-                }
-            }
         }
-        Ok(self
+        let dropped =
+            self.peers
+                .reconcile(&self.storage, account, &listed.active_devices, &listed_ids);
+        if !dropped.is_empty() {
+            tracing::info!(%account, ?dropped, "devices no longer active");
+        }
+        let need: Vec<String> = self
             .peers
             .devices_of(account)
             .into_iter()
-            .filter(|d| self.orchestrator.has_active_session(d))
-            .collect())
+            .filter(|d| {
+                *d != self.identity.device_id && !self.orchestrator.has_session_for_sending(d)
+            })
+            .collect();
+        if need.is_empty() {
+            return Ok(());
+        }
+        let fetched = crate::grpc::get_pre_key_bundles(&self.grpc, account, need, true)
+            .await
+            .map_err(|e| format!("GetPreKeyBundles: {e}"))?;
+        for bundle in fetched.bundles {
+            let device = bundle.device_id.clone();
+            if let Err(e) = self.open_session(bundle).await {
+                tracing::warn!(%account, %device, error = %e, "device left out of the send");
+            }
+        }
+        Ok(())
     }
 
     /// Open an INITIATOR session with a fetched bundle's device.
@@ -800,7 +847,10 @@ impl Task {
         };
         let inner = sealing::sealed_inner(&account, device, body, content_type);
         self.sealed_tx
-            .send(OutboundSealed { inner, local_id })
+            .send(Outbound::Sealed {
+                inner: Box::new(inner),
+                local_id,
+            })
             .map_err(|_| "sealed sender worker stopped".to_string())
     }
 
@@ -860,6 +910,234 @@ impl Task {
                     message_id: local_id,
                 },
             ));
+        }
+    }
+
+    /// Save `device`'s session and the envelope book beside it, after the core changed it
+    /// outside the event loop (a sibling's copy, opened or written directly).
+    fn persist_session(&self, device: &str) {
+        match self.orchestrator.export_session_cfe(device) {
+            Ok(bytes) => {
+                if let Err(e) = self
+                    .storage
+                    .secure_save(&format!("session_{device}"), &bytes)
+                {
+                    tracing::error!(%device, error = %e, "session save failed");
+                }
+            }
+            Err(e) => tracing::error!(%device, error = %e, "session export failed"),
+        }
+        self.save_orchestrator_state();
+    }
+
+    /// The writer of a message that decrypted becomes a contact, so its chat shows.
+    fn adopt_writer(&mut self, account: &str) {
+        if self.known_contacts.contains(account)
+            || account == self.identity.user_id
+            || uuid::Uuid::parse_str(account).is_err()
+        {
+            return;
+        }
+        let username = format!("{}…", &account[..8]);
+        if let Err(e) = self
+            .storage
+            .upsert_contact(&crate::local_store::StoredContact {
+                user_id: account.to_string(),
+                display_name: username.clone(),
+                identity_key_b64: String::new(),
+            })
+        {
+            tracing::warn!(%account, error = %e, "new contact not saved");
+        }
+        self.known_contacts.insert(account.to_string());
+        let _ = self
+            .internal_tx
+            .send(crate::client::ClientEvent::ContactAdded {
+                user_id: account.to_string(),
+                username,
+            });
+    }
+
+    /// A message we send, in the transcript from the moment it is handed over.
+    fn keep_sent(&self, peer: &str, message_id: &str, text: &str) {
+        if let Err(e) = self
+            .storage
+            .store_message(&crate::local_store::StoredMessage {
+                id: message_id.to_string(),
+                peer_id: peer.to_string(),
+                text: text.to_string(),
+                direction: "sent".into(),
+                timestamp_ms: now_ms(),
+                delivery_status: String::new(),
+            })
+        {
+            tracing::warn!(%message_id, error = %e, "sent message not kept");
+        }
+    }
+
+    /// Our other devices, each with a session (see `refresh_devices`).
+    async fn own_siblings(&mut self) -> Vec<String> {
+        let me = self.identity.user_id.clone();
+        if let Err(e) = self.refresh_devices(&me).await {
+            tracing::warn!(error = %e, "own device set unavailable");
+        }
+        self.peers
+            .devices_of(&me)
+            .into_iter()
+            .filter(|d| *d != self.identity.device_id && self.orchestrator.has_active_session(d))
+            .collect()
+    }
+
+    /// A copy of a text we sent to `partner`, for each of our other devices (SENDER_SYNC).
+    async fn send_own_copies(&mut self, partner: &str, message_id: &str, text: &str) {
+        let siblings = self.own_siblings().await;
+        if siblings.is_empty() {
+            return;
+        }
+        let Some(plaintext) = crate::own_copy::text_copy(partner, message_id, text) else {
+            return;
+        };
+        let certificate = match self.certificate().await {
+            Ok(cert) => cert,
+            Err(e) => return tracing::warn!(error = %e, "own-device copies not sent"),
+        };
+        let Ok(certificate) =
+            crate::proto::core::v1::SenderCertificate::decode(certificate.as_slice())
+        else {
+            return tracing::warn!("own sender certificate does not parse");
+        };
+        for device in siblings {
+            let Some(identity_key) = self.peers.identity_of(&device).map(<[u8]>::to_vec) else {
+                continue;
+            };
+            let wire = match self.orchestrator.encrypt_bytes_for(&device, &plaintext) {
+                Ok(wire) => wire,
+                Err(e) => {
+                    tracing::warn!(%device, error = %e, "own-device copy not written");
+                    continue;
+                }
+            };
+            self.persist_session(&device);
+            let tag = match construct_core::crypto::device_copy_tag::device_copy_tag(
+                message_id,
+                &device,
+                &self.identity.identity_secret,
+                &identity_key,
+            ) {
+                Ok(tag) => tag,
+                Err(e) => {
+                    tracing::warn!(%device, error = %e, "own-device copy tag failed");
+                    continue;
+                }
+            };
+            let copy = crate::proto::core::v1::OwnDeviceCopy {
+                sender_certificate: Some(certificate.clone()),
+                wire_payload: wire.into(),
+            };
+            let envelope = own_copy_envelope(
+                &self.identity.user_id,
+                &device,
+                crate::own_copy::copy_id(message_id, &tag),
+                copy.encode_to_vec(),
+            );
+            let _ = self.sealed_tx.send(Outbound::OwnCopy {
+                envelope: Box::new(envelope),
+            });
+        }
+    }
+
+    /// A copy of a message we sent from another device: open it, place it in its conversation.
+    async fn handle_own_copy(&mut self, envelope: &Envelope) {
+        let message_id = direct_envelope_message_id(envelope).to_owned();
+        let me = self.identity.user_id.clone();
+        if envelope.sender.as_ref().map(|u| u.user_id.as_str()) != Some(me.as_str()) {
+            return tracing::warn!(%message_id, "copy from another account dropped");
+        }
+        let copy = match crate::proto::core::v1::OwnDeviceCopy::decode(
+            envelope.encrypted_payload.as_ref(),
+        ) {
+            Ok(copy) => copy,
+            Err(e) => return tracing::warn!(%message_id, error = %e, "copy does not parse"),
+        };
+        let Some(cert) = copy.sender_certificate else {
+            return tracing::warn!(%message_id, "copy carries no sender certificate");
+        };
+        let certificate = match crate::sealing::certificate_from_proto(&cert.encode_to_vec()) {
+            Ok(certificate) => certificate,
+            Err(e) => return tracing::warn!(%message_id, error = %e, "copy certificate unreadable"),
+        };
+        if certificate.user_id != me || certificate.device_id == self.identity.device_id {
+            return tracing::warn!(%message_id, "copy certificate names another account");
+        }
+        let sibling = certificate.device_id.clone();
+        // Addressed to another of our devices: its tag says so.
+        let (base_id, tag) = crate::own_copy::split_copy_id(&message_id);
+        if let Some(tag) = tag
+            && !construct_core::crypto::device_copy_tag::device_copy_tag_matches(
+                tag,
+                base_id,
+                &self.identity.device_id,
+                &self.identity.identity_secret,
+                &certificate.identity_key,
+            )
+        {
+            return tracing::debug!(%message_id, "copy for another device of this account");
+        }
+        let plaintext = match self
+            .orchestrator
+            .decrypt_bytes_for(&sibling, &copy.wire_payload)
+        {
+            Ok(plaintext) => plaintext,
+            Err(_) => match self
+                .orchestrator
+                .receiving_from_certificate(&certificate, &copy.wire_payload)
+            {
+                Ok((device, plaintext)) => {
+                    self.peers
+                        .record(&self.storage, &me, &device, &certificate.identity_key);
+                    crate::prekeys::save_after_responder_init(
+                        &mut self.orchestrator,
+                        &self.storage,
+                    );
+                    plaintext
+                }
+                Err(e) => return tracing::warn!(%message_id, %sibling, "copy does not open: {e}"),
+            },
+        };
+        self.persist_session(&sibling);
+        match crate::own_copy::read(&plaintext) {
+            crate::own_copy::Copy::Text { partner, text } => {
+                let timestamp_ms = now_ms();
+                if let Err(e) = self
+                    .storage
+                    .store_message(&crate::local_store::StoredMessage {
+                        id: base_id.to_string(),
+                        peer_id: partner.clone(),
+                        text: text.clone(),
+                        direction: "sent".into(),
+                        timestamp_ms,
+                        delivery_status: String::new(),
+                    })
+                {
+                    tracing::warn!(%message_id, error = %e, "copied message not kept");
+                }
+                self.adopt_writer(&partner);
+                tracing::info!(%message_id, %partner, "copy of our message placed");
+                let _ = self.internal_tx.send(crate::client::ClientEvent::Bridge(
+                    BridgeEvent::OwnMessage {
+                        peer_id: partner,
+                        message_id: base_id.to_string(),
+                        text,
+                        timestamp_ms,
+                    },
+                ));
+            }
+            crate::own_copy::Copy::ReadMarkers => {
+                tracing::debug!(%message_id, "read markers from another device — not applied yet");
+            }
+            crate::own_copy::Copy::Unsupported(why) => {
+                tracing::warn!(%message_id, "copy not shown: {why}");
+            }
         }
     }
 
@@ -933,6 +1211,7 @@ impl Task {
                 plaintext,
             } => {
                 let account = self.account_of(&contact_id);
+                self.adopt_writer(&account);
                 let text = crate::knst::decode_text(&plaintext);
                 tracing::info!(
                     device = %contact_id,
@@ -1127,6 +1406,35 @@ fn message_number(wire_payload: &[u8]) -> Option<Result<u32, String>> {
     )
 }
 
+/// The envelope of a copy to one of our devices. Identified on purpose — sender and recipient are
+/// both us, which the relay knows from the authenticated channel — and it names no conversation.
+fn own_copy_envelope(
+    account: &str,
+    device: &str,
+    message_id: String,
+    payload: Vec<u8>,
+) -> Envelope {
+    use crate::proto::core::v1::{DeviceId, UserId};
+    let me = UserId {
+        user_id: account.to_string(),
+        domain: None,
+        display_name: None,
+    };
+    Envelope {
+        sender: Some(me.clone()),
+        recipient: Some(me),
+        recipient_device: Some(DeviceId {
+            user: None,
+            device_id: device.to_string(),
+            ..Default::default()
+        }),
+        content_type: ContentType::SenderSync as i32,
+        message_id_type: Some(MessageIdType::MessageId(message_id)),
+        encrypted_payload: payload.into(),
+        ..Default::default()
+    }
+}
+
 fn direct_envelope_message_id(envelope: &Envelope) -> &str {
     match &envelope.message_id_type {
         Some(MessageIdType::MessageId(id)) => id,
@@ -1299,22 +1607,27 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn stream_message_command_drops_unknown_contact_before_core_pending_queue() {
+    #[test]
+    fn the_writer_of_a_message_becomes_a_contact_once() {
+        let (internal_tx, mut internal_rx) = mpsc::unbounded_channel();
         let mut task = test_task();
+        task.internal_tx = internal_tx;
+        let writer = "ed3c4cb1-5ee7-4a6f-9862-62a5a8b8560f";
 
-        let (event, context) = stale_message("bob", "unknown-msg0", 0, 0);
-        task.handle_stream_message(event, context).await;
+        task.adopt_writer(writer);
+        task.adopt_writer(writer);
+        task.adopt_writer(OWN_ACCOUNT); // ourselves
+        task.adopt_writer("bob-device"); // not an account id
 
-        assert_eq!(
-            task.storage.load_stream_cursor().unwrap().as_deref(),
-            Some("1000-0")
+        assert!(matches!(
+            internal_rx.try_recv(),
+            Ok(crate::client::ClientEvent::ContactAdded { ref user_id, .. }) if user_id == writer
+        ));
+        assert!(
+            internal_rx.try_recv().is_err(),
+            "one ContactAdded, for the writer only"
         );
-        assert_eq!(
-            task.orchestrator.pending_message_count("bob-device"),
-            0,
-            "unknown contact backlog must not force a later re-add down RESPONDER path"
-        );
+        assert_eq!(task.storage.get_contacts().unwrap().len(), 1);
     }
 
     #[tokio::test]
@@ -1488,6 +1801,8 @@ mod tests {
         )
     }
 
+    const OWN_ACCOUNT: &str = "753f79af-ede4-432c-9fcd-41deb5a35f0e";
+
     fn test_task() -> Task {
         let client = ClassicClient::<ClassicSuiteProvider>::new()
             .expect("test ClassicClient should initialize");
@@ -1506,6 +1821,7 @@ mod tests {
             cursor,
             Vec::new(),
             LocalIdentity {
+                user_id: OWN_ACCOUNT.into(),
                 device_id: "device-a".into(),
                 identity_secret: vec![1u8; 32],
                 signing_secret: vec![2u8; 32],

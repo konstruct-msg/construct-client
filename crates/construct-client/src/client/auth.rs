@@ -395,6 +395,20 @@ impl Client {
         self.link_task = Some(task.abort_handle());
     }
 
+    /// Let a device that asked to join become one of this account's devices.
+    pub(super) fn approve_join(&self, device_id: String) {
+        let events = self.events.clone();
+        let grpc = self.grpc.clone();
+        tokio::spawn(async move {
+            let short = &device_id[..8.min(device_id.len())];
+            let notice = match crate::grpc::approve_join_request(&grpc, &device_id).await {
+                Ok(()) => format!("Device {short} linked to this account"),
+                Err(e) => format!("Linking device {short} failed: {e}"),
+            };
+            let _ = events.send(ClientEvent::Notice(notice));
+        });
+    }
+
     pub(super) fn cancel_link(&mut self) {
         if let Some(task) = self.link_task.take() {
             task.abort();

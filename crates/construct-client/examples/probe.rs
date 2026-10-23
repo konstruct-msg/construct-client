@@ -10,6 +10,9 @@
 //!     --add <user_id> --send "hello" --wait 60
 //! ```
 //!
+//! `--approve <device id>` lets a device that asked to join (the `id` of its link code) become a
+//! device of this account — what the phone does when it scans the code.
+//!
 //! `--link` instead of `--username`: become a new device of an existing account — print the
 //! `konstruct://link-to-me` code for the phone to scan, then wait for its approval.
 //!
@@ -32,6 +35,7 @@ struct Args {
     find: Option<String>,
     send: Option<String>,
     link: bool,
+    approve: Option<String>,
     wait_secs: u64,
 }
 
@@ -43,6 +47,7 @@ fn parse_args() -> Args {
         find: None,
         send: None,
         link: false,
+        approve: None,
         wait_secs: 30,
     };
     let mut it = std::env::args().skip(1);
@@ -55,6 +60,7 @@ fn parse_args() -> Args {
             "--find" => args.find = Some(value()),
             "--send" => args.send = Some(value()),
             "--link" => args.link = true,
+            "--approve" => args.approve = Some(value()),
             "--wait" => args.wait_secs = value().parse().expect("--wait takes seconds"),
             other => panic!("unknown flag {other}"),
         }
@@ -117,6 +123,11 @@ async fn main() {
             ClientEvent::Started(contacts) => {
                 started = true;
                 println!("STARTED contacts={}", contacts.len());
+                if let Some(device_id) = &args.approve {
+                    client.send(ClientCommand::ApproveJoin {
+                        device_id: device_id.clone(),
+                    });
+                }
                 if let Some(username) = &args.find {
                     client.send(ClientCommand::FindContact {
                         query: username.clone(),
@@ -153,6 +164,9 @@ async fn main() {
             }
             ClientEvent::Bridge(BridgeEvent::NewMessage { peer_id, text, .. }) => {
                 println!("RECEIVED from={peer_id} text={text:?}");
+            }
+            ClientEvent::Bridge(BridgeEvent::OwnMessage { peer_id, text, .. }) => {
+                println!("OWN_COPY to={peer_id} text={text:?}");
             }
             ClientEvent::Bridge(BridgeEvent::MessageDelivered { message_id }) => {
                 println!("DELIVERED {message_id}");
