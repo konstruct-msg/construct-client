@@ -15,9 +15,13 @@ mod grpc;
 mod invite;
 mod knst;
 mod orchestrator_task;
+mod peers;
+mod prekeys;
 mod proto;
+mod sealing;
 pub mod storage;
 mod streaming;
+mod trust;
 
 mod client;
 pub use client::*;

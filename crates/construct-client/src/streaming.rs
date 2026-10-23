@@ -3,7 +3,7 @@
 //! Screens never see h3; they send [`StreamCmd`] and receive [`StreamEvent`].
 //! This worker reconnects the bidi stream on the shared [`GrpcClient`].
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -21,13 +21,11 @@ use crate::proto::services::v1::{
 };
 use crate::storage::Storage;
 
-const OUTGOING_BUFFER_CAP: usize = 256;
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(25);
 
 /// Commands sent **to** the stream handler from the app.
 #[derive(Debug)]
 pub enum StreamCmd {
-    Send(Box<Envelope>),
     Subscribe(Vec<String>, Option<String>),
     #[allow(dead_code)]
     Close,
@@ -150,7 +148,6 @@ async fn run_worker(
     mut cmd_rx: mpsc::Receiver<StreamCmd>,
     event_tx: mpsc::Sender<StreamEvent>,
 ) -> anyhow::Result<()> {
-    let mut pending: VecDeque<Envelope> = VecDeque::new();
     let mut attempt: u32 = 0;
 
     loop {
@@ -159,12 +156,15 @@ async fn run_worker(
             | Err(mpsc::error::TryRecvError::Disconnected) => {
                 return Ok(());
             }
-            Ok(StreamCmd::Send(envelope)) => push_pending(&mut pending, *envelope),
             Ok(StreamCmd::Subscribe(ids, _)) => subscribed_users = ids,
             Err(mpsc::error::TryRecvError::Empty) => {}
         }
 
-        client.invalidate_h3().await;
+        // A new connection only after a failed one: the first open shares the connection the
+        // unary calls are on, and dropping it under them broke them.
+        if attempt > 0 {
+            client.invalidate_h3().await;
+        }
         let since = cursor.committed();
         let (frame_tx, mut frame_rx) = mpsc::unbounded_channel();
         let open = open_message_stream(&client, subscribed_users.clone(), since, move |frame| {
@@ -177,14 +177,7 @@ async fn run_worker(
             Err(e) if e.is_unauthenticated() => {
                 warn!("MessageStream unauthenticated — not wiping keys");
                 let _ = event_tx.send(StreamEvent::AuthRequired).await;
-                if wait_backoff(
-                    &mut cmd_rx,
-                    &mut pending,
-                    &mut subscribed_users,
-                    &event_tx,
-                    &mut attempt,
-                )
-                .await?
+                if wait_backoff(&mut cmd_rx, &mut subscribed_users, &event_tx, &mut attempt).await?
                 {
                     return Ok(());
                 }
@@ -192,27 +185,13 @@ async fn run_worker(
             }
             Err(e) => {
                 warn!("MessageStream open failed: {e}");
-                if wait_backoff(
-                    &mut cmd_rx,
-                    &mut pending,
-                    &mut subscribed_users,
-                    &event_tx,
-                    &mut attempt,
-                )
-                .await?
+                if wait_backoff(&mut cmd_rx, &mut subscribed_users, &event_tx, &mut attempt).await?
                 {
                     return Ok(());
                 }
                 continue;
             }
         };
-
-        while let Some(envelope) = pending.pop_front() {
-            if let Err(e) = stream.send_envelope(envelope).await {
-                warn!("flush pending send failed: {e}");
-                break;
-            }
-        }
 
         attempt = 0;
         let _ = event_tx.send(StreamEvent::Connected).await;
@@ -237,14 +216,6 @@ async fn run_worker(
                 }
                 cmd = cmd_rx.recv() => {
                     match cmd {
-                        Some(StreamCmd::Send(envelope)) => {
-                            let envelope = *envelope;
-                            if let Err(e) = stream.send_envelope(envelope.clone()).await {
-                                warn!("stream send failed: {e}");
-                                push_pending(&mut pending, envelope);
-                                live = false;
-                            }
-                        }
                         Some(StreamCmd::Subscribe(ids, sub_cursor)) => {
                             subscribed_users = ids.clone();
                             let req = MessageStreamRequest {
@@ -283,26 +254,10 @@ async fn run_worker(
 
         drop(stream);
         let _ = event_tx.send(StreamEvent::Disconnected).await;
-        if wait_backoff(
-            &mut cmd_rx,
-            &mut pending,
-            &mut subscribed_users,
-            &event_tx,
-            &mut attempt,
-        )
-        .await?
-        {
+        if wait_backoff(&mut cmd_rx, &mut subscribed_users, &event_tx, &mut attempt).await? {
             return Ok(());
         }
     }
-}
-
-fn push_pending(pending: &mut VecDeque<Envelope>, envelope: Envelope) {
-    if pending.len() >= OUTGOING_BUFFER_CAP {
-        warn!("outgoing stream buffer full, dropping oldest envelope");
-        pending.pop_front();
-    }
-    pending.push_back(envelope);
 }
 
 fn encode_heartbeat_frame() -> bytes::Bytes {
@@ -326,7 +281,6 @@ fn now_ms() -> i64 {
 /// Sleep with backoff, draining cmds. `true` means the worker should exit.
 async fn wait_backoff(
     cmd_rx: &mut mpsc::Receiver<StreamCmd>,
-    pending: &mut VecDeque<Envelope>,
     subscribed_users: &mut Vec<String>,
     event_tx: &mpsc::Sender<StreamEvent>,
     attempt: &mut u32,
@@ -344,10 +298,6 @@ async fn wait_backoff(
         _ = tokio::time::sleep(delay) => Ok(false),
         cmd = cmd_rx.recv() => match cmd {
             Some(StreamCmd::Shutdown | StreamCmd::Close) | None => Ok(true),
-            Some(StreamCmd::Send(envelope)) => {
-                push_pending(pending, *envelope);
-                Ok(false)
-            }
             Some(StreamCmd::Subscribe(ids, _)) => {
                 *subscribed_users = ids;
                 Ok(false)
@@ -496,22 +446,6 @@ fn envelope_message_id(envelope: &Envelope) -> &str {
     }
 }
 
-#[allow(dead_code)]
-pub fn encode_envelope(
-    conversation_id: String,
-    encrypted_payload: Vec<u8>,
-    message_id: String,
-) -> Envelope {
-    Envelope {
-        conversation_id,
-        encrypted_payload: encrypted_payload.into(),
-        message_id_type: Some(crate::proto::core::v1::envelope::MessageIdType::MessageId(
-            message_id,
-        )),
-        ..Default::default()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -528,10 +462,9 @@ mod tests {
     async fn shutdown_aborts_backoff() {
         let (cmd_tx, mut cmd_rx) = mpsc::channel::<StreamCmd>(4);
         let (event_tx, mut event_rx) = mpsc::channel::<StreamEvent>(4);
-        let mut pending = VecDeque::new();
         let mut ids = Vec::new();
         let mut attempt = 6; // 60s without interrupt
-        let wait = wait_backoff(&mut cmd_rx, &mut pending, &mut ids, &event_tx, &mut attempt);
+        let wait = wait_backoff(&mut cmd_rx, &mut ids, &event_tx, &mut attempt);
         cmd_tx.send(StreamCmd::Shutdown).await.unwrap();
         let exit = tokio::time::timeout(Duration::from_millis(500), wait)
             .await

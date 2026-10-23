@@ -20,6 +20,7 @@ pub(crate) mod framing;
 mod invite;
 mod keys;
 mod paths;
+mod sealed;
 mod stream;
 pub(crate) mod users;
 
@@ -28,7 +29,11 @@ pub use auth::{
     register_device,
 };
 pub use client::GrpcClient;
+pub use error::GrpcError;
 pub use invite::accept_invite;
-pub use keys::{FetchedPreKeyBundle, get_pre_key_bundle, upload_pre_keys};
+pub use keys::{FetchedPreKeyBundle, PrekeyUpload, get_pre_key_bundles, upload_prekeys_full};
+pub use sealed::{
+    SenderCertificate, get_sender_certificate, get_server_trust_delegations, send_sealed_message,
+};
 pub use stream::open_message_stream;
 pub use users::find_user;

@@ -68,10 +68,15 @@ impl GrpcClient {
         self.invalidate().await;
     }
 
+    /// Connect once: callers racing here share one connection. Checked again under the write
+    /// lock, because a second connection replacing the first drops it and every call on it.
     async fn ensure(&self) -> Result<(), GrpcError> {
-        if self.inner.session.read().await.is_none() {
-            let session = connect_h2(&self.inner.host, self.inner.port).await?;
-            *self.inner.session.write().await = Some(session);
+        if self.inner.session.read().await.is_some() {
+            return Ok(());
+        }
+        let mut session = self.inner.session.write().await;
+        if session.is_none() {
+            *session = Some(connect_h2(&self.inner.host, self.inner.port).await?);
         }
         Ok(())
     }
