@@ -292,8 +292,23 @@ impl Task {
             tracing::error!(error = %e, "prekey publish failed");
             self.ui_error(format!("[PREKEYS] {e}"));
         }
+        // The first tick is now: rotation and top-up are checked at launch too.
+        let mut maintenance = tokio::time::interval(crate::prekeys::MAINTENANCE_INTERVAL);
+        maintenance.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tokio::select! {
+                _ = maintenance.tick() => {
+                    if let Err(e) = crate::prekeys::maintain(
+                        &mut self.orchestrator,
+                        &self.storage,
+                        &self.grpc,
+                        &self.identity.device_id,
+                    )
+                    .await
+                    {
+                        tracing::warn!(error = %e, "prekey maintenance failed");
+                    }
+                }
                 maybe_cmd = cmd_rx.recv() => {
                     let Some(cmd) = maybe_cmd else { break };
                     self.handle_command(cmd).await;

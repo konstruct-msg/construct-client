@@ -16,6 +16,9 @@ use super::framing::{decode_frame, encode_frame};
 
 pub(crate) type H2SendReq = h2::client::SendRequest<Bytes>;
 
+/// The longest a unary call may take, connecting included.
+const UNARY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
 struct Inner {
     host: String,
     port: u16,
@@ -94,13 +97,25 @@ impl GrpcClient {
     /// Unary gRPC call. `path` is `/package.Service/Method`.
     /// One retry after a transport error (new session); auth errors are not retried.
     pub async fn unary(&self, path: &str, request_bytes: &[u8]) -> Result<Vec<u8>, GrpcError> {
-        match self.unary_once(path, request_bytes).await {
+        match self.unary_timed(path, request_bytes).await {
             Err(e) if e.is_retryable_transport() => {
                 debug!("unary '{path}' transport error, retrying once: {e}");
                 self.invalidate().await;
-                self.unary_once(path, request_bytes).await
+                self.unary_timed(path, request_bytes).await
             }
             other => other,
+        }
+    }
+
+    /// No call waits forever: the orchestrator task awaits some of them, and everything else
+    /// waits behind it.
+    async fn unary_timed(&self, path: &str, request_bytes: &[u8]) -> Result<Vec<u8>, GrpcError> {
+        match tokio::time::timeout(UNARY_TIMEOUT, self.unary_once(path, request_bytes)).await {
+            Ok(result) => result,
+            Err(_) => {
+                *self.inner.session.write().await = None;
+                Err(GrpcError::transport(format!("'{path}' timed out")))
+            }
         }
     }
 
@@ -201,28 +216,30 @@ pub(crate) fn check_grpc_status(headers: &HeaderMap) -> Result<(), GrpcError> {
     Err(GrpcError::status(code, msg))
 }
 
+/// Send `data` as the peer's flow-control window allows: a chunk per grant of capacity.
+///
+/// It waited for capacity for the whole message and then sent it in one go. A message larger
+/// than the window (a prekey upload with 99 Kyber keys, ~500 KB) then never got that capacity,
+/// and the call hung with the orchestrator task behind it.
 pub(crate) async fn send_h2_data(
     send: &mut h2::SendStream<Bytes>,
-    data: Bytes,
+    mut data: Bytes,
 ) -> Result<(), GrpcError> {
-    let needed = data.len();
-    if send.capacity() < needed {
-        send.reserve_capacity(needed);
-        loop {
-            match std::future::poll_fn(|cx| send.poll_capacity(cx)).await {
-                Some(Ok(n)) if n >= needed || send.capacity() >= needed => break,
-                Some(Ok(_)) => continue,
-                Some(Err(e)) => {
-                    return Err(GrpcError::transport(format!("h2 capacity: {e}")));
-                }
-                None => {
-                    return Err(GrpcError::transport("h2 send stream closed"));
-                }
-            }
+    while !data.is_empty() {
+        send.reserve_capacity(data.len());
+        let granted = match std::future::poll_fn(|cx| send.poll_capacity(cx)).await {
+            Some(Ok(n)) => n,
+            Some(Err(e)) => return Err(GrpcError::transport(format!("h2 capacity: {e}"))),
+            None => return Err(GrpcError::transport("h2 send stream closed")),
+        };
+        if granted == 0 {
+            continue;
         }
+        let chunk = data.split_to(granted.min(data.len()));
+        send.send_data(chunk, false)
+            .map_err(|e| GrpcError::transport(format!("h2 send_data: {e}")))?;
     }
-    send.send_data(data, false)
-        .map_err(|e| GrpcError::transport(format!("h2 send_data: {e}")))
+    Ok(())
 }
 
 async fn do_unary(
@@ -306,5 +323,47 @@ mod tests {
             parse_server_url("https://example.com"),
             ("example.com".into(), 443)
         );
+    }
+
+    /// A peer whose flow-control window is 16 KB still receives a 200 KB message whole. Before
+    /// the message went in chunks, this hung waiting for capacity the window never grants.
+    #[tokio::test]
+    async fn a_message_larger_than_the_window_is_sent_whole() {
+        const LEN: usize = 200_000;
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let server = tokio::spawn(async move {
+            let mut conn = h2::server::Builder::new()
+                .initial_window_size(16_384)
+                .initial_connection_window_size(16_384)
+                .handshake::<_, Bytes>(server_io)
+                .await
+                .expect("server handshake");
+            let (request, _respond) = conn.accept().await.expect("a request").expect("ok");
+            tokio::spawn(async move { while conn.accept().await.is_some() {} });
+            let mut body = request.into_body();
+            let mut received = 0;
+            while let Some(chunk) = body.data().await {
+                let chunk = chunk.expect("data");
+                received += chunk.len();
+                let _ = body.flow_control().release_capacity(chunk.len());
+            }
+            received
+        });
+
+        let (mut client, connection) = h2::client::handshake(client_io).await.expect("handshake");
+        tokio::spawn(connection);
+        let (_response, mut send) = client
+            .send_request(http::Request::post("/x").body(()).unwrap(), false)
+            .expect("request");
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            send_h2_data(&mut send, Bytes::from(vec![7u8; LEN])),
+        )
+        .await
+        .expect("the send finishes")
+        .expect("the send succeeds");
+        send.send_data(Bytes::new(), true).expect("end of stream");
+
+        assert_eq!(server.await.unwrap(), LEN);
     }
 }

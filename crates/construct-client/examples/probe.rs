@@ -14,6 +14,9 @@
 //! that made themselves discoverable are found), an invite link is redeemed; either is added and
 //! sent to.
 //!
+//! `CONSTRUCT_ROTATE_PREKEYS_NOW=1` makes the client rotate its signed prekeys at launch, to check
+//! a rotation against the server.
+//!
 //! Register only test accounts with it, named so they read as such.
 
 use construct_client::{ClientCommand, ClientConfig, ClientEvent, bridge::BridgeEvent};
