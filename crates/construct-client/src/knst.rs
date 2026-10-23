@@ -43,6 +43,8 @@ pub const CONTENT_PROFILE: u8 = ContentType::Profile as u8;
 /// "I could not read your message", answered by the core; never a bubble.
 pub const CONTENT_DECRYPTION_ERROR: u8 = ContentType::DecryptionError as u8;
 pub const CONTENT_SESSION_READY: u8 = ContentType::SessionReady as u8;
+/// Read markers from one of our own devices; never a bubble. Applying them waits on multidevice.
+pub const CONTENT_READ_SYNC: u8 = ContentType::ReadSync as u8;
 
 /// Wrap UTF-8 chat text as a single-chunk KNST frame carrying `MessageContent`.
 pub fn encode_text(text: &str, message_id: &str) -> Vec<u8> {
@@ -129,7 +131,8 @@ pub fn disposition(content_type: u8) -> Disposition {
         | CONTENT_SESSION_READY
         | CONTENT_CONTACT_CARD
         | CONTENT_PROFILE
-        | CONTENT_DECRYPTION_ERROR => Disposition::SilentControl,
+        | CONTENT_DECRYPTION_ERROR
+        | CONTENT_READ_SYNC => Disposition::SilentControl,
         _ => Disposition::NotCarried,
     }
 }

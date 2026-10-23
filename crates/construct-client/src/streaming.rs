@@ -443,6 +443,15 @@ async fn dispatch_incoming(frame: bytes::Bytes, event_tx: &mpsc::Sender<StreamEv
                 })
                 .await;
         }
+        Some(message_stream_response::Response::MailboxGap(gap)) => {
+            // Messages trimmed from the mailbox after our cursor are gone; the server knows only
+            // the interval (decisions/mailbox-gap-is-reported.md). Not shown to the person yet.
+            warn!(
+                after_cursor = %gap.after_cursor,
+                resumes_at = %gap.resumes_at,
+                "MessageStream mailbox gap: undelivered messages were trimmed"
+            );
+        }
         Some(message_stream_response::Response::Receipt(_)) => {
             debug!("MessageStream receipt ignored");
         }

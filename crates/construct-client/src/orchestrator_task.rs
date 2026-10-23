@@ -506,11 +506,6 @@ async fn dispatch(
             });
         }
 
-        // These are handled internally by the Orchestrator itself.
-        Action::DecryptMessage { .. }
-        | Action::EncryptMessage { .. }
-        | Action::ArchiveSession { .. } => {}
-
         // ── Decrypted message ready ─────────────────────────────────────────
         Action::MessageDecrypted {
             contact_id,
@@ -647,16 +642,6 @@ async fn dispatch(
             let _ = stream_tx.try_send(StreamCmd::Send(Box::new(envelope)));
         }
 
-        Action::SendReceipt { message_id, status } => {
-            // TODO: construct DeliveryReceipt proto and send via stream.
-            tracing::debug!(
-                target: "orchestrator_task",
-                message_id = %message_id,
-                status = ?status,
-                "SendReceipt (not yet wired)"
-            );
-        }
-
         Action::SendDecryptionError {
             contact_id,
             message_id,
@@ -739,12 +724,6 @@ async fn dispatch(
                 let _ = tx.send(IncomingEvent::TimerFired { timer_id: tid });
             });
             timers.insert(timer_id, handle.abort_handle());
-        }
-
-        Action::CancelTimer { timer_id } => {
-            if let Some(handle) = timers.remove(&timer_id) {
-                handle.abort();
-            }
         }
     }
 }
