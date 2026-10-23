@@ -88,6 +88,8 @@ impl Client {
                         access_token: result.access_token,
                         full_session: full.clone(),
                         pending_save: Some(full),
+                        key_record: None,
+                        link_cursor: None,
                     }))
                 }
                 Err(e) => AuthMsg::Failure(format!("Device re-auth failed: {e}")),
