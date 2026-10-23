@@ -95,3 +95,30 @@ pub async fn get_server_trust_delegations(
         .map_err(|e| GrpcError::transport(format!("GetServerTrust decode: {e}")))?;
     Ok(resp.delegations.into_iter().map(|d| d.to_vec()).collect())
 }
+
+/// `MessagingService.SendMessage` with an identified envelope, on the authenticated client — only
+/// for a copy to one of our own devices, the one send that goes unsealed
+/// (decisions/sealing-is-a-declared-value.md, `.ownDevices`).
+pub async fn send_own_device_copy(
+    client: &GrpcClient,
+    envelope: crate::proto::core::v1::Envelope,
+) -> Result<(), GrpcError> {
+    use crate::proto::services::v1::SendMessageRequest;
+    let req = SendMessageRequest {
+        message: Some(envelope),
+        attempt_id: Some(uuid::Uuid::new_v4().to_string()),
+        ..Default::default()
+    };
+    let bytes = client
+        .unary(paths::MESSAGING_SEND, &req.encode_to_vec())
+        .await?;
+    let resp = SendMessageResponse::decode(bytes.as_slice())
+        .map_err(|e| GrpcError::transport(format!("SendMessage decode: {e}")))?;
+    if let Some(error) = resp.error {
+        return Err(GrpcError::status(
+            error.error_code as u32,
+            format!("SendMessage refused: {}", error.error_message),
+        ));
+    }
+    Ok(())
+}

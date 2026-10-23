@@ -434,14 +434,42 @@ impl App {
 
     fn handle_bridge_event(&mut self, evt: BridgeEvent) {
         match evt {
-            BridgeEvent::NewMessage { text, .. } => {
-                self.chat_view.messages.push(ChatMessage {
-                    id: uuid::Uuid::new_v4().to_string(),
-                    kind: MessageKind::Received,
-                    text,
-                    time: current_time_hhmm(),
-                });
-                self.chat_view.on_new_message();
+            // Into the open conversation only if it is the writer's; it went into every
+            // conversation that happened to be open until a linked device had several.
+            BridgeEvent::NewMessage {
+                peer_id,
+                message_id,
+                text,
+                ..
+            } => {
+                if self.open_peer.as_deref() == Some(peer_id.as_str()) {
+                    self.chat_view.messages.push(ChatMessage {
+                        id: message_id,
+                        kind: MessageKind::Received,
+                        text,
+                        time: current_time_hhmm(),
+                    });
+                    self.chat_view.on_new_message();
+                } else {
+                    let name = self.contact_name(&peer_id);
+                    self.status = format!("New message from @{name}");
+                }
+            }
+            BridgeEvent::OwnMessage {
+                peer_id,
+                message_id,
+                text,
+                ..
+            } => {
+                if self.open_peer.as_deref() == Some(peer_id.as_str()) {
+                    self.chat_view.messages.push(ChatMessage {
+                        id: message_id,
+                        kind: MessageKind::Sent,
+                        text,
+                        time: current_time_hhmm(),
+                    });
+                    self.chat_view.on_new_message();
+                }
             }
             BridgeEvent::MessageDelivered { message_id: _ } => {
                 // TODO: update delivery indicator
@@ -1165,4 +1193,16 @@ fn is_quit(key: &KeyEvent) -> bool {
         (key.code, key.modifiers),
         (KeyCode::Char('c'), KeyModifiers::CONTROL) | (KeyCode::Char('q'), KeyModifiers::NONE)
     )
+}
+
+impl App {
+    /// The name a contact shows under, or its id when it has none.
+    fn contact_name(&self, id: &str) -> String {
+        self.chat_list
+            .contacts
+            .iter()
+            .find(|c| c.id == id)
+            .map(|c| c.display_name.clone())
+            .unwrap_or_else(|| id.to_string())
+    }
 }

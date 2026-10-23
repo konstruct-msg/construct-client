@@ -133,6 +133,22 @@ pub async fn confirm_device_link(
     tokens_from(resp.tokens)
 }
 
+/// `AuthService.ApproveJoinRequest` — authenticated: a device of this account lets the device
+/// that asked to join become one of its devices.
+pub async fn approve_join_request(client: &GrpcClient, device_id: &str) -> Result<(), GrpcError> {
+    use crate::proto::services::v1::{ApproveJoinRequestRequest, ApproveJoinRequestResponse};
+    let req = ApproveJoinRequestRequest {
+        pending_device_id: device_id.to_string(),
+        crypto_suite: "Curve25519+Ed25519".into(),
+    };
+    let bytes = client
+        .unary(paths::AUTH_APPROVE_JOIN, &req.encode_to_vec())
+        .await?;
+    ApproveJoinRequestResponse::decode(bytes.as_slice())
+        .map_err(|e| GrpcError::transport(format!("ApproveJoinRequest decode: {e}")))?;
+    Ok(())
+}
+
 fn tokens_from(
     tokens: Option<crate::proto::services::v1::AuthTokensResponse>,
 ) -> Result<AuthTokens, GrpcError> {

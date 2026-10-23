@@ -37,7 +37,8 @@ pub use keys::{
     upload_prekeys_full,
 };
 pub use sealed::{
-    SenderCertificate, get_sender_certificate, get_server_trust_delegations, send_sealed_message,
+    SenderCertificate, get_sender_certificate, get_server_trust_delegations, send_own_device_copy,
+    send_sealed_message,
 };
 pub use stream::open_message_stream;
 pub use users::find_user;

@@ -10,6 +10,9 @@
 //!     --add <user_id> --send "hello" --wait 60
 //! ```
 //!
+//! `--approve <device id>` lets a device that asked to join (the `id` of its link code) become a
+//! device of this account — what the phone does when it scans the code.
+//!
 //! `--find <username or invite link>` instead of `--add`: a username is looked up (only accounts
 //! that made themselves discoverable are found), an invite link is redeemed; either is added and
 //! sent to.
@@ -108,6 +111,11 @@ async fn main() {
             ClientEvent::Started(contacts) => {
                 started = true;
                 println!("STARTED contacts={}", contacts.len());
+                if let Some(device_id) = &args.approve {
+                    client.send(ClientCommand::ApproveJoin {
+                        device_id: device_id.clone(),
+                    });
+                }
                 if let Some(username) = &args.find {
                     client.send(ClientCommand::FindContact {
                         query: username.clone(),
@@ -144,6 +152,9 @@ async fn main() {
             }
             ClientEvent::Bridge(BridgeEvent::NewMessage { peer_id, text, .. }) => {
                 println!("RECEIVED from={peer_id} text={text:?}");
+            }
+            ClientEvent::Bridge(BridgeEvent::OwnMessage { peer_id, text, .. }) => {
+                println!("OWN_COPY to={peer_id} text={text:?}");
             }
             ClientEvent::Bridge(BridgeEvent::MessageDelivered { message_id }) => {
                 println!("DELIVERED {message_id}");

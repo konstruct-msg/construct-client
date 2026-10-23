@@ -14,6 +14,13 @@ pub enum BridgeEvent {
         text: String,
         timestamp_ms: i64,
     },
+    /// A message we sent from another device of this account, copied here.
+    OwnMessage {
+        peer_id: String,
+        message_id: String,
+        text: String,
+        timestamp_ms: i64,
+    },
     /// A message we sent was acknowledged by the server.
     MessageDelivered { message_id: String },
     /// Stream connection status changed (connected / disconnected).
