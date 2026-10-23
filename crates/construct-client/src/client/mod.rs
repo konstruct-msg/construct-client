@@ -42,6 +42,11 @@ pub enum ClientCommand {
     LinkDevice {
         token: String,
     },
+    /// Become a new device of an existing account: show a code for the phone to scan
+    /// ([`ClientEvent::LinkCode`]) and wait for its approval.
+    LinkByQr,
+    /// Stop waiting for the phone.
+    CancelLink,
     /// Protect the new session with this passphrase and start.
     SetPassphrase(Zeroizing<Vec<u8>>),
     SendText {
@@ -119,6 +124,10 @@ pub enum ClientEvent {
         number: String,
     },
     InviteMinted(Result<String, String>),
+    /// What the phone scans to approve this device (`konstruct://link-to-me?…`).
+    LinkCode(String),
+    /// Linking stopped: refused, expired, or the server could not be reached.
+    LinkFailed(String),
     LoggedOut,
     /// A one-line message for the user.
     Notice(String),
@@ -220,6 +229,10 @@ pub(crate) struct Client {
     stream_tx: Option<mpsc::Sender<crate::streaming::StreamCmd>>,
     /// The people the stream is subscribed for, in the order they were added.
     contact_ids: Vec<String>,
+    /// A link waiting for the phone's approval.
+    link_task: Option<tokio::task::AbortHandle>,
+    /// An approved link's key record and starting cursor, until there is a store to write them to.
+    pending_link: Option<(Vec<u8>, Option<String>)>,
 }
 
 impl Client {
@@ -248,6 +261,8 @@ impl Client {
             orch_handle: None,
             stream_tx: None,
             contact_ids: Vec::new(),
+            link_task: None,
+            pending_link: None,
         }
     }
 
@@ -270,6 +285,8 @@ impl Client {
             ClientCommand::Unlock(passphrase) => self.unlock(&passphrase),
             ClientCommand::Register { username } => self.register(username),
             ClientCommand::LinkDevice { token } => self.link_device(token),
+            ClientCommand::LinkByQr => self.link_by_qr(),
+            ClientCommand::CancelLink => self.cancel_link(),
             ClientCommand::SetPassphrase(passphrase) => self.set_passphrase(&passphrase),
             ClientCommand::SendText { contact_id, text } => self.send_text(contact_id, text),
             ClientCommand::LoadHistory { peer_id, limit } => self.load_history(peer_id, limit),

@@ -29,6 +29,11 @@ pub(crate) struct AuthSuccess {
     pub(super) full_session: Session,
     /// When `Some`, this session must be persisted to disk (new/updated).
     pub(super) pending_save: Option<Session>,
+    /// A linked device's key record, made before the phone approved it (its hybrid key is the
+    /// one the QR committed to): written into the new store before the engine starts.
+    pub(super) key_record: Option<Vec<u8>>,
+    /// Where a linked device starts reading the stream.
+    pub(super) link_cursor: Option<String>,
 }
 
 /// Where the session (keys and tokens) lives in the store.
@@ -192,6 +197,8 @@ impl Client {
                         access_token: result.access_token,
                         full_session: full,
                         pending_save: result.session,
+                        key_record: None,
+                        link_cursor: None,
                     }))
                 }
                 Err(e) => AuthMsg::Failure(format!("{e:#}")),
@@ -228,6 +235,8 @@ impl Client {
                         access_token: result.access_token,
                         full_session: full,
                         pending_save: result.session,
+                        key_record: None,
+                        link_cursor: None,
                     }))
                 }
                 Err(e) => AuthMsg::Failure(format!("{e:#}")),
@@ -253,6 +262,8 @@ impl Client {
                         access_token: result.access_token,
                         full_session: full,
                         pending_save: result.session,
+                        key_record: None,
+                        link_cursor: None,
                     }))
                 }
                 Err(e) => AuthMsg::Failure(format!("{e:#}")),
@@ -280,7 +291,10 @@ impl Client {
             access_token,
             full_session,
             pending_save,
+            key_record,
+            link_cursor,
         } = success;
+        self.pending_link = key_record.map(|record| (record, link_cursor));
         self.user_id = user_id;
         self.device_id = device_id.clone();
         self.access_token = access_token.clone();
@@ -311,9 +325,79 @@ impl Client {
                 Err(e) => return self.emit(ClientEvent::SaveFailed(format!("Save failed: {e}"))),
             }
         }
-        match self.save_session(&session) {
+        match self
+            .save_session(&session)
+            .and_then(|()| self.write_pending_link())
+        {
             Ok(()) => self.start(full_session),
             Err(e) => self.emit(ClientEvent::SaveFailed(format!("Save failed: {e}"))),
+        }
+    }
+
+    /// A linked device's key record and starting cursor, into the store it just got.
+    fn write_pending_link(&mut self) -> Result<(), String> {
+        let Some((record, cursor)) = self.pending_link.take() else {
+            return Ok(());
+        };
+        let store = self.store.as_ref().ok_or("no store open")?;
+        store
+            .secure_save(crate::prekeys::KEY_RECORD, &record)
+            .map_err(|e| format!("{e:#}"))?;
+        if let Some(cursor) = cursor {
+            store
+                .save_stream_cursor(&cursor)
+                .map_err(|e| format!("{e:#}"))?;
+        }
+        Ok(())
+    }
+
+    /// Become a new device of an existing account (Flow B): make the keys, hand them to the
+    /// server, show the phone a code, and wait for its approval. Success arrives as an ordinary
+    /// [`AuthMsg::Success`], carrying the key record made here.
+    pub(super) fn link_by_qr(&mut self) {
+        self.cancel_link();
+        let inbox = self.inbox.clone();
+        let events = self.events.clone();
+        let grpc = self.grpc.clone();
+        let task = tokio::spawn(async move {
+            let prep = match tokio::task::spawn_blocking(crate::auth::prepare_join).await {
+                Ok(Ok(prep)) => prep,
+                Ok(Err(e)) => return drop(events.send(ClientEvent::LinkFailed(format!("{e:#}")))),
+                Err(e) => return drop(events.send(ClientEvent::LinkFailed(e.to_string()))),
+            };
+            if let Err(e) = crate::grpc::submit_join_request(&grpc, &prep.request).await {
+                return drop(events.send(ClientEvent::LinkFailed(format!(
+                    "The server did not take the request: {e}"
+                ))));
+            }
+            let _ = events.send(ClientEvent::LinkCode(prep.qr.clone()));
+            let device_id = prep.request.device_id.clone();
+            let tokens = match crate::auth::wait_for_approval(&grpc, &device_id).await {
+                Ok(tokens) => tokens,
+                Err(e) => return drop(events.send(ClientEvent::LinkFailed(format!("{e:#}")))),
+            };
+            let mut session = prep.session_secrets;
+            session.user_id = tokens.user_id.clone();
+            session.access_token = tokens.access_token.clone();
+            session.refresh_token = tokens.refresh_token;
+            session.expires_at = tokens.expires_at;
+            let link_cursor = crate::auth::link_cursor(&tokens.access_token);
+            let _ = inbox.send(Inbox::Auth(AuthMsg::Success(Box::new(AuthSuccess {
+                user_id: tokens.user_id,
+                device_id,
+                access_token: tokens.access_token,
+                full_session: session.clone(),
+                pending_save: Some(session),
+                key_record: Some(prep.key_record),
+                link_cursor,
+            }))));
+        });
+        self.link_task = Some(task.abort_handle());
+    }
+
+    pub(super) fn cancel_link(&mut self) {
+        if let Some(task) = self.link_task.take() {
+            task.abort();
         }
     }
 
@@ -348,7 +432,10 @@ impl Client {
                 )));
             }
         }
-        if let Err(e) = self.save_session(&session) {
+        if let Err(e) = self
+            .save_session(&session)
+            .and_then(|()| self.write_pending_link())
+        {
             return self.emit(ClientEvent::PassphraseFailed(format!("Save failed: {e}")));
         }
         self.unlocked_by_passphrase = true;

@@ -133,6 +133,74 @@ pub async fn confirm_device_link(
     tokens_from(resp.tokens)
 }
 
+/// This device's keys for the phone to approve (Flow B): what `SubmitJoinRequest` carries.
+pub struct JoinRequest {
+    pub device_id: String,
+    pub identity_public: Vec<u8>,
+    pub verifying_key: Vec<u8>,
+    pub signed_prekey_public: Vec<u8>,
+    pub signed_prekey_signature: Vec<u8>,
+    pub device_name: String,
+    pub platform: String,
+}
+
+/// `DeviceLinkService.SubmitJoinRequest` — no token: the server holds the request until a device
+/// of the account approves it, or ten minutes pass.
+pub async fn submit_join_request(client: &GrpcClient, join: &JoinRequest) -> Result<(), GrpcError> {
+    use crate::proto::services::v1::{JoinRequestAck, JoinRequestPayload};
+    let req = JoinRequestPayload {
+        pending_device_id: join.device_id.clone(),
+        device_name: join.device_name.clone(),
+        platform: join.platform.clone(),
+        identity_public: join.identity_public.clone().into(),
+        verifying_key: join.verifying_key.clone().into(),
+        signed_prekey_public: join.signed_prekey_public.clone().into(),
+        signed_prekey_signature: join.signed_prekey_signature.clone().into(),
+        ..Default::default()
+    };
+    let bytes = client
+        .unary(paths::DEVICE_SUBMIT_JOIN, &req.encode_to_vec())
+        .await?;
+    JoinRequestAck::decode(bytes.as_slice())
+        .map_err(|e| GrpcError::transport(format!("SubmitJoinRequest decode: {e}")))?;
+    Ok(())
+}
+
+/// Where a join request stands.
+pub enum JoinStatus {
+    Pending,
+    Approved(AuthTokens),
+    Rejected,
+    Expired,
+}
+
+/// `DeviceLinkService.CheckJoinRequestStatus`.
+pub async fn check_join_request(
+    client: &GrpcClient,
+    device_id: &str,
+) -> Result<JoinStatus, GrpcError> {
+    use crate::proto::services::v1::{
+        CheckJoinRequestStatusRequest, CheckJoinRequestStatusResponse,
+        check_join_request_status_response::Status,
+    };
+    let req = CheckJoinRequestStatusRequest {
+        pending_device_id: device_id.to_string(),
+    };
+    let bytes = client
+        .unary(paths::DEVICE_CHECK_JOIN, &req.encode_to_vec())
+        .await?;
+    let resp = CheckJoinRequestStatusResponse::decode(bytes.as_slice())
+        .map_err(|e| GrpcError::transport(format!("CheckJoinRequestStatus decode: {e}")))?;
+    Ok(
+        match Status::try_from(resp.status).unwrap_or(Status::Pending) {
+            Status::Pending => JoinStatus::Pending,
+            Status::Approved => JoinStatus::Approved(tokens_from(resp.tokens)?),
+            Status::Rejected => JoinStatus::Rejected,
+            Status::Expired => JoinStatus::Expired,
+        },
+    )
+}
+
 fn tokens_from(
     tokens: Option<crate::proto::services::v1::AuthTokensResponse>,
 ) -> Result<AuthTokens, GrpcError> {

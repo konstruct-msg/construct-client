@@ -1,11 +1,10 @@
 //! Device linking screen — two modes:
 //!
-//! **SCAN** tab (default): enter a link token from another device.
-//!   Flow: other device → Settings → Add Replica → generates token
-//!         user types/pastes it here → Enter → ConfirmDeviceLink RPC
+//! **SHOW** tab (default): this device asks to join an account. Its code (`konstruct://link-to-me`)
+//!   is shown as a QR for the phone to scan and approve; the client waits for the approval
+//!   (Flow B — a desktop has no camera, so this is the way in).
 //!
-//! **SHOW** tab: this device generated a link token; display it as a QR code
-//!   for the new device to scan with the mobile app or another TUI instance.
+//! **SCAN** tab: enter a link token from another device (`ConfirmDeviceLink`, Flow A).
 
 use crate::theme::ThemeMode;
 use ratatui::{
@@ -41,10 +40,10 @@ impl DeviceLinkScreen {
     pub fn new() -> Self {
         Self {
             theme: ThemeMode::default(),
-            tab: DeviceLinkTab::Scan,
+            tab: DeviceLinkTab::Show,
             token: String::new(),
             own_token: None,
-            status: Some("Paste or type the link token shown on your other device".into()),
+            status: None,
             is_error: false,
         }
     }
@@ -84,19 +83,19 @@ impl Widget for &DeviceLinkScreen {
     fn render(self, area: Rect, buf: &mut Buffer) {
         let palette = self.theme.palette();
         // ── Tab bar ───────────────────────────────────────────────────────────
-        let tab_scan = if self.tab == DeviceLinkTab::Scan {
-            Span::styled(" [SCAN] ", palette.selected())
-        } else {
-            Span::styled(" [SCAN] ", palette.muted())
-        };
         let tab_show = if self.tab == DeviceLinkTab::Show {
-            Span::styled(" [SHOW QR] ", palette.selected())
+            Span::styled(" [SHOW CODE] ", palette.selected())
         } else {
-            Span::styled(" [SHOW QR] ", palette.muted())
+            Span::styled(" [SHOW CODE] ", palette.muted())
         };
-        let tab_hint = Span::styled("  Tab=switch tab", palette.muted());
+        let tab_scan = if self.tab == DeviceLinkTab::Scan {
+            Span::styled(" [ENTER TOKEN] ", palette.selected())
+        } else {
+            Span::styled(" [ENTER TOKEN] ", palette.muted())
+        };
+        let tab_hint = Span::styled("  Tab=switch   Esc=back", palette.muted());
 
-        let tab_line = Line::from(vec![tab_scan, tab_show, tab_hint]);
+        let tab_line = Line::from(vec![tab_show, tab_scan, tab_hint]);
         let tab_w = area.width;
         Paragraph::new(tab_line).style(palette.canvas()).render(
             Rect {
@@ -194,10 +193,31 @@ impl DeviceLinkScreen {
 
     fn render_show(&self, area: Rect, buf: &mut Buffer) {
         let palette = self.theme.palette();
+        if let Some(ref msg) = self.status {
+            let style = if self.is_error {
+                palette.state(true)
+            } else {
+                palette.muted()
+            };
+            let w = (msg.chars().count() as u16).min(area.width);
+            Paragraph::new(msg.as_str()).style(style).render(
+                Rect {
+                    x: area.x + area.width.saturating_sub(w) / 2,
+                    y: area.y + area.height.saturating_sub(1),
+                    width: w,
+                    height: 1,
+                },
+                buf,
+            );
+        }
+        let area = Rect {
+            height: area.height.saturating_sub(2),
+            ..area
+        };
         match &self.own_token {
             None => {
                 // Token not yet generated — show loading hint
-                let msg = "Generating link token…";
+                let msg = "Making a link code…";
                 let x = area.x + area.width.saturating_sub(msg.len() as u16) / 2;
                 let y = area.y + area.height / 2;
                 Paragraph::new(msg).style(palette.muted()).render(
@@ -210,30 +230,11 @@ impl DeviceLinkScreen {
                     buf,
                 );
             }
-            Some(token) => {
-                // Show QR code centred in the available area
-                let caption = "Scan with Konstruct on another device";
-                QrWidget::new(token)
-                    .caption(caption)
+            Some(code) => {
+                QrWidget::new(code)
+                    .caption("Link this device to your account")
                     .theme(self.theme)
                     .render(area, buf);
-
-                // Token text below (for manual entry fallback)
-                let token_display = format!("Token: {}", token);
-                let td_w = token_display.len() as u16;
-                let tx = area.x + area.width.saturating_sub(td_w) / 2;
-                let ty = area.y + area.height.saturating_sub(1);
-                Paragraph::new(token_display.as_str())
-                    .style(palette.muted())
-                    .render(
-                        Rect {
-                            x: tx,
-                            y: ty,
-                            width: td_w.min(area.width),
-                            height: 1,
-                        },
-                        buf,
-                    );
             }
         }
     }

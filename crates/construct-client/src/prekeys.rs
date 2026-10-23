@@ -19,7 +19,7 @@ use ed25519_dalek::Signer;
 
 use crate::local_store::LocalStore;
 
-const KEY_RECORD: &str = "crypto_private_keys";
+pub(crate) const KEY_RECORD: &str = "crypto_private_keys";
 const ONE_TIME_PREKEYS: &str = "crypto_otpks";
 const KYBER_PREKEYS: &str = "crypto_kyber_prekeys";
 /// `device_id:kyber_spk_id` of the last successful publish.

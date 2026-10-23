@@ -22,3 +22,7 @@ pub const MESSAGING_SEND_SEALED: &str =
 pub const SERVER_TRUST: &str = "/shared.proto.services.v1.ServerTrustService/GetServerTrust";
 pub const KEY_SPK_AGE: &str = "/shared.proto.services.v1.KeyService/GetSignedPreKeyAge";
 pub const KEY_ROTATE_SPK: &str = "/shared.proto.services.v1.KeyService/RotateSignedPreKey";
+pub const DEVICE_SUBMIT_JOIN: &str =
+    "/shared.proto.services.v1.DeviceLinkService/SubmitJoinRequest";
+pub const DEVICE_CHECK_JOIN: &str =
+    "/shared.proto.services.v1.DeviceLinkService/CheckJoinRequestStatus";

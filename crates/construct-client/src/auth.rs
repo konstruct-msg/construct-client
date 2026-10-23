@@ -313,3 +313,200 @@ pub async fn authenticate_saved_session(
         session: Some(session),
     })
 }
+
+// ── Linking as a new device of an existing account (Flow B) ─────────────────────
+
+/// A device made ready to be approved by the phone: its keys, its key record with the hybrid key
+/// already in it, and what the QR code says.
+pub struct JoinPrep {
+    pub session_secrets: Session,
+    /// The core's key record (`export_private_keys_cfe`), hybrid key included: the QR's
+    /// fingerprint commits to that key, so it must be the one the device later publishes.
+    pub key_record: Vec<u8>,
+    pub request: crate::grpc::JoinRequest,
+    /// `konstruct://link-to-me?…`, what the phone scans.
+    pub qr: String,
+}
+
+/// How long the server holds a join request.
+const JOIN_TTL: Duration = Duration::from_secs(10 * 60);
+const JOIN_POLL: Duration = Duration::from_secs(3);
+
+/// Make the keys of a device that will join an account, as iOS's `prepareLinkIdentity` does: the
+/// classic keys, then the hybrid signature key, all kept in one key record. The QR carries
+/// `SHA256(identity ‖ hybrid)`; the phone vouches for this device only if the keys it later finds
+/// in the directory match.
+pub fn prepare_join() -> Result<JoinPrep> {
+    use base64::Engine;
+    use construct_core::crypto::client_api::ClassicClient;
+    use construct_core::orchestration::orchestrator::Orchestrator;
+
+    let signing_pair = Ed25519KeyPair::generate();
+    let identity_pair = X25519KeyPair::generate();
+    let spk_pair = X25519KeyPair::generate();
+    let device_id = derive_device_id(&identity_pair.public_key);
+    let mut spk_msg = build_prologue(SuiteID::CLASSIC);
+    spk_msg.extend_from_slice(&spk_pair.public_key);
+    let spk_sig = signing_pair.get_signing_key().sign(&spk_msg);
+
+    let client = ClassicClient::from_keys(
+        identity_pair.private_key.to_vec(),
+        signing_pair.private_key.to_vec(),
+        spk_pair.private_key.to_vec(),
+        spk_sig.to_bytes().to_vec(),
+    )
+    .map_err(|e| anyhow::anyhow!("keys: {e}"))?;
+    let mut orchestrator = Orchestrator::new(client, device_id.clone());
+    let hybrid_public = orchestrator
+        .ensure_hybrid_signature_key()
+        .map_err(|e| anyhow::anyhow!("hybrid key: {e}"))?;
+    let key_record = orchestrator
+        .export_private_keys_cfe()
+        .map_err(|e| anyhow::anyhow!("key record: {e}"))?;
+
+    let fingerprint = construct_core::history::discovery::qr_fingerprint(
+        &identity_pair.public_key,
+        &hybrid_public,
+    );
+    let device_name = format!("Konstruct on {}", os_label());
+    let platform = std::env::consts::OS.to_string();
+    let pubkey = base64::engine::general_purpose::STANDARD.encode(identity_pair.public_key);
+    let qr = format!(
+        "konstruct://link-to-me?id={device_id}&pubkey={}&fp={}&name={}&platform={}",
+        percent_encode(&pubkey),
+        hex::encode(fingerprint),
+        percent_encode(&device_name),
+        percent_encode(&platform),
+    );
+
+    Ok(JoinPrep {
+        session_secrets: Session {
+            signing_key_hex: hex::encode(*signing_pair.private_key),
+            identity_key_hex: hex::encode(*identity_pair.private_key),
+            device_id: device_id.clone(),
+            user_id: String::new(),
+            access_token: String::new(),
+            refresh_token: String::new(),
+            expires_at: 0,
+            spk_key_hex: hex::encode(*spk_pair.private_key),
+            spk_sig_hex: hex::encode(spk_sig.to_bytes()),
+        },
+        key_record,
+        request: crate::grpc::JoinRequest {
+            device_id,
+            identity_public: identity_pair.public_key.to_vec(),
+            verifying_key: signing_pair.public_key.to_vec(),
+            signed_prekey_public: spk_pair.public_key.to_vec(),
+            signed_prekey_signature: spk_sig.to_bytes().to_vec(),
+            device_name,
+            platform,
+        },
+        qr,
+    })
+}
+
+/// Wait for the phone: poll the join request until it is approved, refused or expired.
+pub async fn wait_for_approval(
+    client: &GrpcClient,
+    device_id: &str,
+) -> Result<crate::grpc::AuthTokens> {
+    use crate::grpc::JoinStatus;
+    let deadline = tokio::time::Instant::now() + JOIN_TTL;
+    while tokio::time::Instant::now() < deadline {
+        match crate::grpc::check_join_request(client, device_id).await {
+            Ok(JoinStatus::Approved(tokens)) => return Ok(tokens),
+            Ok(JoinStatus::Rejected) => anyhow::bail!("The phone declined this device"),
+            Ok(JoinStatus::Expired) => anyhow::bail!("The link code expired; show a new one"),
+            Ok(JoinStatus::Pending) => {}
+            Err(e) => tracing::warn!(error = %e, "join request status unavailable"),
+        }
+        sleep(JOIN_POLL).await;
+    }
+    anyhow::bail!("The link code expired; show a new one")
+}
+
+/// The stream position a linked device starts from: its token's issue time. What the mailbox
+/// held before that was sealed to keys this device never had (iOS `DeviceLinkOutcome`).
+pub fn link_cursor(access_token: &str) -> Option<String> {
+    use base64::Engine;
+    let payload = access_token.split('.').nth(1)?;
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload.trim_end_matches('='))
+        .ok()?;
+    let iat = serde_json::from_slice::<serde_json::Value>(&bytes)
+        .ok()?
+        .get("iat")?
+        .as_i64()?;
+    Some(format!("{}-0", iat.checked_mul(1000)?))
+}
+
+fn os_label() -> &'static str {
+    match std::env::consts::OS {
+        "linux" => "Linux",
+        "windows" => "Windows",
+        "macos" => "macOS",
+        other => other,
+    }
+}
+
+/// Percent-encode everything but RFC 3986 unreserved characters.
+fn percent_encode(s: &str) -> String {
+    s.bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                (b as char).to_string()
+            }
+            _ => format!("%{b:02X}"),
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_link_code_commits_to_the_keys_the_record_holds() {
+        use construct_core::crypto::client_api::ClassicClient;
+        use construct_core::orchestration::orchestrator::Orchestrator;
+        let prep = prepare_join().unwrap();
+
+        let keys = construct_core::cfe::decode_as::<construct_core::cfe::CfePrivateKeysV1>(
+            &prep.key_record,
+            construct_core::cfe::CfeMessageType::PrivateKeys,
+        )
+        .unwrap();
+        let restored = Orchestrator::new(
+            ClassicClient::from_private_keys_cfe(keys).unwrap(),
+            prep.request.device_id.clone(),
+        );
+        let hybrid = restored
+            .hybrid_signature_public_key()
+            .expect("hybrid key in the record");
+        let fp = construct_core::history::discovery::qr_fingerprint(
+            &prep.request.identity_public,
+            &hybrid,
+        );
+
+        assert!(prep.qr.starts_with("konstruct://link-to-me?"));
+        assert!(prep.qr.contains(&format!("id={}", prep.request.device_id)));
+        assert!(prep.qr.contains(&format!("fp={}", hex::encode(fp))));
+        assert_eq!(
+            derive_device_id(&prep.request.identity_public),
+            prep.request.device_id
+        );
+        // Nothing in the query needs a decoder the phone does not run.
+        let query = prep.qr.split('?').nth(1).unwrap();
+        assert!(!query.contains('+') && !query.contains('/') && !query.contains(' '));
+    }
+
+    #[test]
+    fn a_linked_device_starts_reading_at_its_token_issue_time() {
+        use base64::Engine;
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(br#"{"sub":"u","iat":1792780000}"#);
+        let token = format!("h.{payload}.s");
+        assert_eq!(link_cursor(&token).as_deref(), Some("1792780000000-0"));
+        assert_eq!(link_cursor("not-a-jwt"), None);
+    }
+}
