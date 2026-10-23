@@ -115,6 +115,7 @@ impl Client {
             cursor.clone(),
             contact_ids,
             crate::orchestrator_task::LocalIdentity {
+                user_id: self.user_id.clone(),
                 device_id: self.device_id.clone(),
                 identity_secret: identity_secret_for_sealed,
                 signing_secret: signing_secret_for_prekeys,

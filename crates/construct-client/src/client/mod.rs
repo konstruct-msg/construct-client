@@ -47,6 +47,11 @@ pub enum ClientCommand {
     LinkByQr,
     /// Stop waiting for the phone.
     CancelLink,
+    /// Let a device that asked to join this account (its `link-to-me` code names it) become one
+    /// of its devices — what the phone does when it scans the code.
+    ApproveJoin {
+        device_id: String,
+    },
     /// Protect the new session with this passphrase and start.
     SetPassphrase(Zeroizing<Vec<u8>>),
     SendText {
@@ -287,6 +292,7 @@ impl Client {
             ClientCommand::LinkDevice { token } => self.link_device(token),
             ClientCommand::LinkByQr => self.link_by_qr(),
             ClientCommand::CancelLink => self.cancel_link(),
+            ClientCommand::ApproveJoin { device_id } => self.approve_join(device_id),
             ClientCommand::SetPassphrase(passphrase) => self.set_passphrase(&passphrase),
             ClientCommand::SendText { contact_id, text } => self.send_text(contact_id, text),
             ClientCommand::LoadHistory { peer_id, limit } => self.load_history(peer_id, limit),

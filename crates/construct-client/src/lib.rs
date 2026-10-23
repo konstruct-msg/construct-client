@@ -17,6 +17,7 @@ mod knst;
 mod local_data;
 pub mod local_store;
 mod orchestrator_task;
+mod own_copy;
 mod peers;
 mod prekeys;
 mod proto;

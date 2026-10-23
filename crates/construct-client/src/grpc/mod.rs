@@ -25,9 +25,9 @@ mod stream;
 pub(crate) mod users;
 
 pub use auth::{
-    AuthTokens, JoinRequest, JoinStatus, authenticate_device, check_join_request,
-    confirm_device_link, device_public_keys, get_pow_challenge, refresh_token, register_device,
-    submit_join_request,
+    AuthTokens, JoinRequest, JoinStatus, approve_join_request, authenticate_device,
+    check_join_request, confirm_device_link, device_public_keys, get_pow_challenge, refresh_token,
+    register_device, submit_join_request,
 };
 pub use client::GrpcClient;
 pub use error::GrpcError;
@@ -38,7 +38,8 @@ pub use keys::{
     upload_prekeys_full,
 };
 pub use sealed::{
-    SenderCertificate, get_sender_certificate, get_server_trust_delegations, send_sealed_message,
+    SenderCertificate, get_sender_certificate, get_server_trust_delegations, send_own_device_copy,
+    send_sealed_message,
 };
 pub use stream::open_message_stream;
 pub use users::find_user;
