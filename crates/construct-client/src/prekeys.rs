@@ -26,6 +26,13 @@ const KYBER_PREKEYS: &str = "crypto_kyber_prekeys";
 const PUBLISHED: &str = "crypto_prekeys_published";
 
 const CLASSIC_ONE_TIME_BATCH: u32 = 100;
+/// Below this many classic one-time prekeys on the server, more go up (iOS's low-water mark).
+const ONE_TIME_LOW_WATER: u32 = 20;
+/// A signed prekey this old is rotated. Peers refuse a bundle whose signed prekey is older than
+/// the core's `SPK_MAX_AGE_SECS` (30 days); iOS rotates weekly.
+const ROTATE_AFTER_SECS: i64 = 7 * 24 * 3600;
+/// How often a running client looks again.
+pub const MAINTENANCE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(6 * 3600);
 const KYBER_ONE_TIME_BATCH: u32 = 50;
 /// Suite byte of the classic signed prekey in its hybrid signature (`sign_hybrid_prekey`).
 const CLASSIC_SPK_SUITE: u8 = 0x01;
@@ -226,6 +233,130 @@ fn published_mark(device_id: &str, kyber_spk_id: u32) -> Vec<u8> {
     format!("{device_id}:{kyber_spk_id}").into_bytes()
 }
 
+/// Whether to rotate a signed prekey of this age, given what the server says.
+fn needs_rotation(age_secs: i64, server_says: bool) -> bool {
+    server_says || age_secs >= ROTATE_AFTER_SECS
+}
+
+/// How many one-time prekeys of each kind to add, given how many the server holds and the
+/// minimum it recommends; `None` when it holds enough.
+fn replenish_count(server_count: u32, recommended: u32) -> Option<u32> {
+    if server_count >= recommended.max(ONE_TIME_LOW_WATER) {
+        return None;
+    }
+    Some(
+        CLASSIC_ONE_TIME_BATCH
+            .saturating_sub(server_count)
+            .max(ONE_TIME_LOW_WATER),
+    )
+}
+
+/// Rotate the signed prekeys when due and top up the one-time prekeys when low. Each step is
+/// tried even when the other failed; the first error is returned.
+///
+/// `CONSTRUCT_ROTATE_PREKEYS_NOW` forces the rotation, for interop checks against the server.
+pub async fn maintain(
+    orchestrator: &mut Orchestrator,
+    storage: &LocalStore,
+    grpc: &crate::grpc::GrpcClient,
+    device_id: &str,
+) -> Result<(), String> {
+    let forced = std::env::var_os("CONSTRUCT_ROTATE_PREKEYS_NOW").is_some();
+    let rotation = match crate::grpc::get_signed_prekey_age(grpc, device_id).await {
+        Ok((age, server_says)) if forced || needs_rotation(age, server_says) => {
+            tracing::info!(
+                age_secs = age,
+                server_says,
+                forced,
+                "rotating signed prekeys"
+            );
+            rotate_signed_prekeys(orchestrator, storage, grpc, device_id).await
+        }
+        Ok(_) => Ok(()),
+        Err(e) => Err(format!("GetSignedPreKeyAge: {e}")),
+    };
+    let topping = match crate::grpc::get_prekey_count(grpc, device_id).await {
+        Ok((count, recommended)) => match replenish_count(count, recommended) {
+            Some(n) => {
+                tracing::info!(
+                    server_count = count,
+                    adding = n,
+                    "replenishing one-time prekeys"
+                );
+                replenish(orchestrator, storage, grpc, device_id, n).await
+            }
+            None => Ok(()),
+        },
+        Err(e) => Err(format!("GetPreKeyCount: {e}")),
+    };
+    rotation.and(topping)
+}
+
+/// A new classic and Kyber signed prekey, saved, then sent in one `RotateSignedPreKey`. The
+/// classic rotation keeps the previous signed prekey in the key record for
+/// `SPK_RETENTION_AFTER_ROTATION`, so sessions started from the old bundle still open; a refused
+/// Kyber rotation is rolled back.
+async fn rotate_signed_prekeys(
+    orchestrator: &mut Orchestrator,
+    storage: &LocalStore,
+    grpc: &crate::grpc::GrpcClient,
+    device_id: &str,
+) -> Result<(), String> {
+    let (spk_id, spk_public, spk_signature) = orchestrator.rotate_spk()?;
+    save_key_record(orchestrator, storage)?;
+    let spk_hybrid_signature = orchestrator.sign_hybrid_prekey(CLASSIC_SPK_SUITE, &spk_public)?;
+    let kyber_spk = orchestrator.begin_kyber_spk_rotation()?;
+    save_kyber_prekeys(orchestrator, storage)?;
+    let kyber_spk_id = kyber_spk.key_id;
+    let result = crate::grpc::rotate_signed_prekey(
+        grpc,
+        device_id,
+        crate::grpc::SignedPrekeyRotation {
+            spk_id,
+            spk_public,
+            spk_signature,
+            spk_hybrid_signature,
+            kyber_spk,
+        },
+    )
+    .await;
+    match result {
+        Ok(()) => {
+            orchestrator.commit_kyber_spk_rotation();
+            save_kyber_prekeys(orchestrator, storage)?;
+            storage
+                .secure_save(PUBLISHED, &published_mark(device_id, kyber_spk_id))
+                .map_err(|e| format!("publish mark save: {e}"))?;
+            tracing::info!(spk_id, kyber_spk_id, "signed prekeys rotated");
+            Ok(())
+        }
+        Err(e) => {
+            if !e.is_retryable_transport() {
+                orchestrator.rollback_kyber_spk_rotation();
+                save_kyber_prekeys(orchestrator, storage)?;
+            }
+            Err(format!("RotateSignedPreKey: {e}"))
+        }
+    }
+}
+
+/// `count` more one-time prekeys of each kind, saved before they go up.
+async fn replenish(
+    orchestrator: &mut Orchestrator,
+    storage: &LocalStore,
+    grpc: &crate::grpc::GrpcClient,
+    device_id: &str,
+    count: u32,
+) -> Result<(), String> {
+    let one_time = orchestrator.generate_otpks(count)?;
+    save_one_time_prekeys(orchestrator, storage)?;
+    let kyber = orchestrator.generate_kyber_one_time_prekeys(count)?;
+    save_kyber_prekeys(orchestrator, storage)?;
+    crate::grpc::append_one_time_prekeys(grpc, device_id, one_time, kyber)
+        .await
+        .map_err(|e| format!("UploadPreKeys: {e}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -291,5 +422,46 @@ mod tests {
         let client = restore_client(&storage, vec![], vec![], vec![], vec![]).unwrap();
         let mut second = Orchestrator::new(client, "device".into());
         assert!(!restore_prekeys(&mut second, &storage).unwrap());
+    }
+
+    #[test]
+    fn a_week_old_signed_prekey_is_rotated_and_a_fresh_one_only_on_request() {
+        assert!(!needs_rotation(ROTATE_AFTER_SECS - 1, false));
+        assert!(needs_rotation(ROTATE_AFTER_SECS, false));
+        assert!(needs_rotation(0, true));
+    }
+
+    #[test]
+    fn one_time_prekeys_are_topped_up_below_the_low_water_mark() {
+        assert_eq!(replenish_count(ONE_TIME_LOW_WATER, 0), None);
+        assert_eq!(replenish_count(50, 60), Some(50));
+        assert_eq!(replenish_count(5, 0), Some(95));
+        assert_eq!(replenish_count(0, 0), Some(CLASSIC_ONE_TIME_BATCH));
+        // Never fewer than the low-water mark at a time.
+        assert_eq!(replenish_count(90, 200), Some(ONE_TIME_LOW_WATER));
+    }
+
+    #[test]
+    fn a_rotated_signed_prekey_survives_a_relaunch_beside_the_old_one() {
+        let storage = LocalStore::open_in_memory().unwrap();
+        let mut first = orchestrator();
+        restore_prekeys(&mut first, &storage).unwrap();
+        let old = first
+            .get_registration_bundle_fields()
+            .unwrap()
+            .signed_prekey_public;
+        let (_, new, _) = first.rotate_spk().unwrap();
+        save_key_record(&first, &storage).unwrap();
+
+        let client = restore_client(&storage, vec![], vec![], vec![], vec![]).unwrap();
+        let second = Orchestrator::new(client, "device".into());
+        assert_eq!(
+            second
+                .get_registration_bundle_fields()
+                .unwrap()
+                .signed_prekey_public,
+            new
+        );
+        assert_ne!(old, new);
     }
 }

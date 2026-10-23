@@ -11,6 +11,12 @@ use crate::proto::services::v1::{
     OneTimePreKey, PreKeyBundle, UploadPreKeysRequest, UploadPreKeysResponse,
 };
 
+use crate::proto::services::v1::{
+    GetPreKeyCountRequest, GetPreKeyCountResponse, GetSignedPreKeyAgeRequest,
+    GetSignedPreKeyAgeResponse, RotateSignedPreKeyRequest, RotateSignedPreKeyResponse,
+    SignedPreKeyRotationReason, SignedPreKeyUpload,
+};
+
 use super::client::GrpcClient;
 use super::error::GrpcError;
 use super::paths;
@@ -135,17 +141,7 @@ pub async fn upload_prekeys_full(
             })
             .collect(),
         replace_existing: true,
-        kyber_pre_keys: upload
-            .kyber_one_time
-            .into_iter()
-            .map(|k| KyberOneTimePreKey {
-                key_id: k.key_id,
-                public_key: k.public_key.into(),
-                signature: k.signature.into(),
-                created_at: k.created_at,
-                hybrid_signature: k.hybrid_signature.into(),
-            })
-            .collect(),
+        kyber_pre_keys: kyber_one_time(upload.kyber_one_time),
         kyber_signed_pre_key: Some(KyberSignedPreKeyUpload {
             key_id: upload.kyber_spk.key_id,
             public_key: upload.kyber_spk.public_key.into(),
@@ -165,6 +161,125 @@ pub async fn upload_prekeys_full(
         .map_err(|e| GrpcError::transport(format!("UploadPreKeys decode: {e}")))?;
     if !resp.success {
         return Err(GrpcError::transport("UploadPreKeys: not accepted"));
+    }
+    Ok(())
+}
+
+fn kyber_one_time(
+    keys: Vec<construct_core::crypto::kyber_prekeys::KyberPrekeyUpload>,
+) -> Vec<KyberOneTimePreKey> {
+    keys.into_iter()
+        .map(|k| KyberOneTimePreKey {
+            key_id: k.key_id,
+            public_key: k.public_key.into(),
+            signature: k.signature.into(),
+            created_at: k.created_at,
+            hybrid_signature: k.hybrid_signature.into(),
+        })
+        .collect()
+}
+
+/// `UploadPreKeys` adding one-time prekeys of both kinds to what the server holds.
+pub async fn append_one_time_prekeys(
+    client: &GrpcClient,
+    device_id: &str,
+    one_time: Vec<(u32, Vec<u8>)>,
+    kyber: Vec<construct_core::crypto::kyber_prekeys::KyberPrekeyUpload>,
+) -> Result<(), GrpcError> {
+    let req = UploadPreKeysRequest {
+        device_id: device_id.to_string(),
+        pre_keys: one_time
+            .into_iter()
+            .map(|(key_id, public_key)| OneTimePreKey {
+                key_id,
+                public_key: public_key.into(),
+            })
+            .collect(),
+        replace_existing: false,
+        kyber_pre_keys: kyber_one_time(kyber),
+        ..Default::default()
+    };
+    let bytes = client
+        .unary(paths::KEY_UPLOAD, &req.encode_to_vec())
+        .await?;
+    let resp = UploadPreKeysResponse::decode(bytes.as_slice())
+        .map_err(|e| GrpcError::transport(format!("UploadPreKeys decode: {e}")))?;
+    if !resp.success {
+        return Err(GrpcError::transport("UploadPreKeys: not accepted"));
+    }
+    Ok(())
+}
+
+/// How many classic one-time prekeys the server holds for us, and how many it wants.
+pub async fn get_prekey_count(
+    client: &GrpcClient,
+    device_id: &str,
+) -> Result<(u32, u32), GrpcError> {
+    let req = GetPreKeyCountRequest {
+        device_id: device_id.to_string(),
+    };
+    let bytes = client.unary(paths::KEY_COUNT, &req.encode_to_vec()).await?;
+    let resp = GetPreKeyCountResponse::decode(bytes.as_slice())
+        .map_err(|e| GrpcError::transport(format!("GetPreKeyCount decode: {e}")))?;
+    Ok((resp.count, resp.recommended_minimum))
+}
+
+/// The server's view of our signed prekey: its age, and whether it says to rotate.
+pub async fn get_signed_prekey_age(
+    client: &GrpcClient,
+    device_id: &str,
+) -> Result<(i64, bool), GrpcError> {
+    let req = GetSignedPreKeyAgeRequest {
+        device_id: device_id.to_string(),
+    };
+    let bytes = client
+        .unary(paths::KEY_SPK_AGE, &req.encode_to_vec())
+        .await?;
+    let resp = GetSignedPreKeyAgeResponse::decode(bytes.as_slice())
+        .map_err(|e| GrpcError::transport(format!("GetSignedPreKeyAge decode: {e}")))?;
+    Ok((resp.age_seconds, resp.should_rotate))
+}
+
+/// A new classic and Kyber signed prekey, replacing the current ones in one call.
+pub struct SignedPrekeyRotation {
+    pub spk_id: u32,
+    pub spk_public: Vec<u8>,
+    pub spk_signature: Vec<u8>,
+    /// The hybrid key over the new classic signed prekey (`sign_hybrid_prekey`).
+    pub spk_hybrid_signature: Vec<u8>,
+    pub kyber_spk: construct_core::crypto::kyber_prekeys::KyberPrekeyUpload,
+}
+
+/// `RotateSignedPreKey`, both signed prekeys at once, as iOS's `PreKeyRotationService` sends.
+pub async fn rotate_signed_prekey(
+    client: &GrpcClient,
+    device_id: &str,
+    rotation: SignedPrekeyRotation,
+) -> Result<(), GrpcError> {
+    let req = RotateSignedPreKeyRequest {
+        device_id: device_id.to_string(),
+        new_signed_pre_key: Some(SignedPreKeyUpload {
+            key_id: rotation.spk_id,
+            public_key: rotation.spk_public.into(),
+            signature: rotation.spk_signature.into(),
+        }),
+        reason: SignedPreKeyRotationReason::Scheduled as i32,
+        new_kyber_signed_pre_key: Some(KyberSignedPreKeyUpload {
+            key_id: rotation.kyber_spk.key_id,
+            public_key: rotation.kyber_spk.public_key.into(),
+            signature: rotation.kyber_spk.signature.into(),
+            created_at: rotation.kyber_spk.created_at,
+        }),
+        signed_pre_key_hybrid_signature: Some(rotation.spk_hybrid_signature.into()),
+        kyber_signed_pre_key_hybrid_signature: Some(rotation.kyber_spk.hybrid_signature.into()),
+    };
+    let bytes = client
+        .unary(paths::KEY_ROTATE_SPK, &req.encode_to_vec())
+        .await?;
+    let resp = RotateSignedPreKeyResponse::decode(bytes.as_slice())
+        .map_err(|e| GrpcError::transport(format!("RotateSignedPreKey decode: {e}")))?;
+    if !resp.success {
+        return Err(GrpcError::transport("RotateSignedPreKey: not accepted"));
     }
     Ok(())
 }

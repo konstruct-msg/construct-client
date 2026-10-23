@@ -20,3 +20,5 @@ pub const AUTH_SENDER_CERT: &str = "/shared.proto.services.v1.AuthService/GetSen
 pub const MESSAGING_SEND_SEALED: &str =
     "/shared.proto.services.v1.MessagingService/SendSealedMessage";
 pub const SERVER_TRUST: &str = "/shared.proto.services.v1.ServerTrustService/GetServerTrust";
+pub const KEY_SPK_AGE: &str = "/shared.proto.services.v1.KeyService/GetSignedPreKeyAge";
+pub const KEY_ROTATE_SPK: &str = "/shared.proto.services.v1.KeyService/RotateSignedPreKey";
