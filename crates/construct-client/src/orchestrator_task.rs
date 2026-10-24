@@ -126,6 +126,15 @@ impl OrchestratorHandle {
         });
     }
 
+    /// Our profile to every device of `peer`.
+    pub(crate) fn send_profile(&self, peer: String, payload: Vec<u8>) {
+        let _ = self.cmd_tx.send(OrchestratorCommand::SendControl {
+            peer,
+            content_type: crate::knst::CONTENT_PROFILE,
+            payload,
+        });
+    }
+
     /// Delegations of the server's hybrid keys, as `GetServerTrust` served them.
     pub(crate) fn server_delegations(&self, delegations: Vec<Vec<u8>>) {
         let _ = self
@@ -176,6 +185,12 @@ enum OrchestratorCommand {
         message_id: String,
         content: crate::content::Content,
         /// `content` as it goes on the wire.
+        payload: Vec<u8>,
+    },
+    /// A control frame to every device of `peer` (a profile, content type 29).
+    SendControl {
+        peer: String,
+        content_type: u8,
         payload: Vec<u8>,
     },
     /// Vouch for a device being linked to this account once the directory serves its keys.
@@ -250,6 +265,7 @@ pub fn spawn_orchestrator_task(
         cmd_tx: cmd_tx.clone(),
     };
 
+    let avatars = anonymous.clone();
     let sealed_tx = spawn_sender(anonymous, grpc.clone(), cmd_tx.clone(), internal_tx.clone());
     let mut task = Task::new(
         orchestrator,
@@ -263,6 +279,7 @@ pub fn spawn_orchestrator_task(
         tx,
         cmd_tx,
     );
+    task.anonymous = Some(avatars);
     tokio::spawn(async move { task.run(rx, cmd_rx).await });
 
     handle
@@ -336,6 +353,8 @@ struct Task {
     pending_certificates: HashMap<String, (String, Vec<u8>)>,
     /// When each account's device set was last asked of the server.
     devices_checked: HashMap<String, tokio::time::Instant>,
+    /// The client that never holds a token: avatars a profile names are fetched on it.
+    anonymous: Option<GrpcClient>,
 }
 
 impl Task {
@@ -371,6 +390,7 @@ impl Task {
             certificate: None,
             pending_certificates: HashMap::new(),
             devices_checked: HashMap::new(),
+            anonymous: None,
         }
     }
 
@@ -481,6 +501,11 @@ impl Task {
                 content,
                 payload,
             } => self.send_content(peer, message_id, content, payload).await,
+            OrchestratorCommand::SendControl {
+                peer,
+                content_type,
+                payload,
+            } => self.send_control(peer, content_type, payload).await,
             OrchestratorCommand::Vouch {
                 device_id,
                 evidence,
@@ -1083,6 +1108,56 @@ impl Task {
         })
     }
 
+    /// A profile `account` shared: applied if newer and they are held, then shown; an avatar it
+    /// names is fetched aside.
+    fn profile_received(&mut self, account: &str, body: &[u8]) {
+        let Some(profile) = crate::profile::ProfileShare::decode(body) else {
+            return tracing::warn!("profile does not parse");
+        };
+        match self.storage.apply_profile(account, &profile, now_ms()) {
+            Ok(Some(action)) => {
+                self.contact_updated(account);
+                if matches!(action, crate::profile::AvatarAction::Download(_)) {
+                    self.fetch_avatar(account.to_string());
+                }
+            }
+            Ok(None) => tracing::info!("profile not newer, or from no one held — ignored"),
+            Err(e) => tracing::warn!(error = %e, "profile not kept"),
+        }
+    }
+
+    fn contact_updated(&self, account: &str) {
+        contact_updated(&self.storage, &self.internal_tx, account);
+    }
+
+    fn fetch_avatar(&self, account: String) {
+        let Some(anonymous) = self.anonymous.clone() else {
+            return;
+        };
+        let storage = self.storage.clone();
+        let events = self.internal_tx.clone();
+        tokio::spawn(async move {
+            if crate::profile::fetch_pending_avatar(&storage, &anonymous, &account).await {
+                contact_updated(&storage, &events, &account);
+            }
+        });
+    }
+
+    /// A control frame (`content_type`) to every device of `peer`: not kept, not copied to our
+    /// other devices.
+    async fn send_control(&mut self, peer: String, content_type: u8, payload: Vec<u8>) {
+        let message_id = uuid::Uuid::new_v4().to_string();
+        let event = IncomingEvent::OutgoingMessage {
+            contact_id: peer,
+            plaintext: crate::knst::frame_whole(&payload, content_type, &message_id),
+            message_id,
+            content_type: 0,
+        };
+        for event in self.prepare_outgoing(event).await {
+            self.process(event).await;
+        }
+    }
+
     /// A delivery receipt arrived: the ids it names are the server's for messages we sent.
     fn receipt_received(&self, body: &[u8]) {
         use crate::proto::signaling::v1::{DeliveryReceipt, delivery_receipt::ReceiptType};
@@ -1145,6 +1220,7 @@ impl Task {
                 user_id: account.to_string(),
                 display_name: username.clone(),
                 identity_key_b64: String::new(),
+                ..Default::default()
             })
         {
             tracing::warn!(%account, error = %e, "new contact not saved");
@@ -1513,10 +1589,16 @@ impl Task {
             }
 
             Action::ControlFrameDecrypted {
-                content_type, body, ..
+                contact_id,
+                content_type,
+                body,
+                ..
             } => {
                 if content_type == crate::knst::CONTENT_DELIVERY_RECEIPT {
                     self.receipt_received(&body);
+                } else if content_type == crate::knst::CONTENT_PROFILE {
+                    let account = self.account_of(&contact_id);
+                    self.profile_received(&account, &body);
                 } else {
                     // Heartbeat, card, profile, read markers, retired ping/ready: never shown.
                     tracing::debug!(content_type, "control frame — not handled by the TUI");
@@ -1846,6 +1928,19 @@ fn now_ms_u64() -> u64 {
         .as_millis()
         .try_into()
         .unwrap_or(u64::MAX)
+}
+
+/// Tell the screens that `account` changed, as the store now holds them.
+fn contact_updated(
+    storage: &LocalStore,
+    events: &mpsc::UnboundedSender<crate::client::ClientEvent>,
+    account: &str,
+) {
+    if let Ok(Some(contact)) = storage.get_contact_by_id(account) {
+        let _ = events.send(crate::client::ClientEvent::Bridge(
+            BridgeEvent::ContactUpdated { contact },
+        ));
+    }
 }
 
 #[cfg(test)]
@@ -2234,6 +2329,36 @@ mod tests {
 
         let messages = task.storage.get_messages("bob", 10).unwrap();
         assert_eq!(messages[0].delivery_status, "delivered");
+    }
+
+    #[test]
+    fn a_profile_names_the_person_who_shared_it() {
+        let mut task = test_task();
+        let bob = "550e8400-e29b-41d4-a716-446655440000";
+        task.storage
+            .upsert_contact(&crate::local_store::StoredContact {
+                user_id: bob.into(),
+                display_name: "bob_k".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        let profile = crate::profile::ProfileShare {
+            display_name: "Боб".into(),
+            edited_at_ms: 7,
+            avatar: crate::profile::Avatar::Removed,
+        };
+        task.profile_received(bob, &profile.encode());
+        let held = task.storage.get_contact_by_id(bob).unwrap().unwrap();
+        assert_eq!(held.display_name, "Боб");
+        task.profile_received(bob, b"\xff not a profile");
+        assert_eq!(
+            task.storage
+                .get_contact_by_id(bob)
+                .unwrap()
+                .unwrap()
+                .display_name,
+            "Боб"
+        );
     }
 
     #[test]

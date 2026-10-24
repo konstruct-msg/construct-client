@@ -12,11 +12,13 @@ mod identity;
 mod inbound;
 mod messages;
 mod orchestrator;
+mod profile;
 mod settings;
 mod tokens;
 
 pub(crate) use auth::AuthMsg;
 pub use contacts::{FindStarted, SearchResult};
+pub use profile::AvatarChange;
 pub use settings::{AccountSettings, normalize_username};
 
 use tokio::sync::mpsc;
@@ -135,6 +137,17 @@ pub enum ClientCommand {
     SetDeliveryReceipts(bool),
     /// Sign out another device of this account; `None`: every other one.
     RevokeDevices(Option<String>),
+    /// Our name and picture, as a new version sent to everyone we share them with.
+    SetProfile {
+        /// `None`: the name stays.
+        display_name: Option<String>,
+        avatar: AvatarChange,
+    },
+    /// Share our profile with a contact (it is sent to them now), or stop.
+    ShareProfile {
+        contact_id: String,
+        on: bool,
+    },
     Logout,
 }
 
@@ -412,6 +425,11 @@ impl Client {
             ClientCommand::SetDiscoverable(on) => self.set_discoverable(on),
             ClientCommand::SetDeliveryReceipts(on) => self.set_delivery_receipts(on),
             ClientCommand::RevokeDevices(device_id) => self.revoke_devices(device_id),
+            ClientCommand::SetProfile {
+                display_name,
+                avatar,
+            } => self.set_profile(display_name, avatar),
+            ClientCommand::ShareProfile { contact_id, on } => self.share_profile(contact_id, on),
             ClientCommand::Logout => self.logout(),
         }
     }

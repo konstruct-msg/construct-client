@@ -9,7 +9,8 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use construct_store::{
-    Chat, Contact, Message, PeerDevice, PendingChunk, Reaction, Store, delivery, payload,
+    Chat, Contact, Message, OwnProfile, PeerDevice, PendingChunk, Reaction, Store, delivery,
+    payload,
 };
 
 pub use crate::content::{Attachment, MediaInfo, Quote};
@@ -54,17 +55,30 @@ pub struct StoredReaction {
 
 const PREF_DELIVERY_RECEIPTS: &str = "pref.delivery_receipts";
 const PREF_DISCOVERABLE: &str = "pref.discoverable";
-const PREF_OWN_USERNAME: &str = "pref.own_username";
 
 /// How long a split message waits for its missing frames (iOS `PendingReassemblyStore`).
 const CHUNK_RETENTION_MS: i64 = 24 * 60 * 60 * 1000;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct StoredContact {
     pub user_id: String,
     pub display_name: String,
     /// Base-64 encoded identity public key (for safety number display).
     pub identity_key_b64: String,
+    /// The picture they shared, as it came (a JPEG with zeros after it).
+    pub avatar: Option<Vec<u8>>,
+    /// We share our profile with them.
+    pub sharing: bool,
+}
+
+/// Our profile as we share it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct OwnProfileView {
+    pub display_name: String,
+    pub username: String,
+    pub avatar: Option<Vec<u8>>,
+    /// The version contacts hold it at; 0 before the first edit.
+    pub edited_at_ms: i64,
 }
 
 // ── The store ─────────────────────────────────────────────────────────────────
@@ -165,12 +179,140 @@ impl LocalStore {
     /// Our username, as last set from this device: the server does not tell it back
     /// (`GetUserProfile` leaves it out for our own account), so it is kept here, as on iOS.
     pub fn own_username(&self) -> Option<String> {
-        let bytes = self.secure_load(PREF_OWN_USERNAME).ok()??;
-        String::from_utf8(bytes).ok().filter(|u| !u.is_empty())
+        Some(self.own_profile().ok()?.username).filter(|u| !u.is_empty())
     }
 
+    /// The username does not version the profile: contacts learn it from the server.
     pub fn set_own_username(&self, username: &str) -> Result<()> {
-        self.secure_save(PREF_OWN_USERNAME, username.as_bytes())
+        let mut p = self.own_profile()?;
+        p.username = username.to_owned();
+        self.save_own_profile(&p)
+    }
+
+    // ── Profiles: ours, and the ones shared with us ──
+
+    pub fn own_profile(&self) -> Result<OwnProfileView> {
+        Ok(self
+            .store
+            .own_profile()?
+            .map(|p| OwnProfileView {
+                display_name: p.display_name,
+                username: p.username,
+                avatar: p.avatar,
+                edited_at_ms: p.profile_edited_at_ms,
+            })
+            .unwrap_or_default())
+    }
+
+    fn save_own_profile(&self, p: &OwnProfileView) -> Result<()> {
+        Ok(self.store.set_own_profile(&OwnProfile {
+            account_id: self.own_account.clone(),
+            username: p.username.clone(),
+            display_name: p.display_name.clone(),
+            avatar: p.avatar.clone(),
+            profile_edited_at_ms: p.edited_at_ms,
+        })?)
+    }
+
+    /// A new version of our name and avatar, stamped `now_ms` (never older than the last).
+    pub fn edit_own_profile(
+        &self,
+        display_name: String,
+        avatar: Option<Vec<u8>>,
+        now_ms: i64,
+    ) -> Result<OwnProfileView> {
+        let mut p = self.own_profile()?;
+        p.display_name = display_name;
+        p.avatar = avatar;
+        p.edited_at_ms = now_ms.max(p.edited_at_ms + 1);
+        self.save_own_profile(&p)?;
+        Ok(p)
+    }
+
+    /// A profile that has never been stamped gets one now, once: what makes it a version is
+    /// that sending it again does not change it (iOS `prepareProfile`).
+    pub fn stamped_own_profile(&self, now_ms: i64) -> Result<OwnProfileView> {
+        let mut p = self.own_profile()?;
+        if p.edited_at_ms == 0 {
+            p.edited_at_ms = now_ms;
+            self.save_own_profile(&p)?;
+        }
+        Ok(p)
+    }
+
+    /// The people we share our profile with.
+    pub fn sharing_with(&self) -> Result<Vec<String>> {
+        Ok(self.store.sharing_with(Some(&self.own_account))?)
+    }
+
+    pub fn set_sharing_with(&self, id: &str, sharing: bool) -> Result<bool> {
+        Ok(self.store.set_sharing_with(id, sharing)?)
+    }
+
+    /// `profile` from `sender`, applied if it is newer than the one held and `sender` is a
+    /// person we hold. Returns what then happens to their avatar; `None`: ignored.
+    pub fn apply_profile(
+        &self,
+        sender: &str,
+        profile: &crate::profile::ProfileShare,
+        now_ms: i64,
+    ) -> Result<Option<crate::profile::AvatarAction>> {
+        use crate::profile::AvatarAction;
+        let Some(held) = self.store.contact(sender)? else {
+            return Ok(None);
+        };
+        let Some(action) = profile.decision(held.profile_edited_at_ms) else {
+            return Ok(None);
+        };
+        // The sender's whole state: no chosen name means none, and the username shows again.
+        self.store.apply_shared_profile(
+            sender,
+            &profile.chosen_name(sender).unwrap_or_default(),
+            now_ms,
+            i64::try_from(profile.edited_at_ms).unwrap_or(i64::MAX),
+        )?;
+        match &action {
+            AvatarAction::Download(r) => {
+                self.store.set_pending_avatar(sender, &r.stored(), now_ms)?;
+            }
+            AvatarAction::Clear => {
+                self.store.set_contact_avatar(sender, None, None, None)?;
+            }
+            AvatarAction::Keep => {}
+        }
+        Ok(Some(action))
+    }
+
+    /// The avatar `id` announced and since when, if one waits to be downloaded.
+    pub fn pending_avatar(&self, id: &str) -> Result<Option<(Vec<u8>, i64)>> {
+        Ok(self.store.contact(id)?.and_then(|c| {
+            c.pending_avatar_ref
+                .map(|r| (r, c.pending_avatar_since.unwrap_or(0)))
+        }))
+    }
+
+    pub fn contacts_with_pending_avatar(&self) -> Result<Vec<String>> {
+        Ok(self
+            .store
+            .contacts_with_pending_avatar()?
+            .into_iter()
+            .map(|c| c.id)
+            .collect())
+    }
+
+    /// The download of `expected` finished; false when a newer one was announced meanwhile.
+    pub fn complete_pending_avatar(
+        &self,
+        id: &str,
+        expected: &[u8],
+        avatar: &[u8],
+    ) -> Result<bool> {
+        Ok(self.store.complete_pending_avatar(id, expected, avatar)?)
+    }
+
+    /// The wait for `expected` ends without it; the avatar shown stays.
+    pub fn drop_pending_avatar(&self, id: &str, expected: &[u8]) -> Result<bool> {
+        Ok(self.store.drop_pending_avatar(id, expected)?)
     }
 
     fn flag(&self, key: &str) -> Option<bool> {
@@ -441,10 +583,16 @@ impl LocalStore {
 
     pub fn upsert_contact(&self, contact: &StoredContact) -> Result<()> {
         let existing = self.store.contact(&contact.user_id)?;
+        // A name they shared stays: the username is a fallback, not a newer name (iOS
+        // `applyServerUsername`).
+        let display_name = match &existing {
+            Some(c) if c.is_sharing_with_me => c.display_name.clone(),
+            _ => contact.display_name.clone(),
+        };
         self.store.upsert_contact(&Contact {
             id: contact.user_id.clone(),
             username: contact.display_name.clone(),
-            display_name: contact.display_name.clone(),
+            display_name,
             is_contact: true,
             added_at: Some(now_ms()),
             ..existing.unwrap_or_default()
@@ -546,6 +694,8 @@ fn view_contact(c: Contact) -> StoredContact {
         // As iOS names a person: the name they shared, their username, or the one generated
         // from their id — never a blank or a raw id.
         display_name: crate::names::resolved(&c.display_name, &c.username, &c.id),
+        avatar: c.avatar,
+        sharing: c.am_i_sharing_with,
         user_id: c.id,
     }
 }
@@ -760,6 +910,7 @@ mod tests {
             user_id: "alice".into(),
             display_name: "Alice".into(),
             identity_key_b64: String::new(),
+            ..Default::default()
         })
         .unwrap();
         s.store_inbound_message(&message("m1", "hi", "received", 1))
@@ -771,5 +922,121 @@ mod tests {
         assert!(s.get_contacts().unwrap().is_empty());
         assert!(s.get_messages("alice", 10).unwrap().is_empty());
         assert!(s.peer_devices().unwrap().is_empty());
+    }
+
+    fn profile(
+        name: &str,
+        at: u64,
+        avatar: crate::profile::Avatar,
+    ) -> crate::profile::ProfileShare {
+        crate::profile::ProfileShare {
+            display_name: name.into(),
+            edited_at_ms: at,
+            avatar,
+        }
+    }
+
+    fn avatar_ref(id: &str) -> crate::profile::AvatarRef {
+        crate::profile::AvatarRef {
+            media_id: id.into(),
+            media_url: String::new(),
+            media_key: vec![7; 32],
+            mime_type: "image/jpeg".into(),
+        }
+    }
+
+    fn held(s: &LocalStore, id: &str) {
+        s.upsert_contact(&StoredContact {
+            user_id: id.into(),
+            display_name: "bob_k".into(),
+            ..Default::default()
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn a_shared_profile_names_a_held_person_and_only_when_newer() {
+        use crate::profile::{Avatar, AvatarAction};
+        let s = LocalStore::open_in_memory().unwrap();
+        let bob = "550e8400-e29b-41d4-a716-446655440000";
+        assert_eq!(
+            s.apply_profile(bob, &profile("Bob", 5, Avatar::Unchanged), 1)
+                .unwrap(),
+            None,
+            "sending to us makes no contact"
+        );
+        held(&s, bob);
+        let name = |s: &LocalStore| s.get_contact_by_id(bob).unwrap().unwrap().display_name;
+        assert_eq!(
+            s.apply_profile(bob, &profile("Bob", 5, Avatar::Set(avatar_ref("a1"))), 1)
+                .unwrap(),
+            Some(AvatarAction::Download(avatar_ref("a1")))
+        );
+        assert_eq!(name(&s), "Bob");
+        assert_eq!(
+            s.pending_avatar(bob).unwrap().unwrap().0,
+            avatar_ref("a1").stored()
+        );
+        assert_eq!(
+            s.apply_profile(bob, &profile("Old", 5, Avatar::Removed), 2)
+                .unwrap(),
+            None
+        );
+        assert_eq!(name(&s), "Bob", "the same version applies once");
+
+        // Re-adding them keeps the name they shared.
+        held(&s, bob);
+        assert_eq!(name(&s), "Bob");
+
+        // Their generated name is no name: the username shows again.
+        s.apply_profile(bob, &profile("cool cobra", 6, Avatar::Unchanged), 3)
+            .unwrap();
+        assert_eq!(name(&s), "bob_k");
+    }
+
+    #[test]
+    fn a_downloaded_avatar_counts_only_if_it_is_still_the_one_named() {
+        use crate::profile::Avatar;
+        let s = LocalStore::open_in_memory().unwrap();
+        held(&s, "bob");
+        s.apply_profile("bob", &profile("Bob", 1, Avatar::Set(avatar_ref("a1"))), 1)
+            .unwrap();
+        s.apply_profile("bob", &profile("Bob", 2, Avatar::Set(avatar_ref("a2"))), 1)
+            .unwrap();
+        assert!(
+            !s.complete_pending_avatar("bob", &avatar_ref("a1").stored(), b"old")
+                .unwrap()
+        );
+        assert!(
+            s.complete_pending_avatar("bob", &avatar_ref("a2").stored(), b"new")
+                .unwrap()
+        );
+        let bob = s.get_contact_by_id("bob").unwrap().unwrap();
+        assert_eq!(bob.avatar.as_deref(), Some(&b"new"[..]));
+        s.apply_profile("bob", &profile("Bob", 3, Avatar::Removed), 1)
+            .unwrap();
+        assert_eq!(s.get_contact_by_id("bob").unwrap().unwrap().avatar, None);
+    }
+
+    #[test]
+    fn our_profile_versions_only_move_forward() {
+        let s = LocalStore::open_in_memory().unwrap();
+        assert_eq!(s.stamped_own_profile(100).unwrap().edited_at_ms, 100);
+        assert_eq!(
+            s.stamped_own_profile(200).unwrap().edited_at_ms,
+            100,
+            "stamped once"
+        );
+        let p = s.edit_own_profile("Me".into(), None, 50).unwrap();
+        assert_eq!(
+            p.edited_at_ms, 101,
+            "never older than the last, even with a clock behind"
+        );
+        s.set_own_username("me_k").unwrap();
+        let p = s.own_profile().unwrap();
+        assert_eq!(
+            (p.display_name.as_str(), p.username.as_str(), p.edited_at_ms),
+            ("Me", "me_k", 101)
+        );
     }
 }

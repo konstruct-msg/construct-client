@@ -93,6 +93,7 @@ impl Client {
                 user_id: user_id.clone(),
                 display_name: username.clone(),
                 identity_key_b64: String::new(),
+                ..Default::default()
             });
         }
         if !self.contact_ids.contains(&user_id) {

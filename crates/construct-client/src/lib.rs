@@ -25,6 +25,7 @@ pub mod outgoing;
 mod own_copy;
 mod peers;
 mod prekeys;
+pub mod profile;
 mod proto;
 pub mod recovery;
 mod sealing;

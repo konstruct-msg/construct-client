@@ -14,6 +14,10 @@ pub struct AccountSettings {
     pub delivery_receipts: bool,
     /// As last set on this device; `None` when never set here.
     pub discoverable: Option<bool>,
+    /// The name we chose to share; empty when none.
+    pub display_name: String,
+    /// The picture we share, a JPEG.
+    pub avatar: Option<Vec<u8>>,
 }
 
 /// A username as iOS takes it: trimmed, lower case, 3 to 20 letters, digits or `_`.
@@ -38,6 +42,7 @@ impl Client {
         let user_id = self.user_id.clone();
         let events = self.events.clone();
         tokio::spawn(async move {
+            let own = store.own_profile().unwrap_or_default();
             let (username, devices) = tokio::join!(
                 crate::grpc::own_username(&grpc, &user_id),
                 crate::grpc::list_devices(&grpc)
@@ -51,6 +56,8 @@ impl Client {
                 devices,
                 delivery_receipts: store.sends_delivery_receipts(),
                 discoverable: store.discoverable(),
+                display_name: own.display_name,
+                avatar: own.avatar,
             }));
         });
     }
