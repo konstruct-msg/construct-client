@@ -62,6 +62,28 @@ pub enum ClientCommand {
         contact_id: String,
         text: String,
     },
+    /// Send `text` to `contact_id` as an answer to their message or ours, `to`.
+    Reply {
+        contact_id: String,
+        text: String,
+        to: String,
+    },
+    /// Replace the text of a message we sent.
+    EditMessage {
+        message_id: String,
+        text: String,
+    },
+    /// Our reaction on a message: `emoji`, or none when it is already ours there (a second tap
+    /// takes it back, as on iOS).
+    React {
+        message_id: String,
+        emoji: String,
+    },
+    /// Delete a message on this device only. The peer and our other devices keep it: no client
+    /// sends a delete yet.
+    DeleteMessage {
+        message_id: String,
+    },
     LoadHistory {
         peer_id: String,
         limit: usize,
@@ -131,6 +153,8 @@ pub enum ClientEvent {
         contact_id: String,
         message_id: String,
         text: String,
+        /// The message it answers.
+        quote: Option<crate::local_store::Quote>,
     },
     History {
         peer_id: String,
@@ -320,7 +344,15 @@ impl Client {
                 fingerprint,
             } => self.approve_join(device_id, fingerprint),
             ClientCommand::SetPassphrase(passphrase) => self.set_passphrase(&passphrase),
-            ClientCommand::SendText { contact_id, text } => self.send_text(contact_id, text),
+            ClientCommand::SendText { contact_id, text } => self.send_text(contact_id, text, None),
+            ClientCommand::Reply {
+                contact_id,
+                text,
+                to,
+            } => self.reply(contact_id, text, to),
+            ClientCommand::EditMessage { message_id, text } => self.edit_message(message_id, text),
+            ClientCommand::React { message_id, emoji } => self.react(message_id, emoji),
+            ClientCommand::DeleteMessage { message_id } => self.delete_message(message_id),
             ClientCommand::LoadHistory { peer_id, limit } => self.load_history(peer_id, limit),
             ClientCommand::FindContact { query } => self.find_contact(&query),
             ClientCommand::AddContact { user_id, username } => self.add_contact(user_id, username),

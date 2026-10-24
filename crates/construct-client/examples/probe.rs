@@ -14,6 +14,9 @@
 //! or just its `id`) become a device of this account — what the phone does when it scans the
 //! code — and vouches for it when the code carries `fp`.
 //!
+//! `--answer <text>`: to the first message that arrives, reply with `text`, react 👍, then edit
+//! the reply — the message actions, end to end.
+//!
 //! `--invite`: once the account's recovery key is in place, mint an invite link and print it.
 //!
 //! `--link` instead of `--username`: become a new device of an existing account — print the
@@ -40,6 +43,7 @@ struct Args {
     link: bool,
     approve: Option<String>,
     invite: bool,
+    answer: Option<String>,
     wait_secs: u64,
 }
 
@@ -53,6 +57,7 @@ fn parse_args() -> Args {
         link: false,
         approve: None,
         invite: false,
+        answer: None,
         wait_secs: 30,
     };
     let mut it = std::env::args().skip(1);
@@ -67,6 +72,7 @@ fn parse_args() -> Args {
             "--link" => args.link = true,
             "--approve" => args.approve = Some(value()),
             "--invite" => args.invite = true,
+            "--answer" => args.answer = Some(value()),
             "--wait" => args.wait_secs = value().parse().expect("--wait takes seconds"),
             other => panic!("unknown flag {other}"),
         }
@@ -83,7 +89,7 @@ async fn main() {
         )
         .with_writer(std::io::stderr)
         .init();
-    let args = parse_args();
+    let mut args = parse_args();
     let (tx, mut rx) = mpsc::unbounded_channel();
     let client = construct_client::spawn(
         ClientConfig {
@@ -100,6 +106,8 @@ async fn main() {
     tokio::pin!(deadline);
     let mut started = false;
     let mut sent: Option<String> = None;
+    let mut answering = false;
+    let mut to_edit: Option<(String, String)> = None;
     loop {
         let event = tokio::select! {
             _ = &mut deadline, if started => break,
@@ -172,21 +180,53 @@ async fn main() {
                     sent = Some(user_id);
                 }
             }
-            ClientEvent::Bridge(BridgeEvent::NewMessage { peer_id, text, .. }) => {
-                println!("RECEIVED from={peer_id} text={text:?}");
+            ClientEvent::Bridge(BridgeEvent::NewMessage { message: m }) => {
+                println!(
+                    "RECEIVED from={} id={} text={:?} quote={:?} attachment={:?}",
+                    m.peer_id, m.id, m.text, m.quote, m.attachment
+                );
+                if let Some(text) = args.answer.take() {
+                    client.send(ClientCommand::Reply {
+                        contact_id: m.peer_id.clone(),
+                        text,
+                        to: m.id.clone(),
+                    });
+                    client.send(ClientCommand::React {
+                        message_id: m.id,
+                        emoji: "👍".into(),
+                    });
+                    answering = true;
+                }
             }
-            ClientEvent::Bridge(BridgeEvent::OwnMessage { peer_id, text, .. }) => {
-                println!("OWN_COPY to={peer_id} text={text:?}");
+            ClientEvent::Bridge(BridgeEvent::OwnMessage { message: m }) => {
+                println!("OWN_COPY to={} id={} text={:?}", m.peer_id, m.id, m.text);
+            }
+            ClientEvent::Bridge(BridgeEvent::MessageChanged { message: m }) => {
+                println!(
+                    "CHANGED id={} text={:?} edited={} reactions={:?}",
+                    m.id, m.text, m.edited, m.reactions
+                );
             }
             ClientEvent::Bridge(BridgeEvent::MessageDelivered { message_id }) => {
                 println!("DELIVERED {message_id}");
+                if to_edit.as_ref().is_some_and(|(id, _)| *id == message_id) {
+                    let (message_id, text) = to_edit.take().expect("checked");
+                    client.send(ClientCommand::EditMessage { message_id, text });
+                }
             }
             ClientEvent::Bridge(BridgeEvent::Error(e)) => println!("ERROR {e}"),
             ClientEvent::Bridge(BridgeEvent::UnvouchedDevices {
                 peer_id,
                 device_ids,
             }) => println!("UNVOUCHED {peer_id} {device_ids:?}"),
-            ClientEvent::MessageQueued { message_id, .. } => println!("QUEUED {message_id}"),
+            ClientEvent::MessageQueued {
+                message_id, text, ..
+            } => {
+                println!("QUEUED {message_id}");
+                if std::mem::take(&mut answering) {
+                    to_edit = Some((message_id, format!("{text} (edited)")));
+                }
+            }
             ClientEvent::RegistrationStep(step) => println!("STEP {step:?}"),
             ClientEvent::Notice(n) => println!("NOTICE {n}"),
             ClientEvent::Recovery(state) => {
