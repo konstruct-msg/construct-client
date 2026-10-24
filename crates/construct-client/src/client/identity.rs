@@ -3,7 +3,8 @@
 
 use base64::Engine as _;
 
-use super::{Client, ClientEvent};
+use super::{Client, ClientEvent, Inbox};
+use zeroize::Zeroizing;
 
 impl Client {
     /// The safety number with a contact — the core's computation over both device ids, the
@@ -72,16 +73,74 @@ impl Client {
         else {
             return self.emit(ClientEvent::InviteMinted(Err("Not signed in".into())));
         };
+        let Some(address) = self.store.as_ref().and_then(crate::recovery::own_address) else {
+            return self.emit(ClientEvent::InviteMinted(Err(
+                "This device does not know the account's address yet: it is made in the \
+                 background, or, if the account was made on another device, comes from the \
+                 recovery phrase entered in Settings"
+                    .into(),
+            )));
+        };
         let result = crate::invite::generate_invite_qr(
             &self.user_id,
             &self.device_id,
             &self.server_url,
             signing_key_hex,
-            // No recovery key in this client yet, so no account address to sign.
-            None,
+            Some(&address),
         )
         .map_err(|e| format!("{e:#}"));
         self.emit(ClientEvent::InviteMinted(result));
+    }
+
+    // ── Recovery key (crate::recovery) ─────────────────────────────────────────
+
+    /// Make the account's recovery key in the background if it has none, and learn where it
+    /// stands. Nothing waits on it: until it is done only the QR and the link are missing.
+    pub(super) fn ensure_recovery_key(&self) {
+        let Some(store) = self.store.clone() else {
+            return;
+        };
+        let grpc = self.grpc.clone();
+        let user_id = self.user_id.clone();
+        let inbox = self.inbox.clone();
+        tokio::spawn(async move {
+            let state = crate::recovery::ensure_key(&store, &grpc, &user_id).await;
+            let _ = inbox.send(Inbox::Recovery(state));
+        });
+    }
+
+    pub(super) fn reveal_recovery_phrase(&self) {
+        let phrase = self
+            .store
+            .as_ref()
+            .and_then(crate::recovery::pending_phrase)
+            .ok_or_else(|| "No recovery phrase is kept on this device".to_string());
+        self.emit(ClientEvent::RecoveryPhrase(phrase));
+    }
+
+    pub(super) fn confirm_recovery_copy(&self, answers: &[(usize, String)]) {
+        let Some(store) = self.store.as_ref() else {
+            return;
+        };
+        match crate::recovery::confirm_copy(store, answers) {
+            Ok(()) => self.emit(ClientEvent::Recovery(crate::recovery::RecoveryState::Ready)),
+            Err(e) => self.emit(ClientEvent::RecoveryFailed(e)),
+        }
+    }
+
+    pub(super) fn enter_recovery_phrase(&self, phrase: Zeroizing<String>) {
+        let Some(store) = self.store.clone() else {
+            return;
+        };
+        let grpc = self.grpc.clone();
+        let events = self.events.clone();
+        let inbox = self.inbox.clone();
+        tokio::spawn(async move {
+            match crate::recovery::enter_phrase(&store, &grpc, &phrase).await {
+                Ok(state) => drop(inbox.send(Inbox::Recovery(state))),
+                Err(e) => drop(events.send(ClientEvent::RecoveryFailed(e))),
+            }
+        });
     }
 }
 

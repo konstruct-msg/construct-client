@@ -446,6 +446,7 @@ impl Client {
             Vec::new()
         });
         self.emit(ClientEvent::Started(contacts));
+        self.ensure_recovery_key();
     }
 
     /// Protect a newly created session with a passphrase, save it, and start. Without a new

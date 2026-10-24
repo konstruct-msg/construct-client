@@ -6,6 +6,8 @@ pub const AUTH_POW_CHALLENGE: &str = "/shared.proto.services.v1.AuthService/GetP
 pub const AUTH_REGISTER: &str = "/shared.proto.services.v1.AuthService/RegisterDevice";
 pub const AUTH_AUTHENTICATE: &str = "/shared.proto.services.v1.AuthService/AuthenticateDevice";
 pub const AUTH_REFRESH: &str = "/shared.proto.services.v1.AuthService/RefreshToken";
+pub const AUTH_SET_RECOVERY_KEY: &str = "/shared.proto.services.v1.AuthService/SetRecoveryKey";
+pub const AUTH_RECOVERY_STATUS: &str = "/shared.proto.services.v1.AuthService/GetRecoveryStatus";
 pub const AUTH_LOGOUT: &str = "/shared.proto.services.v1.AuthService/Logout";
 pub const DEVICE_PUBLISH_CERTIFICATE: &str =
     "/shared.proto.services.v1.DeviceService/PublishDeviceCertificate";
