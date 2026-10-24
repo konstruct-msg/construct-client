@@ -399,6 +399,14 @@ impl App {
             }
             ClientEvent::LoggedOut => self.reset_after_logout(),
             ClientEvent::Notice(text) => self.status = text,
+            // The terminal does not offer a code yet; the desktop does.
+            ClientEvent::LinkOffer { .. } => {}
+            ClientEvent::LinkOfferEnded(ended) => {
+                self.status = match ended {
+                    Ok(device) => format!("Device {} linked", &device[..8.min(device.len())]),
+                    Err(e) => format!("Link code: {e}"),
+                }
+            }
             ClientEvent::DeleteAccountFailed(reason) => {
                 self.status = format!("Account not deleted: {reason}")
             }

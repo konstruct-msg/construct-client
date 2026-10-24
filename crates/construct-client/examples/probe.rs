@@ -36,6 +36,10 @@
 //! `--link` instead of `--username`: become a new device of an existing account — print the
 //! `konstruct://link-to-me` code for the phone to scan, then wait for its approval.
 //!
+//! `--offer-link`: once started, show a Flow A code (`LINK_OFFER <code>`) and wait for a device
+//! to link with it; `--link-code <code>` instead of `--username`: become a device of the account
+//! that showed it.
+//!
 //! `--find <username or invite link>` instead of `--add`: a username is looked up (only accounts
 //! that made themselves discoverable are found), an invite link is redeemed; either is added and
 //! sent to.
@@ -68,6 +72,8 @@ struct Args {
     avatar: Option<String>,
     share_with: Option<String>,
     goodbye: Option<String>,
+    offer_link: bool,
+    link_code: Option<String>,
     wait_secs: u64,
 }
 
@@ -92,6 +98,8 @@ fn parse_args() -> Args {
         avatar: None,
         share_with: None,
         goodbye: None,
+        offer_link: false,
+        link_code: None,
         wait_secs: 30,
     };
     let mut it = std::env::args().skip(1);
@@ -117,6 +125,8 @@ fn parse_args() -> Args {
             "--avatar" => args.avatar = Some(value()),
             "--share-with" => args.share_with = Some(value()),
             "--goodbye" => args.goodbye = Some(value()),
+            "--offer-link" => args.offer_link = true,
+            "--link-code" => args.link_code = Some(value()),
             "--wait" => args.wait_secs = value().parse().expect("--wait takes seconds"),
             other => panic!("unknown flag {other}"),
         }
@@ -159,7 +169,10 @@ async fn main() {
         };
         match event {
             ClientEvent::AuthFailed { reason, no_session } => {
-                if no_session && args.link {
+                if no_session && let Some(token) = args.link_code.take() {
+                    println!("LINKING WITH CODE");
+                    client.send(ClientCommand::LinkDevice { token });
+                } else if no_session && args.link {
                     println!("LINKING");
                     client.send(ClientCommand::LinkByQr);
                 } else if no_session && let Some(username) = &args.username {
@@ -215,6 +228,9 @@ async fn main() {
                 }
                 if args.settings {
                     client.send(ClientCommand::LoadSettings);
+                }
+                if args.offer_link {
+                    client.send(ClientCommand::OfferLink);
                 }
                 match args.goodbye.as_deref() {
                     Some("logout") => client.send(ClientCommand::Logout),
@@ -400,6 +416,10 @@ async fn main() {
                 println!("LINK_CODE {code}");
             }
             ClientEvent::LinkFailed(e) => println!("LINK_FAILED {e}"),
+            ClientEvent::LinkOffer { code, expires_at } => {
+                println!("LINK_OFFER {} expires_at={expires_at}", code.as_str())
+            }
+            ClientEvent::LinkOfferEnded(ended) => println!("LINK_OFFER_ENDED {ended:?}"),
             ClientEvent::LoggedOut if args.goodbye.is_some() => {
                 println!("LOGGED_OUT");
                 return;

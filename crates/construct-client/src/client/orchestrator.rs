@@ -95,6 +95,7 @@ impl Client {
             .get_registration_bundle_fields()
             .ok()
             .map(|fields| fields.identity_public);
+        self.our_hybrid_key = orchestrator.hybrid_signature_public_key();
 
         let cursor = CursorTracker::load(&read_storage);
         if let Some(name) = self.pending_username.take()

@@ -12,6 +12,8 @@ pub const AUTH_LOGOUT: &str = "/shared.proto.services.v1.AuthService/Logout";
 pub const USER_DELETE_ACCOUNT: &str = "/shared.proto.services.v1.UserService/DeleteAccount";
 pub const DEVICE_PUBLISH_CERTIFICATE: &str =
     "/shared.proto.services.v1.DeviceService/PublishDeviceCertificate";
+pub const DEVICE_INITIATE_LINK: &str = "/shared.proto.services.v1.DeviceService/InitiateDeviceLink";
+pub const DEVICE_LINK_RESULT: &str = "/shared.proto.services.v1.DeviceService/GetDeviceLinkResult";
 pub const DEVICE_CONFIRM_LINK: &str =
     "/shared.proto.services.v1.DeviceLinkService/ConfirmDeviceLink";
 pub const KEY_GET_BUNDLE: &str = "/shared.proto.services.v1.KeyService/GetPreKeyBundle";

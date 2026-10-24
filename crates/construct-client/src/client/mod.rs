@@ -10,6 +10,7 @@ mod auth;
 mod contacts;
 mod identity;
 mod inbound;
+mod linking;
 mod messages;
 mod orchestrator;
 mod profile;
@@ -52,6 +53,11 @@ pub enum ClientCommand {
     LinkByQr,
     /// Stop waiting for the phone.
     CancelLink,
+    /// Show a code a new device scans to become a device of this account (Flow A, what iOS
+    /// "Link new device" shows); this device vouches for it once it links.
+    OfferLink,
+    /// Stop offering the code.
+    CancelLinkOffer,
     /// Let a device that asked to join this account (its `link-to-me` code names it) become one
     /// of its devices — what the phone does when it scans the code.
     ApproveJoin {
@@ -229,6 +235,14 @@ pub enum ClientEvent {
     LinkCode(String),
     /// Linking stopped: refused, expired, or the server could not be reached.
     LinkFailed(String),
+    /// A code for a new device to scan (`konstruct://link?token&fp&s`), valid until `expires_at`
+    /// (Unix seconds). It carries a secret: shown, never sent anywhere.
+    LinkOffer {
+        code: Zeroizing<String>,
+        expires_at: i64,
+    },
+    /// The offer ended: the device that linked with it, or why not.
+    LinkOfferEnded(Result<String, String>),
     LoggedOut,
     /// The server did not delete the account; nothing was wiped. The reason, for the person.
     DeleteAccountFailed(String),
@@ -345,6 +359,9 @@ pub(crate) struct Client {
     access_token: String,
     /// Our identity public key, captured at orchestrator start; for safety numbers and export.
     our_identity_key: Option<Vec<u8>>,
+    /// Our hybrid signature key: with the identity key, what a link code's `fp` pins.
+    our_hybrid_key: Option<Vec<u8>>,
+    offer_task: Option<tokio::task::AbortHandle>,
     orch_handle: Option<crate::orchestrator_task::OrchestratorHandle>,
     stream_tx: Option<mpsc::Sender<crate::streaming::StreamCmd>>,
     /// The people the stream is subscribed for, in the order they were added.
@@ -383,6 +400,8 @@ impl Client {
             device_id: String::new(),
             access_token: String::new(),
             our_identity_key: None,
+            our_hybrid_key: None,
+            offer_task: None,
             orch_handle: None,
             stream_tx: None,
             contact_ids: Vec::new(),
@@ -416,6 +435,8 @@ impl Client {
             ClientCommand::LinkDevice { token } => self.link_device(token),
             ClientCommand::LinkByQr => self.link_by_qr(),
             ClientCommand::CancelLink => self.cancel_link(),
+            ClientCommand::OfferLink => self.offer_link(),
+            ClientCommand::CancelLinkOffer => self.cancel_link_offer(),
             ClientCommand::ApproveJoin {
                 device_id,
                 fingerprint,
