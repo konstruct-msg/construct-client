@@ -28,8 +28,8 @@ mod stream;
 pub(crate) mod users;
 
 pub use account::{
-    Device, list_devices, own_username, revoke_device, set_device_metadata, set_discoverable,
-    set_username, username_refusal,
+    Device, delete_account, list_devices, logout, own_username, revoke_device, set_device_metadata,
+    set_discoverable, set_username, username_refusal,
 };
 pub use auth::{
     AuthTokens, JoinRequest, JoinStatus, approve_join_request, authenticate_device,

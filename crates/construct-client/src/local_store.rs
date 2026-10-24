@@ -55,9 +55,31 @@ pub struct StoredReaction {
 
 const PREF_DELIVERY_RECEIPTS: &str = "pref.delivery_receipts";
 const PREF_DISCOVERABLE: &str = "pref.discoverable";
+const PREF_MEDIA: &str = "pref.media";
 
 /// How long a split message waits for its missing frames (iOS `PendingReassemblyStore`).
 const CHUNK_RETENTION_MS: i64 = 24 * 60 * 60 * 1000;
+
+/// How attachments are fetched and kept, as iOS offers it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MediaPrefs {
+    pub auto_download: crate::media::AutoDownload,
+    /// Bytes the cache may take; `None` for no limit.
+    pub quota: Option<u64>,
+    /// Days a fetched file is kept; `None` for always.
+    pub keep_days: Option<u32>,
+}
+
+impl Default for MediaPrefs {
+    /// iOS's: small files on arrival, 1 GB, kept always.
+    fn default() -> Self {
+        Self {
+            auto_download: crate::media::AutoDownload::Small,
+            quota: Some(1 << 30),
+            keep_days: None,
+        }
+    }
+}
 
 #[derive(Debug, Clone, Default)]
 pub struct StoredContact {
@@ -176,6 +198,26 @@ impl LocalStore {
 
     pub fn set_discoverable(&self, on: bool) -> Result<()> {
         self.secure_save(PREF_DISCOVERABLE, &[u8::from(on)])
+    }
+
+    /// How attachments are fetched and kept (Settings → Data and storage).
+    pub fn media_prefs(&self) -> MediaPrefs {
+        match self.secure_load(PREF_MEDIA) {
+            Ok(Some(v)) if v.len() == 13 => MediaPrefs {
+                auto_download: crate::media::AutoDownload::from_byte(v[0]),
+                quota: Some(u64::from_le_bytes(v[1..9].try_into().unwrap())).filter(|q| *q > 0),
+                keep_days: Some(u32::from_le_bytes(v[9..13].try_into().unwrap()))
+                    .filter(|d| *d > 0),
+            },
+            _ => MediaPrefs::default(),
+        }
+    }
+
+    pub fn set_media_prefs(&self, prefs: &MediaPrefs) -> Result<()> {
+        let mut v = vec![prefs.auto_download.to_byte()];
+        v.extend_from_slice(&prefs.quota.unwrap_or(0).to_le_bytes());
+        v.extend_from_slice(&prefs.keep_days.unwrap_or(0).to_le_bytes());
+        self.secure_save(PREF_MEDIA, &v)
     }
 
     /// Our username, as last set from this device: the server does not tell it back

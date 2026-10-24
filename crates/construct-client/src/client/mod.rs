@@ -155,7 +155,19 @@ pub enum ClientCommand {
         contact_id: String,
         on: bool,
     },
+    /// Sign out here: the server is told, then this device is wiped.
     Logout,
+    /// Sign out every device of the account, this one wiped too.
+    LogoutEverywhere,
+    /// Delete the account on the server, then wipe this device. `local_only`: wipe only, for when
+    /// the server refused or cannot be reached (iOS "delete locally only").
+    DeleteAccount {
+        local_only: bool,
+    },
+    /// Delete every fetched attachment.
+    ClearMediaCache,
+    /// How attachments are fetched and kept.
+    SetMediaPrefs(crate::local_store::MediaPrefs),
 }
 
 /// What the client tells a front end.
@@ -218,6 +230,8 @@ pub enum ClientEvent {
     /// Linking stopped: refused, expired, or the server could not be reached.
     LinkFailed(String),
     LoggedOut,
+    /// The server did not delete the account; nothing was wiped. The reason, for the person.
+    DeleteAccountFailed(String),
     /// Where the account's recovery key stands, for this device. Sent after each start and
     /// whenever it changes.
     Recovery(crate::recovery::RecoveryState),
@@ -258,6 +272,8 @@ enum Inbox {
     },
     /// The recovery key's state after background work.
     Recovery(crate::recovery::RecoveryState),
+    /// The server was told of a sign-out or a deletion (or could not be): wipe now.
+    Wipe,
 }
 
 /// The front end's end of the client: send commands, nothing else.
@@ -387,6 +403,7 @@ impl Client {
                 Inbox::StreamAuthRequired => self.refresh_token_now(),
                 Inbox::InviteAccepted { user_id, username } => self.add_contact(user_id, username),
                 Inbox::Recovery(state) => self.emit(ClientEvent::Recovery(state)),
+                Inbox::Wipe => self.logout(),
             }
         }
     }
@@ -442,7 +459,11 @@ impl Client {
             ClientCommand::ShareProfile { contact_id, on } => self.share_profile(contact_id, on),
             ClientCommand::SetAlias { contact_id, alias } => self.set_alias(contact_id, alias),
             ClientCommand::RenameDevice(name) => self.rename_device(name),
-            ClientCommand::Logout => self.logout(),
+            ClientCommand::Logout => self.sign_out(false),
+            ClientCommand::LogoutEverywhere => self.sign_out(true),
+            ClientCommand::DeleteAccount { local_only } => self.delete_account(local_only),
+            ClientCommand::ClearMediaCache => self.clear_media_cache(),
+            ClientCommand::SetMediaPrefs(prefs) => self.set_media_prefs(prefs),
         }
     }
 

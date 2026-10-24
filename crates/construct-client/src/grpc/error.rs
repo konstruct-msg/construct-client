@@ -50,6 +50,20 @@ impl GrpcError {
         )
     }
 
+    /// The server deactivated this device (`RevokeDevice` from another device of the account, or
+    /// its `Logout`): the one signal that wipes it (decisions/sign-out-wipes-the-device.md). Any
+    /// other refusal — "Device not found" too, which a server that lost rows also says — is not.
+    pub fn is_device_removed(&self) -> bool {
+        match self {
+            Self::Unauthenticated(m)
+            | Self::Status {
+                code: 16,
+                message: m,
+            } => m.trim() == "Device is inactive",
+            _ => false,
+        }
+    }
+
     pub fn is_permission_denied(&self) -> bool {
         matches!(
             self,
@@ -66,6 +80,16 @@ impl GrpcError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_an_inactive_device_reads_as_removed() {
+        assert!(GrpcError::status(16, "Device is inactive").is_device_removed());
+        assert!(GrpcError::unauthenticated("Device is inactive").is_device_removed());
+        // A server that lost its rows says this too; a wipe on it would be a false alarm.
+        assert!(!GrpcError::status(16, "Device not found").is_device_removed());
+        assert!(!GrpcError::status(7, "Device is inactive").is_device_removed());
+        assert!(!GrpcError::transport("Device is inactive").is_device_removed());
+    }
 
     #[test]
     fn transport_is_not_unauthenticated() {

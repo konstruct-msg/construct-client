@@ -113,6 +113,13 @@ impl Client {
         // the token.
         let anonymous = crate::grpc::GrpcClient::new(&self.server_url);
         let avatars = anonymous.clone();
+        let media = crate::media::MediaCache::new(self.data_dir()?.media_dir());
+        {
+            // Kept within the settings from the start, not only after the next arrival.
+            let (media, prefs) = (media.clone(), self.store.as_ref().map(|s| s.media_prefs()));
+            let prefs = prefs.unwrap_or_default();
+            tokio::task::spawn_blocking(move || media.evict(prefs.quota, prefs.keep_days));
+        }
         let orch_handle = spawn_orchestrator_task(
             orchestrator,
             storage,
@@ -128,6 +135,7 @@ impl Client {
                 signing_secret: signing_secret_for_prekeys,
                 replace_prekeys: !prekeys_whole,
             },
+            media,
         );
         {
             let orch = orch_handle.clone();

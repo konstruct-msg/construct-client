@@ -399,6 +399,9 @@ impl App {
             }
             ClientEvent::LoggedOut => self.reset_after_logout(),
             ClientEvent::Notice(text) => self.status = text,
+            ClientEvent::DeleteAccountFailed(reason) => {
+                self.status = format!("Account not deleted: {reason}")
+            }
             // The terminal has no screen for the phrase yet: it says where things stand.
             ClientEvent::Recovery(state) => {
                 use construct_client::recovery::RecoveryState;

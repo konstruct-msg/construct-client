@@ -93,7 +93,7 @@ impl Client {
                         username: None,
                     }))
                 }
-                Err(e) => AuthMsg::Failure(format!("Device re-auth failed: {e}")),
+                Err(e) => super::auth::auth_failure(&e, format!("Device re-auth failed: {e}")),
             };
             let _ = inbox.send(Inbox::Auth(msg));
         });

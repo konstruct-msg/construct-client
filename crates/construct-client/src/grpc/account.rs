@@ -4,10 +4,11 @@
 use prost::Message;
 
 use crate::proto::services::v1::{
-    CheckUsernameAvailabilityRequest, CheckUsernameAvailabilityResponse, GetUserProfileRequest,
-    GetUserProfileResponse, ListDevicesRequest, ListDevicesResponse, RevokeDeviceRequest,
-    RevokeDeviceResponse, SetDeviceMetadataRequest, SetDiscoverableRequest,
-    SetDiscoverableResponse, UpdateUserProfileRequest, UpdateUserProfileResponse,
+    CheckUsernameAvailabilityRequest, CheckUsernameAvailabilityResponse, DeleteAccountRequest,
+    DeleteAccountResponse, GetUserProfileRequest, GetUserProfileResponse, ListDevicesRequest,
+    ListDevicesResponse, LogoutRequest, LogoutResponse, RevokeDeviceRequest, RevokeDeviceResponse,
+    SetDeviceMetadataRequest, SetDiscoverableRequest, SetDiscoverableResponse,
+    UpdateUserProfileRequest, UpdateUserProfileResponse,
 };
 
 use super::client::GrpcClient;
@@ -152,4 +153,49 @@ pub async fn set_discoverable(client: &GrpcClient, discoverable: bool) -> Result
     let resp = SetDiscoverableResponse::decode(bytes.as_slice())
         .map_err(|e| GrpcError::transport(format!("SetDiscoverable decode: {e}")))?;
     Ok(resp.discoverable)
+}
+
+/// `AuthService.Logout`: the server stops taking this session's tokens, and with `all_devices`
+/// every device's. It marks the devices inactive, so a revoked one wipes itself when it next
+/// signs in (decisions/sign-out-wipes-the-device.md).
+pub async fn logout(
+    client: &GrpcClient,
+    access_token: &str,
+    all_devices: bool,
+) -> Result<(), GrpcError> {
+    let req = LogoutRequest {
+        access_token: access_token.to_owned(),
+        all_devices,
+    };
+    let bytes = client
+        .unary(paths::AUTH_LOGOUT, &req.encode_to_vec())
+        .await?;
+    let resp = LogoutResponse::decode(bytes.as_slice())
+        .map_err(|e| GrpcError::transport(format!("Logout decode: {e}")))?;
+    if !resp.success {
+        return Err(GrpcError::transport("the server did not sign out"));
+    }
+    Ok(())
+}
+
+/// `UserService.DeleteAccount`, confirmed the way iOS confirms it.
+pub async fn delete_account(client: &GrpcClient) -> Result<(), GrpcError> {
+    let req = DeleteAccountRequest {
+        confirmation: "DELETE".into(),
+        reason: Some("user_requested".into()),
+    };
+    let bytes = client
+        .unary(paths::USER_DELETE_ACCOUNT, &req.encode_to_vec())
+        .await?;
+    let resp = DeleteAccountResponse::decode(bytes.as_slice())
+        .map_err(|e| GrpcError::transport(format!("DeleteAccount decode: {e}")))?;
+    if !resp.success {
+        let why = if resp.message.is_empty() {
+            "the server did not delete the account".to_string()
+        } else {
+            resp.message
+        };
+        return Err(GrpcError::transport(why));
+    }
+    Ok(())
 }

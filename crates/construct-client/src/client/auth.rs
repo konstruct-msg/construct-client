@@ -15,6 +15,21 @@ use crate::{
 pub(crate) enum AuthMsg {
     Success(Box<AuthSuccess>),
     Failure(String),
+    /// The server says this device was removed from the account: wipe it.
+    Removed,
+}
+
+/// A failed sign-in, as the inbox takes it: a removed device apart from every other failure.
+pub(super) fn auth_failure(e: &anyhow::Error, reason: String) -> AuthMsg {
+    let removed = e
+        .chain()
+        .filter_map(|c| c.downcast_ref::<crate::grpc::GrpcError>())
+        .any(crate::grpc::GrpcError::is_device_removed);
+    if removed {
+        AuthMsg::Removed
+    } else {
+        AuthMsg::Failure(reason)
+    }
 }
 
 /// `try_restore_session` found nothing on disk.
@@ -43,7 +58,7 @@ const SESSION_KEY: &str = "account.session";
 
 impl Client {
     /// Lock the data directory, once per process. Another shell holding it is a failure.
-    fn data_dir(&mut self) -> Result<&crate::local_data::DataDir, String> {
+    pub(super) fn data_dir(&mut self) -> Result<&crate::local_data::DataDir, String> {
         if self.data.is_none() {
             self.data =
                 Some(crate::local_data::DataDir::open_default().map_err(|e| format!("{e:#}"))?);
@@ -204,7 +219,7 @@ impl Client {
                         username: None,
                     }))
                 }
-                Err(e) => AuthMsg::Failure(format!("{e:#}")),
+                Err(e) => auth_failure(&e, format!("{e:#}")),
             };
             let _ = inbox.send(Inbox::Auth(msg));
         });
@@ -293,6 +308,13 @@ impl Client {
             AuthMsg::Failure(reason) => {
                 let no_session = reason == NO_SESSION;
                 self.emit(ClientEvent::AuthFailed { reason, no_session });
+            }
+            AuthMsg::Removed => {
+                tracing::warn!("this device was removed from the account: wiping it");
+                self.emit(ClientEvent::Notice(
+                    "This device was signed out from another device; its data is wiped".into(),
+                ));
+                self.logout();
             }
         }
     }
@@ -493,12 +515,95 @@ impl Client {
     }
 
     /// Clear the session from disk and stop everything running for it.
-    pub(super) fn logout(&mut self) {
+    /// Tell the server, then wipe. The stream stops at once, so nothing arrives into a store about
+    /// to go; an unreachable server does not keep the device signed in (it was asked to sign out),
+    /// it only leaves the session live there until the token runs out.
+    ///
+    /// `all_devices`: the others are revoked one by one first. `Logout` with `all_devices` only
+    /// revokes refresh tokens; a device still active signs in again with its key and goes on.
+    /// The server refuses to revoke the account's first device, which then stays signed in.
+    pub(super) fn sign_out(&mut self, all_devices: bool) {
+        self.stop_session();
+        let (grpc, token) = (self.grpc.clone(), self.access_token.clone());
+        let own = self.device_id.clone();
+        let (events, inbox) = (self.events.clone(), self.inbox.clone());
+        tokio::spawn(async move {
+            let mut kept = 0;
+            if all_devices {
+                let others = tokio::time::timeout(SERVER_GOODBYE, crate::grpc::list_devices(&grpc))
+                    .await
+                    .ok()
+                    .and_then(Result::ok)
+                    .unwrap_or_default();
+                for d in others
+                    .iter()
+                    .filter(|d| !d.is_current && d.device_id != own)
+                {
+                    let revoked = tokio::time::timeout(
+                        SERVER_GOODBYE,
+                        crate::grpc::revoke_device(&grpc, &d.device_id),
+                    )
+                    .await;
+                    if !matches!(revoked, Ok(Ok(()))) {
+                        tracing::warn!(device = %&d.device_id[..8.min(d.device_id.len())], "not revoked");
+                        kept += 1;
+                    }
+                }
+            }
+            let told = tokio::time::timeout(
+                SERVER_GOODBYE,
+                crate::grpc::logout(&grpc, &token, all_devices),
+            )
+            .await;
+            match &told {
+                Ok(Ok(())) => tracing::info!(all_devices, "signed out on the server"),
+                Ok(Err(e)) => tracing::warn!(all_devices, "the server was not told: {e}"),
+                Err(_) => tracing::warn!(all_devices, "the server did not answer the sign-out"),
+            }
+            // The account's first device is refused by the server, by design.
+            if kept > 0 {
+                let _ = events.send(ClientEvent::Notice(format!(
+                    "{kept} other device(s) are still signed in: the server did not sign them out"
+                )));
+            }
+            let _ = inbox.send(super::Inbox::Wipe);
+        });
+    }
+
+    /// Delete the account, then wipe. A refusal leaves everything as it was and says why, so the
+    /// person can choose to wipe only this device.
+    pub(super) fn delete_account(&mut self, local_only: bool) {
+        if local_only {
+            self.stop_session();
+            return self.logout();
+        }
+        let grpc = self.grpc.clone();
+        let (events, inbox) = (self.events.clone(), self.inbox.clone());
+        tokio::spawn(async move {
+            match tokio::time::timeout(SERVER_GOODBYE, crate::grpc::delete_account(&grpc)).await {
+                Ok(Ok(())) => {
+                    tracing::info!("account deleted on the server");
+                    let _ = inbox.send(super::Inbox::Wipe);
+                }
+                Ok(Err(e)) => drop(events.send(ClientEvent::DeleteAccountFailed(e.to_string()))),
+                Err(_) => drop(events.send(ClientEvent::DeleteAccountFailed(
+                    "the server did not answer".into(),
+                ))),
+            }
+        });
+    }
+
+    fn stop_session(&mut self) {
         // Dropping the handle stops the orchestrator task; the stream worker is told.
         self.orch_handle = None;
         if let Some(ref tx) = self.stream_tx.take() {
             let _ = tx.try_send(crate::streaming::StreamCmd::Shutdown);
         }
+    }
+
+    /// Wipe this device and forget the session.
+    pub(super) fn logout(&mut self) {
+        self.stop_session();
         // Signing out wipes the device (decisions/sign-out-wipes-the-device.md): the store's
         // files and its key. The task's handle may still be closing; the files go regardless.
         let store = self.store.take();
@@ -527,5 +632,29 @@ impl Client {
         self.contact_ids.clear();
         self.emit(ClientEvent::Account(self.account_info()));
         self.emit(ClientEvent::LoggedOut);
+    }
+}
+
+/// How long a sign-out or a deletion waits for the server before going on.
+const SERVER_GOODBYE: std::time::Duration = std::time::Duration::from_secs(10);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_removed_device_is_told_apart_under_its_context() {
+        let removed = anyhow::Error::new(crate::grpc::GrpcError::status(16, "Device is inactive"))
+            .context("authenticate");
+        assert!(matches!(
+            auth_failure(&removed, "x".into()),
+            AuthMsg::Removed
+        ));
+        let other = anyhow::Error::new(crate::grpc::GrpcError::status(16, "Device not found"))
+            .context("authenticate");
+        assert!(matches!(
+            auth_failure(&other, "x".into()),
+            AuthMsg::Failure(_)
+        ));
     }
 }

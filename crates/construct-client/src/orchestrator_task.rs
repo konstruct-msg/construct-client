@@ -247,6 +247,7 @@ pub struct LocalIdentity {
 /// * `anonymous` — a client that never holds a token, for sealed sends
 /// * `cursor` — stream watermark, advanced after inbound persist
 /// * `known_contacts` — accounts whose deliveries may enter the core
+/// * `media` — where attachments fetched on arrival are kept
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_orchestrator_task(
     orchestrator: Orchestrator,
@@ -257,6 +258,7 @@ pub fn spawn_orchestrator_task(
     cursor: CursorTracker,
     known_contacts: Vec<String>,
     identity: LocalIdentity,
+    media: crate::media::MediaCache,
 ) -> OrchestratorHandle {
     let (tx, rx) = mpsc::unbounded_channel::<IncomingEvent>();
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<OrchestratorCommand>();
@@ -280,6 +282,7 @@ pub fn spawn_orchestrator_task(
         cmd_tx,
     );
     task.anonymous = Some(avatars);
+    task.media = Some(media);
     tokio::spawn(async move { task.run(rx, cmd_rx).await });
 
     handle
@@ -355,6 +358,8 @@ struct Task {
     devices_checked: HashMap<String, tokio::time::Instant>,
     /// The client that never holds a token: avatars a profile names are fetched on it.
     anonymous: Option<GrpcClient>,
+    /// Where attachments fetched on arrival go.
+    media: Option<crate::media::MediaCache>,
 }
 
 impl Task {
@@ -391,7 +396,31 @@ impl Task {
             pending_certificates: HashMap::new(),
             devices_checked: HashMap::new(),
             anonymous: None,
+            media: None,
         }
+    }
+
+    /// The files a message just placed brought, fetched now as the settings allow: the server's
+    /// copy lasts a week from upload (decisions/media-fetch-on-arrival.md).
+    fn fetch_on_arrival(&self, event: Option<&BridgeEvent>, payload: &[u8]) {
+        if !matches!(
+            event,
+            Some(BridgeEvent::NewMessage { .. } | BridgeEvent::OwnMessage { .. })
+        ) {
+            return;
+        }
+        let (Some(cache), Some(anonymous)) = (self.media.clone(), self.anonymous.clone()) else {
+            return;
+        };
+        let files = crate::content::media_files(payload);
+        let prefs = self.storage.media_prefs();
+        if files.is_empty() || prefs.auto_download == crate::media::AutoDownload::Never {
+            return;
+        }
+        tokio::spawn(async move {
+            crate::media::prefetch(&cache, &anonymous, files, prefs.auto_download).await;
+            cache.evict(prefs.quota, prefs.keep_days);
+        });
     }
 
     async fn run(
@@ -1446,6 +1475,7 @@ impl Task {
                 match place_inbound(&self.storage, from, base_id, content, &payload, now_ms()) {
                     Ok(event) => {
                         tracing::info!(%message_id, %partner, "copy from another device placed");
+                        self.fetch_on_arrival(event.as_ref(), &payload);
                         if let Some(event) = event {
                             let _ = self
                                 .internal_tx
@@ -1575,6 +1605,7 @@ impl Task {
                         place_inbound(&self.storage, from, &id, content, &payload, now_ms())
                     {
                         self.cursor.commit(&self.storage, &message_id);
+                        self.fetch_on_arrival(event.as_ref(), &payload);
                         if let Some(event) = event {
                             let _ = self
                                 .internal_tx
