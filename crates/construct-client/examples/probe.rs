@@ -10,8 +10,9 @@
 //!     --add <user_id> --send "hello" --wait 60
 //! ```
 //!
-//! `--approve <device id>` lets a device that asked to join (the `id` of its link code) become a
-//! device of this account — what the phone does when it scans the code.
+//! `--approve <link code>` lets a device that asked to join (its `konstruct://link-to-me` code,
+//! or just its `id`) become a device of this account — what the phone does when it scans the
+//! code — and vouches for it when the code carries `fp`.
 //!
 //! `--link` instead of `--username`: become a new device of an existing account — print the
 //! `konstruct://link-to-me` code for the phone to scan, then wait for its approval.
@@ -123,10 +124,14 @@ async fn main() {
             ClientEvent::Started(contacts) => {
                 started = true;
                 println!("STARTED contacts={}", contacts.len());
-                if let Some(device_id) = &args.approve {
-                    client.send(ClientCommand::ApproveJoin {
-                        device_id: device_id.clone(),
-                    });
+                if let Some(code) = &args.approve {
+                    match construct_client::device_certs::parse_join_code(code) {
+                        Some(join) => client.send(ClientCommand::ApproveJoin {
+                            device_id: join.device_id,
+                            fingerprint: join.fingerprint,
+                        }),
+                        None => println!("NOT A JOIN CODE {code}"),
+                    }
                 }
                 if let Some(username) = &args.find {
                     client.send(ClientCommand::FindContact {
@@ -172,6 +177,10 @@ async fn main() {
                 println!("DELIVERED {message_id}");
             }
             ClientEvent::Bridge(BridgeEvent::Error(e)) => println!("ERROR {e}"),
+            ClientEvent::Bridge(BridgeEvent::UnvouchedDevices {
+                peer_id,
+                device_ids,
+            }) => println!("UNVOUCHED {peer_id} {device_ids:?}"),
             ClientEvent::MessageQueued { message_id, .. } => println!("QUEUED {message_id}"),
             ClientEvent::RegistrationStep(step) => println!("STEP {step:?}"),
             ClientEvent::Notice(n) => println!("NOTICE {n}"),

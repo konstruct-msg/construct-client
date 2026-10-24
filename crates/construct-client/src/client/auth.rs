@@ -245,25 +245,35 @@ impl Client {
         });
     }
 
-    /// Link this device to an existing account with a token from another device.
-    pub(super) fn link_device(&self, token: String) {
+    /// Link this device to an existing account with a code another device of it showed: the
+    /// `konstruct://link?…` code, or its bare token.
+    pub(super) fn link_device(&self, code: String) {
         let inbox = self.inbox.clone();
         let grpc = self.grpc.clone();
         tokio::spawn(async move {
-            let msg = match crate::auth::link_existing_device(&grpc, &token).await {
-                Ok(result) => {
+            let Some(code) = crate::device_certs::parse_link_code(&code) else {
+                let reason = "That is not a link code".to_string();
+                return drop(inbox.send(Inbox::Auth(AuthMsg::Failure(reason))));
+            };
+            if code.secret.is_none() {
+                tracing::info!("link code carries no secret: this device will be unvouched");
+            }
+            let msg = match crate::auth::link_existing_device(&grpc, &code).await {
+                Ok(linked) => {
+                    let result = linked.result;
                     let full = result
                         .session
                         .clone()
                         .expect("link_existing_device always returns session");
+                    let link_cursor = crate::auth::link_cursor(&result.access_token);
                     AuthMsg::Success(Box::new(AuthSuccess {
                         user_id: result.user_id,
                         device_id: result.device_id,
                         access_token: result.access_token,
                         full_session: full,
                         pending_save: result.session,
-                        key_record: None,
-                        link_cursor: None,
+                        key_record: Some(linked.key_record),
+                        link_cursor,
                     }))
                 }
                 Err(e) => AuthMsg::Failure(format!("{e:#}")),
@@ -395,14 +405,27 @@ impl Client {
         self.link_task = Some(task.abort_handle());
     }
 
-    /// Let a device that asked to join become one of this account's devices.
-    pub(super) fn approve_join(&self, device_id: String) {
+    /// Let a device that asked to join become one of this account's devices, then vouch for it
+    /// when its code carried the fingerprint of its keys.
+    pub(super) fn approve_join(&self, device_id: String, fingerprint: Option<Vec<u8>>) {
         let events = self.events.clone();
         let grpc = self.grpc.clone();
+        let orchestrator = self.orch_handle.clone();
         tokio::spawn(async move {
             let short = &device_id[..8.min(device_id.len())];
             let notice = match crate::grpc::approve_join_request(&grpc, &device_id).await {
-                Ok(()) => format!("Device {short} linked to this account"),
+                Ok(()) => {
+                    match (fingerprint, orchestrator) {
+                        (Some(fp), Some(orchestrator)) => orchestrator.vouch(
+                            device_id.clone(),
+                            crate::device_certs::Evidence::QrFingerprint(fp),
+                        ),
+                        _ => {
+                            tracing::info!(device = %short, "linked without a fingerprint: not vouched")
+                        }
+                    }
+                    format!("Device {short} linked to this account")
+                }
                 Err(e) => format!("Linking device {short} failed: {e}"),
             };
             let _ = events.send(ClientEvent::Notice(notice));

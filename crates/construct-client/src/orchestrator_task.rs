@@ -42,6 +42,11 @@ use crate::streaming::CursorTracker;
 /// How long an account's device set is trusted before it is asked again.
 const DEVICES_RECHECK: std::time::Duration = std::time::Duration::from_secs(10 * 60);
 
+/// How long a device being linked has to publish its keys before it is vouched for, and how
+/// often the directory is asked (iOS `DeviceCertificateIssuer`).
+const VOUCH_DEADLINE: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+const VOUCH_POLL: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// A certificate this close to its expiry is fetched again before it is used.
 const CERTIFICATE_REFRESH_AHEAD_SECS: i64 = 5 * 60;
 
@@ -79,6 +84,15 @@ impl OrchestratorHandle {
         let _ = self.cmd_tx.send(OrchestratorCommand::StreamEnvelope {
             envelope,
             stream_cursor,
+        });
+    }
+
+    /// Vouch for `device_id`, a device just linked to this account, once the directory serves
+    /// the keys `evidence` names.
+    pub(crate) fn vouch(&self, device_id: String, evidence: crate::device_certs::Evidence) {
+        let _ = self.cmd_tx.send(OrchestratorCommand::Vouch {
+            device_id,
+            evidence,
         });
     }
 
@@ -124,6 +138,17 @@ enum OrchestratorCommand {
     },
     ServerDelegations {
         delegations: Vec<Vec<u8>>,
+    },
+    /// Vouch for a device being linked to this account once the directory serves its keys.
+    Vouch {
+        device_id: String,
+        evidence: crate::device_certs::Evidence,
+    },
+    /// The directory serves the keys of a device being vouched for.
+    VouchKeys {
+        device_id: String,
+        evidence: crate::device_certs::Evidence,
+        keys: crate::device_certs::SubjectKeys,
     },
     /// The sealed sender worker sent `local_id`; the server calls it `server_id`.
     Sent {
@@ -186,7 +211,7 @@ pub fn spawn_orchestrator_task(
         cmd_tx: cmd_tx.clone(),
     };
 
-    let sealed_tx = spawn_sender(anonymous, grpc.clone(), cmd_tx, internal_tx.clone());
+    let sealed_tx = spawn_sender(anonymous, grpc.clone(), cmd_tx.clone(), internal_tx.clone());
     let mut task = Task::new(
         orchestrator,
         storage,
@@ -197,6 +222,7 @@ pub fn spawn_orchestrator_task(
         known_contacts,
         identity,
         tx,
+        cmd_tx,
     );
     tokio::spawn(async move { task.run(rx, cmd_rx).await });
 
@@ -258,6 +284,8 @@ struct Task {
     cursor: CursorTracker,
     identity: LocalIdentity,
     self_tx: mpsc::UnboundedSender<IncomingEvent>,
+    /// Commands back to this task, from its own sub-tasks.
+    self_cmd: mpsc::UnboundedSender<OrchestratorCommand>,
     timers: HashMap<String, AbortHandle>,
     session_established_at_ms: HashMap<String, u64>,
     known_contacts: HashSet<String>,
@@ -283,6 +311,7 @@ impl Task {
         known_contacts: Vec<String>,
         identity: LocalIdentity,
         self_tx: mpsc::UnboundedSender<IncomingEvent>,
+        self_cmd: mpsc::UnboundedSender<OrchestratorCommand>,
     ) -> Self {
         orchestrator.set_trusted_server_keys(crate::trust::pinned_certificate_keys());
         let peers = PeerDevices::load(&storage);
@@ -295,6 +324,7 @@ impl Task {
             cursor,
             identity,
             self_tx,
+            self_cmd,
             timers: HashMap::new(),
             session_established_at_ms: HashMap::new(),
             known_contacts: known_contacts.into_iter().collect(),
@@ -406,6 +436,15 @@ impl Task {
                     "server key delegations handed to the core"
                 );
             }
+            OrchestratorCommand::Vouch {
+                device_id,
+                evidence,
+            } => self.await_subject_keys(device_id, evidence),
+            OrchestratorCommand::VouchKeys {
+                device_id,
+                evidence,
+                keys,
+            } => self.vouch(device_id, &evidence, &keys),
             OrchestratorCommand::Sent {
                 server_id,
                 local_id,
@@ -415,6 +454,96 @@ impl Task {
                 }
             }
         }
+    }
+
+    /// Wait, off the task, for the directory to serve the keys of `device_id`: a device being
+    /// linked publishes its hybrid key and binding only with its first prekey upload, after the
+    /// link. Pending work lives in memory; a client closed meanwhile leaves the device
+    /// unvouched, and its peers see the alarm — the safe side.
+    fn await_subject_keys(&self, device_id: String, evidence: crate::device_certs::Evidence) {
+        let grpc = self.grpc.clone();
+        let account = self.identity.user_id.clone();
+        let commands = self.self_cmd.clone();
+        tokio::spawn(async move {
+            let deadline = tokio::time::Instant::now() + VOUCH_DEADLINE;
+            while tokio::time::Instant::now() < deadline {
+                tokio::time::sleep(VOUCH_POLL).await;
+                let listed = match crate::grpc::get_pre_key_bundles(
+                    &grpc,
+                    &account,
+                    vec![device_id.clone()],
+                    false,
+                )
+                .await
+                {
+                    Ok(listed) => listed,
+                    Err(e) => {
+                        tracing::debug!(device = %device_id, error = %e, "device keys unavailable");
+                        continue;
+                    }
+                };
+                let keys = listed
+                    .bundles
+                    .iter()
+                    .find(|b| b.device_id == device_id)
+                    .and_then(crate::device_certs::SubjectKeys::of);
+                if let Some(keys) = keys {
+                    let _ = commands.send(OrchestratorCommand::VouchKeys {
+                        device_id,
+                        evidence,
+                        keys,
+                    });
+                    return;
+                }
+            }
+            tracing::info!(device = %device_id, "keys not published in time: not vouched");
+        });
+    }
+
+    /// Ask the core for a certificate over the keys the directory serves, and publish it. The
+    /// core signs only the keys the link code named; other keys are the substitution the
+    /// certificate exists to catch, reported and never retried.
+    fn vouch(
+        &self,
+        device_id: String,
+        evidence: &crate::device_certs::Evidence,
+        keys: &crate::device_certs::SubjectKeys,
+    ) {
+        use construct_core::crypto::device_certificate::CertError;
+        let certificate = match self
+            .orchestrator
+            .issue_device_certificate(&keys.view(), &evidence.view())
+        {
+            Ok(certificate) => certificate,
+            Err(CertError::EvidenceMismatch) => {
+                tracing::error!(device = %device_id, "directory keys differ from the link code: refused");
+                return self.ui_error(format!(
+                    "[DEVICE_CERT] The server's keys for device {} differ from its code: not vouched",
+                    &device_id[..8.min(device_id.len())]
+                ));
+            }
+            Err(e) => {
+                return tracing::error!(device = %device_id, error = ?e, "certificate not issued");
+            }
+        };
+        let grpc = self.grpc.clone();
+        tokio::spawn(async move {
+            for _ in 0..5 {
+                match crate::grpc::publish_device_certificate(
+                    &grpc,
+                    &device_id,
+                    certificate.clone(),
+                )
+                .await
+                {
+                    Ok(()) => return tracing::info!(device = %device_id, "device vouched for"),
+                    Err(e) => {
+                        tracing::warn!(device = %device_id, error = %e, "certificate not published")
+                    }
+                }
+                tokio::time::sleep(VOUCH_POLL).await;
+            }
+        });
     }
 
     fn forget_contact(&mut self, contact_id: &str) {
@@ -699,6 +828,21 @@ impl Task {
             .await
             .map_err(|e| format!("GetPreKeyBundles: {e}"))?;
         let listed_ids: Vec<String> = listed.bundles.iter().map(|b| b.device_id.clone()).collect();
+        // Judged against the devices trusted before this answer is recorded below. Not our own
+        // account, and not one seen for the first time (nothing to vouch from).
+        if account != self.identity.user_id && !known.is_empty() {
+            let alarm =
+                crate::device_certs::vet(&self.orchestrator, account, &known, &listed.bundles);
+            if !alarm.is_empty() {
+                tracing::error!(%account, devices = ?alarm, "UNVOUCHED devices");
+                let _ = self.internal_tx.send(crate::client::ClientEvent::Bridge(
+                    BridgeEvent::UnvouchedDevices {
+                        peer_id: account.to_string(),
+                        device_ids: alarm,
+                    },
+                ));
+            }
+        }
         for bundle in &listed.bundles {
             if bundle.device_id != self.identity.device_id {
                 self.peers.record(
@@ -1812,6 +1956,7 @@ mod tests {
         let (internal_tx, _internal_rx) = mpsc::unbounded_channel();
         let (self_tx, _self_rx) = mpsc::unbounded_channel();
         let (sealed_tx, _sealed_rx) = mpsc::unbounded_channel();
+        let (self_cmd, _self_cmd_rx) = mpsc::unbounded_channel();
         Task::new(
             orchestrator,
             storage,
@@ -1828,6 +1973,7 @@ mod tests {
                 replace_prekeys: false,
             },
             self_tx,
+            self_cmd,
         )
     }
 }

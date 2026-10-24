@@ -114,16 +114,16 @@ pub async fn confirm_device_link(
     link_token: &str,
     device_id: &str,
     public_keys: DevicePublicKeys,
+    link_key_proof: Vec<u8>,
 ) -> Result<AuthTokens, GrpcError> {
     let req = ConfirmDeviceLinkRequest {
         link_token: link_token.to_string(),
         device_id: device_id.to_string(),
         public_keys: Some(public_keys),
-        // Left empty on purpose: the proof is an HMAC under the secret the old device's QR code
-        // carries (core `device_link_key_proof`), and this link flow takes only the token. Empty
-        // is what the protocol defines for a client older than device certificates; carrying the
-        // secret is TODO 218 stage 4 (this device as the iPhone's second device).
-        link_key_proof: Default::default(),
+        // HMAC under the secret in the old device's QR (core `device_link_key_proof`), so that
+        // device can vouch for these keys. Empty when the code carried no secret: the old device
+        // then leaves this one unvouched.
+        link_key_proof: link_key_proof.into(),
     };
     let bytes = client
         .unary(paths::DEVICE_CONFIRM_LINK, &req.encode_to_vec())
@@ -147,6 +147,33 @@ pub async fn approve_join_request(client: &GrpcClient, device_id: &str) -> Resul
     ApproveJoinRequestResponse::decode(bytes.as_slice())
         .map_err(|e| GrpcError::transport(format!("ApproveJoinRequest decode: {e}")))?;
     Ok(())
+}
+
+/// `DeviceService.PublishDeviceCertificate` — authenticated: this device vouches for `subject`,
+/// another device of its account. The server stores it beside the subject's bundle unverified;
+/// peers verify it (construct-core `judge_peer_devices`).
+pub async fn publish_device_certificate(
+    client: &GrpcClient,
+    subject: &str,
+    certificate: Vec<u8>,
+) -> Result<(), GrpcError> {
+    use crate::proto::services::v1::{
+        PublishDeviceCertificateRequest, PublishDeviceCertificateResponse,
+    };
+    let req = PublishDeviceCertificateRequest {
+        subject_device_id: subject.to_string(),
+        certificate: certificate.into(),
+    };
+    let bytes = client
+        .unary(paths::DEVICE_PUBLISH_CERTIFICATE, &req.encode_to_vec())
+        .await?;
+    let resp = PublishDeviceCertificateResponse::decode(bytes.as_slice())
+        .map_err(|e| GrpcError::transport(format!("PublishDeviceCertificate decode: {e}")))?;
+    if resp.success {
+        Ok(())
+    } else {
+        Err(GrpcError::transport("certificate not stored"))
+    }
 }
 
 /// This device's keys for the phone to approve (Flow B): what `SubmitJoinRequest` carries.

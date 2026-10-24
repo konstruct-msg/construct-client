@@ -38,7 +38,8 @@ pub enum ClientCommand {
     Register {
         username: String,
     },
-    /// Link this device to an account with a token from another device.
+    /// Link this device to an account with the code another device of it shows
+    /// (`konstruct://link?…`, or its bare token).
     LinkDevice {
         token: String,
     },
@@ -51,6 +52,9 @@ pub enum ClientCommand {
     /// of its devices — what the phone does when it scans the code.
     ApproveJoin {
         device_id: String,
+        /// The `fp` of its code: the keys this device vouches for once the directory serves
+        /// them. Without it the device is approved and left unvouched.
+        fingerprint: Option<Vec<u8>>,
     },
     /// Protect the new session with this passphrase and start.
     SetPassphrase(Zeroizing<Vec<u8>>),
@@ -292,7 +296,10 @@ impl Client {
             ClientCommand::LinkDevice { token } => self.link_device(token),
             ClientCommand::LinkByQr => self.link_by_qr(),
             ClientCommand::CancelLink => self.cancel_link(),
-            ClientCommand::ApproveJoin { device_id } => self.approve_join(device_id),
+            ClientCommand::ApproveJoin {
+                device_id,
+                fingerprint,
+            } => self.approve_join(device_id, fingerprint),
             ClientCommand::SetPassphrase(passphrase) => self.set_passphrase(&passphrase),
             ClientCommand::SendText { contact_id, text } => self.send_text(contact_id, text),
             ClientCommand::LoadHistory { peer_id, limit } => self.load_history(peer_id, limit),
