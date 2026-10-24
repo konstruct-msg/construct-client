@@ -12,7 +12,7 @@ use construct_store::{
     Chat, Contact, Message, PeerDevice, PendingChunk, Reaction, Store, delivery, payload,
 };
 
-pub use crate::content::{Attachment, Quote};
+pub use crate::content::{Attachment, MediaInfo, Quote};
 use serde::{Deserialize, Serialize};
 
 // ── What the screens read ─────────────────────────────────────────────────────
@@ -41,6 +41,9 @@ pub struct StoredMessage {
     /// One per person, oldest first.
     #[serde(default)]
     pub reactions: Vec<StoredReaction>,
+    /// The files it carries, in display order; fetched by index ([`LocalStore::media_files`]).
+    #[serde(default)]
+    pub media: Vec<MediaInfo>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -253,6 +256,17 @@ impl LocalStore {
         };
         let reactions = self.store.reactions(id)?;
         Ok(Some(view_message(row, &chat.peer_id, &reactions)))
+    }
+
+    /// The files message `id` carries, with what fetching and opening them takes.
+    pub fn media_files(&self, id: &str) -> Result<Vec<crate::content::MediaFile>> {
+        Ok(match self.store.message(id)? {
+            Some(row) => match payload::Payload::decode(&row.body) {
+                payload::Payload::MessageContent(bytes) => crate::content::media_files(bytes),
+                _ => Vec::new(),
+            },
+            None => Vec::new(),
+        })
     }
 
     /// The author of message `id`, when it is held.
@@ -503,6 +517,7 @@ fn now_ms() -> i64 {
 
 /// A stored row as the screens read it.
 fn view_message(m: Message, peer: &str, reactions: &[Reaction]) -> StoredMessage {
+    let mut media = Vec::new();
     let (text, quote, attachment) = match payload::Payload::decode(&m.body) {
         payload::Payload::Text(text) => (text.to_string(), None, None),
         payload::Payload::MessageContent(bytes) => match crate::content::parse(bytes) {
@@ -510,7 +525,13 @@ fn view_message(m: Message, peer: &str, reactions: &[Reaction]) -> StoredMessage
                 text,
                 quote,
                 attachment,
-            }) => (text, quote, attachment),
+            }) => {
+                media = crate::content::media_files(bytes)
+                    .into_iter()
+                    .map(|f| f.info)
+                    .collect();
+                (text, quote, attachment)
+            }
             _ => (String::new(), None, Some(Attachment::Other)),
         },
         payload::Payload::Legacy(bytes) => {
@@ -545,6 +566,7 @@ fn view_message(m: Message, peer: &str, reactions: &[Reaction]) -> StoredMessage
                 emoji: r.emoji,
             })
             .collect(),
+        media,
         id: m.id,
         peer_id: peer.to_string(),
         timestamp_ms: m.timestamp,

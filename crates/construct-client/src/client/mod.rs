@@ -62,6 +62,13 @@ pub enum ClientCommand {
         contact_id: String,
         text: String,
     },
+    /// Send a file: `name` as the person's system called it, `caption` under it.
+    SendFile {
+        contact_id: String,
+        name: String,
+        bytes: Vec<u8>,
+        caption: String,
+    },
     /// Send `text` to `contact_id` as an answer to their message or ours, `to`.
     Reply {
         contact_id: String,
@@ -87,6 +94,11 @@ pub enum ClientCommand {
     LoadHistory {
         peer_id: String,
         limit: usize,
+    },
+    /// Fetch and open file `index` of a message ([`ClientEvent::Media`]).
+    LoadMedia {
+        message_id: String,
+        index: usize,
     },
     /// A username, or an invite link to redeem.
     FindContact {
@@ -159,6 +171,12 @@ pub enum ClientEvent {
     History {
         peer_id: String,
         messages: Vec<StoredMessage>,
+    },
+    /// File `index` of a message, opened — or why not.
+    Media {
+        message_id: String,
+        index: usize,
+        result: Result<crate::media::OpenedMedia, String>,
     },
     /// The safety number with a contact, computed by the core.
     SafetyNumber {
@@ -257,6 +275,9 @@ pub(crate) struct Client {
     no_encrypt: bool,
     pq_active: bool,
     grpc: GrpcClient,
+    /// A client that never holds a token: attachments are fetched on it, so the server does not
+    /// learn which account fetched whose file.
+    anonymous: GrpcClient,
     events: mpsc::UnboundedSender<ClientEvent>,
     /// Where background work started here reports back.
     inbox: mpsc::UnboundedSender<Inbox>,
@@ -294,6 +315,7 @@ impl Client {
     ) -> Self {
         Self {
             grpc: GrpcClient::new(&cfg.server_url),
+            anonymous: GrpcClient::new(&cfg.server_url),
             server_url: cfg.server_url,
             transport: cfg.transport,
             no_encrypt: cfg.no_encrypt,
@@ -345,6 +367,12 @@ impl Client {
             } => self.approve_join(device_id, fingerprint),
             ClientCommand::SetPassphrase(passphrase) => self.set_passphrase(&passphrase),
             ClientCommand::SendText { contact_id, text } => self.send_text(contact_id, text, None),
+            ClientCommand::SendFile {
+                contact_id,
+                name,
+                bytes,
+                caption,
+            } => self.send_file(contact_id, name, bytes, caption),
             ClientCommand::Reply {
                 contact_id,
                 text,
@@ -354,6 +382,7 @@ impl Client {
             ClientCommand::React { message_id, emoji } => self.react(message_id, emoji),
             ClientCommand::DeleteMessage { message_id } => self.delete_message(message_id),
             ClientCommand::LoadHistory { peer_id, limit } => self.load_history(peer_id, limit),
+            ClientCommand::LoadMedia { message_id, index } => self.load_media(message_id, index),
             ClientCommand::FindContact { query } => self.find_contact(&query),
             ClientCommand::AddContact { user_id, username } => self.add_contact(user_id, username),
             ClientCommand::DeleteContact { peer_id } => self.delete_contact(peer_id),
