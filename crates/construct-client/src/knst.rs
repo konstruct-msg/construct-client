@@ -71,30 +71,103 @@ pub fn is_frame(data: &[u8]) -> bool {
     construct_core::knst::Frame::parse(data).is_some()
 }
 
-/// Displayable chat text from a decrypted plaintext buffer.
+/// A decrypted plaintext buffer, read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Inbound {
+    /// A control type (ping, ready, call, heartbeat, receipt): never a bubble.
+    Silent,
+    /// Chat content. `id` is the sender's message id from the KNST header — the id every other
+    /// message (a reply, an edit, a reaction) names it by; `None` for bare UTF-8.
+    Content {
+        id: Option<String>,
+        content: crate::content::Content,
+        /// The `MessageContent` bytes it was read from; empty for bare UTF-8.
+        payload: Vec<u8>,
+    },
+    /// One frame of a message split across several; held until the rest come
+    /// ([`crate::local_store::LocalStore::hold_chunk`]), then read with [`decode_assembled`].
+    Chunk(Chunk),
+}
+
+/// One frame of a split message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Chunk {
+    pub id: String,
+    pub index: u16,
+    pub total: u16,
+    /// The length of the whole message, which the last frame's padding is cut to.
+    pub plaintext_length: u32,
+    pub content_type: u8,
+    pub payload: Vec<u8>,
+}
+
+/// Most frames a message is split into (`knst::MAX_CHUNKS`); a frame saying more is not held.
+pub const MAX_CHUNKS: u16 = construct_core::knst::MAX_CHUNKS as u16;
+
+/// Read a decrypted plaintext buffer.
 ///
-/// Control types (ping / ready / call / heartbeat / receipt) return empty so
-/// they never become a bubble. Unknown KNST payloads try `MessageContent`, then
-/// UTF-8. Bare UTF-8 is the TUI↔TUI / leftover path.
-pub fn decode_text(plaintext: &[u8]) -> String {
-    if !is_frame(plaintext) {
-        return String::from_utf8_lossy(plaintext).into_owned();
-    }
+/// Bare UTF-8 is the TUI↔TUI / leftover path. A payload that is not `MessageContent`, or a type
+/// no producer frames, is still a message — shown as one this client cannot read rather than
+/// dropped, and never as its bytes.
+pub fn decode(plaintext: &[u8]) -> Inbound {
+    use crate::content::Content;
     let Some(frame) = construct_core::knst::Frame::parse(plaintext) else {
-        return String::from_utf8_lossy(plaintext).into_owned();
+        return Inbound::Content {
+            id: None,
+            content: Content::Message {
+                text: String::from_utf8_lossy(plaintext).into_owned(),
+                quote: None,
+                attachment: None,
+            },
+            payload: Vec::new(),
+        };
     };
     if is_silent_type(frame.content_type) {
-        return String::new();
+        return Inbound::Silent;
+    }
+    let id = construct_core::knst::message_id_string(&frame.message_id);
+    if frame.total_chunks > 1 {
+        if frame.total_chunks > MAX_CHUNKS || frame.chunk_index >= frame.total_chunks {
+            return Inbound::Silent;
+        }
+        return Inbound::Chunk(Chunk {
+            id,
+            index: frame.chunk_index,
+            total: frame.total_chunks,
+            plaintext_length: frame.plaintext_length,
+            content_type: frame.content_type,
+            payload: frame.payload.to_vec(),
+        });
     }
     let length = (frame.plaintext_length as usize).min(frame.payload.len());
-    let payload = &frame.payload[..length];
+    decode_assembled(id, &frame.payload[..length])
+}
 
-    if let Ok(content) = MessageContent::decode(payload)
-        && let Some(message_content::Content::Text(text_msg)) = content.content
-    {
-        return text_msg.text;
+/// A whole message payload, joined from its frames or carried in one.
+pub fn decode_assembled(id: String, payload: &[u8]) -> Inbound {
+    use crate::content::{Attachment, Content};
+    let content = crate::content::parse(payload).unwrap_or(Content::Message {
+        text: String::new(),
+        quote: None,
+        attachment: Some(Attachment::Other),
+    });
+    Inbound::Content {
+        id: Some(id),
+        content,
+        payload: payload.to_vec(),
     }
-    String::from_utf8_lossy(payload).into_owned()
+}
+
+/// The text of a decrypted buffer, when it is a plain message.
+#[cfg(test)]
+fn decode_text(plaintext: &[u8]) -> String {
+    match decode(plaintext) {
+        Inbound::Content {
+            content: crate::content::Content::Message { text, .. },
+            ..
+        } => text,
+        _ => String::new(),
+    }
 }
 
 /// What a client must do with the payload behind a KNST byte-5 value.

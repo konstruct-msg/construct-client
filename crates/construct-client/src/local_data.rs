@@ -280,6 +280,7 @@ mod tests {
                 direction: "received".into(),
                 timestamp_ms: 1,
                 delivery_status: String::new(),
+                ..Default::default()
             })
             .unwrap();
         local

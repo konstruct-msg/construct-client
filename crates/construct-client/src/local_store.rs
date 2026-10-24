@@ -8,12 +8,16 @@
 use std::sync::Arc;
 
 use anyhow::Result;
-use construct_store::{Chat, Contact, Message, PeerDevice, Store, delivery, payload};
+use construct_store::{
+    Chat, Contact, Message, PeerDevice, PendingChunk, Reaction, Store, delivery, payload,
+};
+
+pub use crate::content::{Attachment, Quote};
 use serde::{Deserialize, Serialize};
 
 // ── What the screens read ─────────────────────────────────────────────────────
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct StoredMessage {
     pub id: String,
     /// The account on the other side (the conversation).
@@ -25,7 +29,28 @@ pub struct StoredMessage {
     pub timestamp_ms: i64,
     /// `"delivered"` once the peer's receipt came, else `""`.
     pub delivery_status: String,
+    /// Its author changed the text after sending.
+    #[serde(default)]
+    pub edited: bool,
+    /// The message this one answers.
+    #[serde(default)]
+    pub quote: Option<Quote>,
+    /// What it carries besides `text` (which is then its caption, or a sticker's emoji).
+    #[serde(default)]
+    pub attachment: Option<Attachment>,
+    /// One per person, oldest first.
+    #[serde(default)]
+    pub reactions: Vec<StoredReaction>,
 }
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StoredReaction {
+    pub reactor_id: String,
+    pub emoji: String,
+}
+
+/// How long a split message waits for its missing frames (iOS `PendingReassemblyStore`).
+const CHUNK_RETENTION_MS: i64 = 24 * 60 * 60 * 1000;
 
 #[derive(Debug, Clone)]
 pub struct StoredContact {
@@ -157,14 +182,21 @@ impl LocalStore {
     }
 
     /// A message we sent, or one received. A message id already held is kept as it is, so a
-    /// redelivery cannot clobber what was stored.
-    fn insert(&self, msg: &StoredMessage, sent_by_me: bool) -> Result<()> {
+    /// redelivery cannot clobber what was stored. `content` is the wire `MessageContent` of a
+    /// message that is more than text, kept whole so what this client cannot show yet is not
+    /// lost; plain text is stored as text.
+    fn insert(&self, msg: &StoredMessage, sent_by_me: bool, content: Option<&[u8]>) -> Result<()> {
         let chat_id = self.chat_with(&msg.peer_id)?;
         let (from, to) = if sent_by_me {
             (self.own_account.clone(), msg.peer_id.clone())
         } else {
             (msg.peer_id.clone(), self.own_account.clone())
         };
+        let body = match content {
+            Some(content) => payload::encode(payload::kind::MESSAGE_CONTENT, content),
+            None => payload::encode(payload::kind::TEXT, msg.text.as_bytes()),
+        };
+        let preview = preview(msg);
         self.store.insert_message(
             &Message {
                 id: msg.id.clone(),
@@ -174,29 +206,147 @@ impl LocalStore {
                 is_sent_by_me: sent_by_me,
                 timestamp: msg.timestamp_ms,
                 order_key: payload::local_order_key(msg.timestamp_ms, &msg.id),
-                body: payload::encode(payload::kind::TEXT, msg.text.as_bytes()),
+                body,
                 content_type: 1,
                 delivery_status: if sent_by_me {
                     delivery::SENDING
                 } else {
                     delivery::DELIVERED
                 },
+                reply_to_message_id: msg.quote.as_ref().map(|q| q.message_id.clone()),
+                reply_to_content: msg.quote.as_ref().map(|q| q.preview.clone()),
                 ..Default::default()
             },
             Some(&msg.text),
         )?;
         self.store
-            .set_chat_preview(&chat_id, Some(&msg.text), Some(msg.timestamp_ms))?;
+            .set_chat_preview(&chat_id, Some(&preview), Some(msg.timestamp_ms))?;
         Ok(())
     }
 
     pub fn store_message(&self, msg: &StoredMessage) -> Result<()> {
-        self.insert(msg, msg.direction == "sent")
+        self.insert(msg, msg.direction == "sent", None)
     }
 
     /// Inbound path: a replay of an id already held changes nothing.
     pub fn store_inbound_message(&self, msg: &StoredMessage) -> Result<()> {
-        self.insert(msg, false)
+        self.insert(msg, false, None)
+    }
+
+    /// A message that is more than text, sent or received: `content` is its `MessageContent`.
+    pub fn store_content(&self, msg: &StoredMessage, content: &[u8]) -> Result<()> {
+        self.insert(msg, msg.direction == "sent", Some(content))
+    }
+
+    /// Our account, the author of what this device and its siblings send.
+    pub fn own_account(&self) -> &str {
+        &self.own_account
+    }
+
+    /// One message, as the screens read it.
+    pub fn message(&self, id: &str) -> Result<Option<StoredMessage>> {
+        let Some(row) = self.store.message(id)? else {
+            return Ok(None);
+        };
+        let Some(chat) = self.store.chat(&row.chat_id)? else {
+            return Ok(None);
+        };
+        let reactions = self.store.reactions(id)?;
+        Ok(Some(view_message(row, &chat.peer_id, &reactions)))
+    }
+
+    /// The author of message `id`, when it is held.
+    pub fn author_of(&self, id: &str) -> Result<Option<String>> {
+        Ok(self.store.message(id)?.map(|m| m.from_user_id))
+    }
+
+    /// `author` replaced the text of `id`. False — nothing changed — when there is no such
+    /// message, it is not theirs, or it is not text (a caption edit waits on attachments).
+    pub fn edit(&self, id: &str, author: &str, text: &str, edited_at: i64) -> Result<bool> {
+        let Some(row) = self.store.message(id)? else {
+            return Ok(false);
+        };
+        if row.from_user_id != author
+            || !matches!(
+                payload::Payload::decode(&row.body),
+                payload::Payload::Text(_)
+            )
+        {
+            return Ok(false);
+        }
+        Ok(self.store.edit_message(
+            id,
+            &payload::encode(payload::kind::TEXT, text.as_bytes()),
+            Some(text),
+            edited_at,
+        )?)
+    }
+
+    /// `reactor`'s reaction on `target`, set or taken back, if `clock` is newer than the one
+    /// held (iOS `ReactionReducer`). Returns whether anything changed.
+    pub fn react(
+        &self,
+        target: &str,
+        reactor: &str,
+        emoji: Option<&str>,
+        clock: i64,
+    ) -> Result<bool> {
+        let held = self
+            .store
+            .reactions(target)?
+            .into_iter()
+            .find(|r| r.reactor_user_id == reactor);
+        if !crate::content::reaction_wins(clock, held.as_ref().map(|r| r.timestamp_ms)) {
+            return Ok(false);
+        }
+        match emoji {
+            Some(emoji) => self.store.upsert_reaction(&Reaction {
+                target_message_id: target.to_string(),
+                reactor_user_id: reactor.to_string(),
+                emoji: emoji.to_string(),
+                timestamp_ms: clock,
+                received_at: Some(now_ms()),
+            })?,
+            None if held.is_some() => self.store.delete_reaction(target, reactor)?,
+            None => return Ok(false),
+        }
+        Ok(true)
+    }
+
+    /// Delete message `id` here, with its reactions. Other devices and the peer keep theirs.
+    pub fn delete_message(&self, id: &str) -> Result<()> {
+        Ok(self.store.delete_message(id)?)
+    }
+
+    /// Hold one frame of `sender`'s split message. Returns the whole payload once every frame is
+    /// in — and forgets the frames — else `None`. A frame decrypts once (its ratchet key is gone
+    /// after), so the frames are kept on disk, not in memory.
+    pub fn hold_chunk(
+        &self,
+        sender: &str,
+        chunk: &crate::knst::Chunk,
+        envelope_id: &str,
+    ) -> Result<Option<Vec<u8>>> {
+        let now = now_ms();
+        self.store
+            .forget_pending_chunks_before(now - CHUNK_RETENTION_MS)?;
+        self.store.add_pending_chunk(&PendingChunk {
+            sender_id: sender.to_string(),
+            message_id: chunk.id.clone(),
+            chunk_index: chunk.index.into(),
+            total_chunks: chunk.total.into(),
+            plaintext_length: chunk.plaintext_length.into(),
+            content_type: chunk.content_type,
+            payload: chunk.payload.clone(),
+            envelope_id: Some(envelope_id.to_string()),
+            received_at: now,
+        })?;
+        if self.store.pending_chunk_count(sender, &chunk.id)? < u32::from(chunk.total) {
+            return Ok(None);
+        }
+        let held = self.store.pending_chunks(sender, &chunk.id)?;
+        self.store.delete_pending_chunks(sender, &chunk.id)?;
+        Ok(assemble(&held, chunk.total))
     }
 
     /// Up to `limit` most recent messages with `peer`, oldest first.
@@ -207,26 +357,16 @@ impl LocalStore {
         let rows =
             self.store
                 .messages_before(&chat.id, None, limit.try_into().unwrap_or(u32::MAX))?;
+        let reactions = self.store.reactions_in_chat(&chat.id)?;
         let mut messages: Vec<StoredMessage> = rows
             .into_iter()
-            .map(|m| StoredMessage {
-                text: match payload::Payload::decode(&m.body) {
-                    payload::Payload::Text(text) => text.to_string(),
-                    other => String::from_utf8_lossy(match other {
-                        payload::Payload::Legacy(b) => b,
-                        _ => &[],
-                    })
-                    .into_owned(),
-                },
-                direction: if m.is_sent_by_me { "sent" } else { "received" }.into(),
-                delivery_status: if m.is_sent_by_me && m.delivery_status == delivery::DELIVERED {
-                    "delivered".into()
-                } else {
-                    String::new()
-                },
-                id: m.id,
-                peer_id: peer.to_string(),
-                timestamp_ms: m.timestamp,
+            .map(|m| {
+                let on_it: Vec<Reaction> = reactions
+                    .iter()
+                    .filter(|r| r.target_message_id == m.id)
+                    .cloned()
+                    .collect();
+                view_message(m, peer, &on_it)
             })
             .collect();
         messages.sort_by_key(|m| m.timestamp_ms);
@@ -361,6 +501,91 @@ fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
+/// A stored row as the screens read it.
+fn view_message(m: Message, peer: &str, reactions: &[Reaction]) -> StoredMessage {
+    let (text, quote, attachment) = match payload::Payload::decode(&m.body) {
+        payload::Payload::Text(text) => (text.to_string(), None, None),
+        payload::Payload::MessageContent(bytes) => match crate::content::parse(bytes) {
+            Some(crate::content::Content::Message {
+                text,
+                quote,
+                attachment,
+            }) => (text, quote, attachment),
+            _ => (String::new(), None, Some(Attachment::Other)),
+        },
+        payload::Payload::Legacy(bytes) => {
+            (String::from_utf8_lossy(bytes).into_owned(), None, None)
+        }
+        payload::Payload::MediaAlbum(_) => (String::new(), None, Some(Attachment::Photo)),
+        payload::Payload::Profile(_) => (String::new(), None, Some(Attachment::Contact)),
+    };
+    let quote = quote.or_else(|| {
+        m.reply_to_message_id.clone().map(|message_id| Quote {
+            message_id,
+            preview: m.reply_to_content.clone().unwrap_or_default(),
+        })
+    });
+    let mut reactions = reactions.to_vec();
+    reactions.sort_by_key(|r| r.timestamp_ms);
+    StoredMessage {
+        text,
+        direction: if m.is_sent_by_me { "sent" } else { "received" }.into(),
+        delivery_status: if m.is_sent_by_me && m.delivery_status == delivery::DELIVERED {
+            "delivered".into()
+        } else {
+            String::new()
+        },
+        edited: m.is_edited,
+        quote,
+        attachment,
+        reactions: reactions
+            .into_iter()
+            .map(|r| StoredReaction {
+                reactor_id: r.reactor_user_id,
+                emoji: r.emoji,
+            })
+            .collect(),
+        id: m.id,
+        peer_id: peer.to_string(),
+        timestamp_ms: m.timestamp,
+    }
+}
+
+/// The chat list's line for a message: its text, or what it carries.
+fn preview(msg: &StoredMessage) -> String {
+    match (msg.attachment, msg.text.is_empty()) {
+        (Some(_), true) => "📎".to_string(),
+        (Some(_), false) => format!("📎 {}", msg.text),
+        (None, _) => msg.text.clone(),
+    }
+}
+
+/// The frames of a split message joined in order and cut to the length they declare. `None`
+/// when one is missing or they disagree about the message.
+fn assemble(held: &[PendingChunk], total: u16) -> Option<Vec<u8>> {
+    let first = held.first()?;
+    let whole = held.len() == usize::from(total)
+        && held.iter().enumerate().all(|(i, c)| {
+            c.chunk_index as usize == i
+                && c.total_chunks == u32::from(total)
+                && c.plaintext_length == first.plaintext_length
+                && c.content_type == first.content_type
+        });
+    if !whole {
+        return None;
+    }
+    let mut payload: Vec<u8> = held
+        .iter()
+        .flat_map(|c| c.payload.iter().copied())
+        .collect();
+    let length = usize::try_from(first.plaintext_length).ok()?;
+    if length > payload.len() {
+        return None;
+    }
+    payload.truncate(length);
+    Some(payload)
+}
+
 /// Redis stream ids compare as `(ms, seq)`; anything else falls back to string order.
 pub fn cursor_after(new: &str, old: &str) -> bool {
     match (parse_stream_cursor(new), parse_stream_cursor(old)) {
@@ -385,7 +610,7 @@ mod tests {
             text: text.into(),
             direction: direction.into(),
             timestamp_ms: ts,
-            delivery_status: String::new(),
+            ..Default::default()
         }
     }
 
@@ -421,6 +646,30 @@ mod tests {
         s.store_inbound_message(&message("m1", "replay", "received", 1))
             .unwrap();
         assert_eq!(s.get_messages("alice", 10).unwrap()[0].text, "original");
+    }
+
+    #[test]
+    fn split_frames_join_in_order_and_lose_their_padding() {
+        let chunk = |index: u32, payload: &[u8]| PendingChunk {
+            sender_id: "bob".into(),
+            message_id: "m".into(),
+            chunk_index: index,
+            total_chunks: 2,
+            plaintext_length: 5,
+            content_type: 1,
+            payload: payload.to_vec(),
+            envelope_id: None,
+            received_at: 0,
+        };
+        assert_eq!(
+            assemble(&[chunk(0, b"abc"), chunk(1, b"de\0\0")], 2).as_deref(),
+            Some(&b"abcde"[..])
+        );
+        // A frame missing, or one that says it is another message's, joins nothing.
+        assert_eq!(assemble(&[chunk(0, b"abc")], 2), None);
+        let mut stray = chunk(1, b"de");
+        stray.plaintext_length = 9;
+        assert_eq!(assemble(&[chunk(0, b"abc"), stray], 2), None);
     }
 
     #[test]

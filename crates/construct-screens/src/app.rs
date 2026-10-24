@@ -336,6 +336,7 @@ impl App {
                 contact_id,
                 message_id,
                 text,
+                ..
             } => {
                 if self.open_peer.as_deref() == Some(contact_id.as_str()) {
                     self.chat_view.messages.push(ChatMessage {
@@ -360,9 +361,9 @@ impl App {
                     };
                     let secs = msg.timestamp_ms / 1000;
                     self.chat_view.messages.push(ChatMessage {
+                        text: transcript_text(&msg),
                         id: msg.id,
                         kind,
-                        text: msg.text,
                         time: format!("{:02}:{:02}", (secs / 3600) % 24, (secs / 60) % 60),
                     });
                 }
@@ -464,40 +465,43 @@ impl App {
         match evt {
             // Into the open conversation only if it is the writer's; it went into every
             // conversation that happened to be open until a linked device had several.
-            BridgeEvent::NewMessage {
-                peer_id,
-                message_id,
-                text,
-                ..
-            } => {
-                if self.open_peer.as_deref() == Some(peer_id.as_str()) {
+            BridgeEvent::NewMessage { message } => {
+                if self.open_peer.as_deref() == Some(message.peer_id.as_str()) {
                     self.chat_view.messages.push(ChatMessage {
-                        id: message_id,
+                        text: transcript_text(&message),
+                        id: message.id,
                         kind: MessageKind::Received,
-                        text,
                         time: current_time_hhmm(),
                     });
                     self.chat_view.on_new_message();
                 } else {
-                    let name = self.contact_name(&peer_id);
+                    let name = self.contact_name(&message.peer_id);
                     self.status = format!("New message from @{name}");
                 }
             }
-            BridgeEvent::OwnMessage {
-                peer_id,
-                message_id,
-                text,
-                ..
-            } => {
-                if self.open_peer.as_deref() == Some(peer_id.as_str()) {
+            BridgeEvent::OwnMessage { message } => {
+                if self.open_peer.as_deref() == Some(message.peer_id.as_str()) {
                     self.chat_view.messages.push(ChatMessage {
-                        id: message_id,
+                        text: transcript_text(&message),
+                        id: message.id,
                         kind: MessageKind::Sent,
-                        text,
                         time: current_time_hhmm(),
                     });
                     self.chat_view.on_new_message();
                 }
+            }
+            BridgeEvent::MessageChanged { message } => {
+                if let Some(shown) = self
+                    .chat_view
+                    .messages
+                    .iter_mut()
+                    .find(|m| m.id == message.id)
+                {
+                    shown.text = transcript_text(&message);
+                }
+            }
+            BridgeEvent::MessageDeleted { message_id, .. } => {
+                self.chat_view.messages.retain(|m| m.id != message_id);
             }
             BridgeEvent::MessageDelivered { message_id: _ } => {
                 // TODO: update delivery indicator
@@ -1264,4 +1268,24 @@ impl App {
             .map(|c| c.display_name.clone())
             .unwrap_or_else(|| id.to_string())
     }
+}
+
+/// A message as one line of the transcript: what it carries, its text, and the marks on it.
+fn transcript_text(m: &construct_client::local_store::StoredMessage) -> String {
+    let mut line = String::new();
+    if let Some(quote) = &m.quote {
+        line.push_str(&format!("» {} │ ", quote.preview));
+    }
+    if let Some(attachment) = m.attachment {
+        line.push_str(&format!("[{}] ", format!("{attachment:?}").to_lowercase()));
+    }
+    line.push_str(&m.text);
+    if m.edited {
+        line.push_str(" (edited)");
+    }
+    if !m.reactions.is_empty() {
+        line.push(' ');
+        line.extend(m.reactions.iter().map(|r| r.emoji.as_str()));
+    }
+    line
 }

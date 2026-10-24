@@ -2,25 +2,21 @@
 
 use tokio::sync::mpsc;
 
+use crate::local_store::StoredMessage;
+
 // ── Public event type ─────────────────────────────────────────────────────────
 
 /// Events from the bridge to the UI layer.
 #[derive(Debug, Clone)]
 pub enum BridgeEvent {
     /// A new message was decrypted and stored. UI should refresh.
-    NewMessage {
-        peer_id: String,
-        message_id: String,
-        text: String,
-        timestamp_ms: i64,
-    },
+    NewMessage { message: StoredMessage },
     /// A message we sent from another device of this account, copied here.
-    OwnMessage {
-        peer_id: String,
-        message_id: String,
-        text: String,
-        timestamp_ms: i64,
-    },
+    OwnMessage { message: StoredMessage },
+    /// A message held changed: edited by its author, or its reactions.
+    MessageChanged { message: StoredMessage },
+    /// A message was deleted on this device.
+    MessageDeleted { peer_id: String, message_id: String },
     /// A message we sent was acknowledged by the server.
     MessageDelivered { message_id: String },
     /// Stream connection status changed (connected / disconnected).

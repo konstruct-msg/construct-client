@@ -10,8 +10,10 @@
 //! field of the envelope that could say whose conversation it is, so the receiver learns it only
 //! from here (iOS `SenderSyncRouting`). READ_SYNC (30) travels the same way.
 
+#[cfg(test)]
 use prost::Message;
 
+#[cfg(test)]
 use crate::proto::messaging::v1::{MessageContent, TextMessage, message_content};
 
 const MAGIC: &[u8; 4] = b"SSR1";
@@ -21,8 +23,8 @@ const COPY_MARKER: &str = "-ss-";
 
 /// The plaintext of a copy of a text message we sent to `partner`: a whole KNST frame, byte 5 = 23,
 /// `"SSR1" ‖ partner ‖ MessageContent`. `None` when `partner` is not a UUID.
+#[cfg(test)]
 pub fn text_copy(partner: &str, message_id: &str, text: &str) -> Option<Vec<u8>> {
-    let partner = uuid::Uuid::parse_str(partner).ok()?;
     let content = MessageContent {
         content: Some(message_content::Content::Text(TextMessage {
             text: text.to_owned(),
@@ -30,10 +32,18 @@ pub fn text_copy(partner: &str, message_id: &str, text: &str) -> Option<Vec<u8>>
         })),
         ..Default::default()
     };
-    let mut body = Vec::with_capacity(HEADER_LEN + 64);
+    copy(partner, message_id, &content.encode_to_vec())
+}
+
+/// The plaintext of a copy of what we sent to `partner` — `content` is its `MessageContent`: a
+/// whole KNST frame, byte 5 = 23, `"SSR1" ‖ partner ‖ content`. `None` when `partner` is not a
+/// UUID.
+pub fn copy(partner: &str, message_id: &str, content: &[u8]) -> Option<Vec<u8>> {
+    let partner = uuid::Uuid::parse_str(partner).ok()?;
+    let mut body = Vec::with_capacity(HEADER_LEN + content.len());
     body.extend_from_slice(MAGIC);
     body.extend_from_slice(partner.as_bytes());
-    body.extend_from_slice(&content.encode_to_vec());
+    body.extend_from_slice(content);
     Some(crate::knst::frame_whole(
         &body,
         crate::knst::CONTENT_SENDER_SYNC,
@@ -44,8 +54,13 @@ pub fn text_copy(partner: &str, message_id: &str, text: &str) -> Option<Vec<u8>>
 /// What a decrypted copy turned out to be.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Copy {
-    /// A text message we sent to `partner` from another device.
-    Text { partner: String, text: String },
+    /// Something we sent to `partner` from another device: a message, or a reaction or edit of
+    /// one. `payload` is its `MessageContent`.
+    Content {
+        partner: String,
+        content: crate::content::Content,
+        payload: Vec<u8>,
+    },
     /// Read markers from another device (READ_SYNC); this client does not apply them yet.
     ReadMarkers,
     /// Split into chunks, or a kind of content this client does not show.
@@ -74,15 +89,14 @@ pub fn read(plaintext: &[u8]) -> Copy {
     let partner = uuid::Uuid::from_slice(&body[4..HEADER_LEN])
         .expect("16 bytes")
         .to_string();
-    match MessageContent::decode(&body[HEADER_LEN..]) {
-        Ok(MessageContent {
-            content: Some(message_content::Content::Text(text)),
-            ..
-        }) => Copy::Text {
+    let payload = &body[HEADER_LEN..];
+    match crate::content::parse(payload) {
+        Some(content) => Copy::Content {
             partner,
-            text: text.text,
+            content,
+            payload: payload.to_vec(),
         },
-        _ => Copy::Unsupported("not a text message"),
+        None => Copy::Unsupported("not a message this client reads"),
     }
 }
 
@@ -112,13 +126,14 @@ mod tests {
         let frame = construct_core::knst::Frame::parse(&plaintext).unwrap();
         assert_eq!(frame.content_type, 23);
         assert_eq!(&frame.payload[..4], b"SSR1");
-        assert_eq!(
+        assert!(matches!(
             read(&plaintext),
-            Copy::Text {
-                partner: PARTNER.into(),
-                text: "sent from the phone".into()
-            }
-        );
+            Copy::Content {
+                partner,
+                content: crate::content::Content::Message { text, .. },
+                ..
+            } if partner == PARTNER && text == "sent from the phone"
+        ));
     }
 
     #[test]

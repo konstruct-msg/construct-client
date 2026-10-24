@@ -96,6 +96,20 @@ impl OrchestratorHandle {
         });
     }
 
+    /// Send `content` to `peer` (see [`OrchestratorCommand::Send`]).
+    pub(crate) fn send_content(
+        &self,
+        peer: String,
+        message_id: String,
+        content: crate::content::Content,
+    ) {
+        let _ = self.cmd_tx.send(OrchestratorCommand::Send {
+            peer,
+            message_id,
+            content,
+        });
+    }
+
     /// Delegations of the server's hybrid keys, as `GetServerTrust` served them.
     pub(crate) fn server_delegations(&self, delegations: Vec<Vec<u8>>) {
         let _ = self
@@ -138,6 +152,13 @@ enum OrchestratorCommand {
     },
     ServerDelegations {
         delegations: Vec<Vec<u8>>,
+    },
+    /// Send `content` to `peer` under `message_id`: kept here as ours, copied to our other
+    /// devices, then sent to each of the peer's.
+    Send {
+        peer: String,
+        message_id: String,
+        content: crate::content::Content,
     },
     /// Vouch for a device being linked to this account once the directory serves its keys.
     Vouch {
@@ -436,6 +457,11 @@ impl Task {
                     "server key delegations handed to the core"
                 );
             }
+            OrchestratorCommand::Send {
+                peer,
+                message_id,
+                content,
+            } => self.send_content(peer, message_id, content).await,
             OrchestratorCommand::Vouch {
                 device_id,
                 evidence,
@@ -779,7 +805,13 @@ impl Task {
             // Text from the screens: kept in the transcript, copied to our other devices.
             let text = String::from_utf8_lossy(&plaintext).into_owned();
             self.keep_sent(&contact_id, &message_id, &text);
-            self.send_own_copies(&contact_id, &message_id, &text).await;
+            let content = crate::content::encode(&crate::content::Content::Message {
+                text: text.clone(),
+                quote: None,
+                attachment: None,
+            });
+            self.send_own_copies(&contact_id, &message_id, &content)
+                .await;
             crate::knst::encode_text(&text, &message_id)
         };
         devices
@@ -1113,6 +1145,7 @@ impl Task {
                 direction: "sent".into(),
                 timestamp_ms: now_ms(),
                 delivery_status: String::new(),
+                ..Default::default()
             })
         {
             tracing::warn!(%message_id, error = %e, "sent message not kept");
@@ -1133,12 +1166,59 @@ impl Task {
     }
 
     /// A copy of a text we sent to `partner`, for each of our other devices (SENDER_SYNC).
-    async fn send_own_copies(&mut self, partner: &str, message_id: &str, text: &str) {
+    /// Send what the screens wrote. It is placed here first, as a copy from another of our
+    /// devices would be — an edit only of our own message, a reaction by its clock — and not
+    /// sent when that changes nothing (an edit of a message that is not ours).
+    async fn send_content(
+        &mut self,
+        peer: String,
+        message_id: String,
+        content: crate::content::Content,
+    ) {
+        let payload = crate::content::encode(&content);
+        let is_message = matches!(content, crate::content::Content::Message { .. });
+        let placed = place_inbound(
+            &self.storage,
+            Sender::OwnDevice { partner: &peer },
+            &message_id,
+            content,
+            &payload,
+            now_ms(),
+        );
+        match placed {
+            // The screens learned of a message from `MessageQueued`.
+            Ok(Some(event)) if !is_message => {
+                let _ = self
+                    .internal_tx
+                    .send(crate::client::ClientEvent::Bridge(event));
+            }
+            Ok(None) if !is_message => {
+                return tracing::info!(%message_id, "changes nothing here — not sent");
+            }
+            Ok(_) => {}
+            Err(()) => return self.ui_error(format!("[NOT_KEPT] {message_id}")),
+        }
+        self.send_own_copies(&peer, &message_id, &payload).await;
+        let framed =
+            crate::knst::frame_whole(&payload, crate::knst::CONTENT_E2EE_SIGNAL, &message_id);
+        let event = IncomingEvent::OutgoingMessage {
+            contact_id: peer,
+            message_id,
+            plaintext: framed,
+            content_type: 0,
+        };
+        for event in self.prepare_outgoing(event).await {
+            self.process(event).await;
+        }
+    }
+
+    /// Copies of what we sent to `partner` (`content`, its `MessageContent`) for our other devices.
+    async fn send_own_copies(&mut self, partner: &str, message_id: &str, content: &[u8]) {
         let siblings = self.own_siblings().await;
         if siblings.is_empty() {
             return;
         }
-        let Some(plaintext) = crate::own_copy::text_copy(partner, message_id, text) else {
+        let Some(plaintext) = crate::own_copy::copy(partner, message_id, content) else {
             return;
         };
         let certificate = match self.certificate().await {
@@ -1250,31 +1330,24 @@ impl Task {
         };
         self.persist_session(&sibling);
         match crate::own_copy::read(&plaintext) {
-            crate::own_copy::Copy::Text { partner, text } => {
-                let timestamp_ms = now_ms();
-                if let Err(e) = self
-                    .storage
-                    .store_message(&crate::local_store::StoredMessage {
-                        id: base_id.to_string(),
-                        peer_id: partner.clone(),
-                        text: text.clone(),
-                        direction: "sent".into(),
-                        timestamp_ms,
-                        delivery_status: String::new(),
-                    })
-                {
-                    tracing::warn!(%message_id, error = %e, "copied message not kept");
+            crate::own_copy::Copy::Content {
+                partner,
+                content,
+                payload,
+            } => {
+                let from = Sender::OwnDevice { partner: &partner };
+                match place_inbound(&self.storage, from, base_id, content, &payload, now_ms()) {
+                    Ok(event) => {
+                        tracing::info!(%message_id, %partner, "copy from another device placed");
+                        if let Some(event) = event {
+                            let _ = self
+                                .internal_tx
+                                .send(crate::client::ClientEvent::Bridge(event));
+                        }
+                    }
+                    Err(()) => tracing::warn!(%message_id, "copied message not kept"),
                 }
                 self.adopt_writer(&partner);
-                tracing::info!(%message_id, %partner, "copy of our message placed");
-                let _ = self.internal_tx.send(crate::client::ClientEvent::Bridge(
-                    BridgeEvent::OwnMessage {
-                        peer_id: partner,
-                        message_id: base_id.to_string(),
-                        text,
-                        timestamp_ms,
-                    },
-                ));
             }
             crate::own_copy::Copy::ReadMarkers => {
                 tracing::debug!(%message_id, "read markers from another device — not applied yet");
@@ -1356,39 +1429,52 @@ impl Task {
             } => {
                 let account = self.account_of(&contact_id);
                 self.adopt_writer(&account);
-                let text = crate::knst::decode_text(&plaintext);
                 tracing::info!(
                     device = %contact_id,
                     %account,
                     message_id = %message_id,
                     plaintext_len = plaintext.len(),
-                    "MessageDecrypted: storing and notifying UI"
+                    "MessageDecrypted"
                 );
-                let now_ms = now_ms();
-                persist_inbound(
-                    &self.storage,
-                    &self.cursor,
-                    &message_id,
-                    crate::local_store::StoredMessage {
-                        id: message_id.clone(),
-                        peer_id: account.clone(),
-                        text: text.clone(),
-                        direction: "received".into(),
-                        timestamp_ms: now_ms,
-                        delivery_status: String::new(),
-                    },
-                );
+                let inbound = match crate::knst::decode(&plaintext) {
+                    crate::knst::Inbound::Chunk(chunk) => {
+                        match self.storage.hold_chunk(&account, &chunk, &message_id) {
+                            Ok(Some(whole)) => crate::knst::decode_assembled(chunk.id, &whole),
+                            Ok(None) => {
+                                self.cursor.commit(&self.storage, &message_id);
+                                crate::knst::Inbound::Silent
+                            }
+                            Err(e) => {
+                                tracing::warn!(%message_id, error = %e, "chunk not held");
+                                crate::knst::Inbound::Silent
+                            }
+                        }
+                    }
+                    other => other,
+                };
                 if let Some(receipt) = self.delivery_receipt(&contact_id, &message_id) {
                     follow_ups.push(receipt);
                 }
-                let _ = self.internal_tx.send(crate::client::ClientEvent::Bridge(
-                    BridgeEvent::NewMessage {
-                        peer_id: account,
-                        message_id,
-                        text,
-                        timestamp_ms: now_ms,
-                    },
-                ));
+                if let crate::knst::Inbound::Content {
+                    id,
+                    content,
+                    payload,
+                } = inbound
+                {
+                    let id = id.unwrap_or_else(|| message_id.clone());
+                    // Not kept: the cursor stays, so the server delivers it again.
+                    let from = Sender::Peer(&account);
+                    if let Ok(event) =
+                        place_inbound(&self.storage, from, &id, content, &payload, now_ms())
+                    {
+                        self.cursor.commit(&self.storage, &message_id);
+                        if let Some(event) = event {
+                            let _ = self
+                                .internal_tx
+                                .send(crate::client::ClientEvent::Bridge(event));
+                        }
+                    }
+                }
             }
 
             Action::CallSignalDecrypted { .. } => {
@@ -1586,15 +1672,110 @@ fn direct_envelope_message_id(envelope: &Envelope) -> &str {
     }
 }
 
-fn persist_inbound(
+/// Apply what `account` sent under message id `id`: a message goes into the transcript, an edit
+/// or a reaction changes the message it names. Returns what the screens are told, if anything;
+/// `Err` when it could not be kept.
+///
+/// An edit counts only from the author of its target (iOS `MessageRouter`); a reaction is the
+/// reactor's newest by its own clock, and may come before the message it is on. A delete is
+/// read and not applied — no client sends one (decision in TODO 218, 2026-10-24).
+fn place_inbound(
     storage: &LocalStore,
-    cursor: &CursorTracker,
-    message_id: &str,
-    msg: crate::local_store::StoredMessage,
-) {
-    if storage.store_inbound_message(&msg).is_ok() {
-        cursor.commit(storage, message_id);
+    from: Sender<'_>,
+    id: &str,
+    content: crate::content::Content,
+    payload: &[u8],
+    now_ms: i64,
+) -> Result<Option<BridgeEvent>, ()> {
+    use crate::content::Content;
+    let (chat, author) = match from {
+        Sender::Peer(account) => (account, account),
+        Sender::OwnDevice { partner } => (partner, storage.own_account()),
+    };
+    let author = author.to_string();
+    match content {
+        Content::Message {
+            text,
+            quote,
+            attachment,
+        } => {
+            let own = matches!(from, Sender::OwnDevice { .. });
+            let message = crate::local_store::StoredMessage {
+                id: id.to_string(),
+                peer_id: chat.to_string(),
+                text,
+                direction: if own { "sent" } else { "received" }.into(),
+                timestamp_ms: now_ms,
+                quote,
+                attachment,
+                ..Default::default()
+            };
+            let stored = if attachment.is_some() && !payload.is_empty() {
+                storage.store_content(&message, payload)
+            } else {
+                storage.store_message(&message)
+            };
+            if let Err(e) = stored {
+                tracing::warn!(%id, error = %e, "message not kept");
+                return Err(());
+            }
+            Ok(Some(if own {
+                BridgeEvent::OwnMessage { message }
+            } else {
+                BridgeEvent::NewMessage { message }
+            }))
+        }
+        Content::Edit { target, text } => match storage.edit(&target, &author, &text, now_ms) {
+            Ok(true) => Ok(changed(storage, &target)),
+            Ok(false) => {
+                tracing::info!(%target, "edit of a message not held or not theirs — dropped");
+                Ok(None)
+            }
+            Err(e) => {
+                tracing::warn!(%target, error = %e, "edit not applied");
+                Err(())
+            }
+        },
+        Content::Reaction {
+            target,
+            emoji,
+            timestamp_ms,
+        } => {
+            let clock = if timestamp_ms > 0 {
+                timestamp_ms
+            } else {
+                now_ms
+            };
+            match storage.react(&target, &author, emoji.as_deref(), clock) {
+                Ok(true) => Ok(changed(storage, &target)),
+                Ok(false) => Ok(None),
+                Err(e) => {
+                    tracing::warn!(%target, error = %e, "reaction not applied");
+                    Err(())
+                }
+            }
+        }
+        Content::Delete => {
+            tracing::info!(%id, "delete from the peer — not applied");
+            Ok(None)
+        }
     }
+}
+
+/// Who sent what is being placed.
+#[derive(Clone, Copy)]
+enum Sender<'a> {
+    /// The account on the other side of the chat.
+    Peer(&'a str),
+    /// Another device of ours, in the chat with `partner`.
+    OwnDevice { partner: &'a str },
+}
+
+/// The message `id` as it now is, for the screens; nothing when it is not held (a reaction that
+/// came first).
+fn changed(storage: &LocalStore, id: &str) -> Option<BridgeEvent> {
+    let message = storage.message(id).ok()??;
+    Some(BridgeEvent::MessageChanged { message })
 }
 
 fn should_drop_stale_session_replay(
@@ -1635,6 +1816,169 @@ fn now_ms_u64() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── What a payload does once decrypted ─────────────────────────────────────
+
+    fn text_from(storage: &LocalStore, peer: &str, id: &str, text: &str) {
+        let content = crate::content::Content::Message {
+            text: text.into(),
+            quote: None,
+            attachment: None,
+        };
+        place_inbound(storage, Sender::Peer(peer), id, content, &[], 1).unwrap();
+    }
+
+    #[test]
+    fn a_message_from_ios_is_kept_under_the_id_its_header_carries() {
+        let storage = LocalStore::open_in_memory().unwrap();
+        let id = "6ae5e1ff-cd35-484d-a9ca-f2dc3fdb78ac";
+        let framed = crate::knst::encode_text("hi", id);
+        let crate::knst::Inbound::Content {
+            id: Some(header_id),
+            content,
+            payload,
+        } = crate::knst::decode(&framed)
+        else {
+            panic!("a text frame is content");
+        };
+        place_inbound(
+            &storage,
+            Sender::Peer("bob"),
+            &header_id,
+            content,
+            &payload,
+            1,
+        )
+        .unwrap();
+        assert!(storage.message(id).unwrap().is_some());
+    }
+
+    #[test]
+    fn only_the_author_edits_a_message() {
+        let storage = LocalStore::open_in_memory().unwrap();
+        text_from(&storage, "bob", "m1", "helo");
+        let edit = |text: &str| crate::content::Content::Edit {
+            target: "m1".into(),
+            text: text.into(),
+        };
+
+        // Someone else's edit, and ours of bob's message, change nothing.
+        assert!(
+            place_inbound(&storage, Sender::Peer("carol"), "e1", edit("x"), &[], 2)
+                .unwrap()
+                .is_none()
+        );
+        let own = Sender::OwnDevice { partner: "bob" };
+        assert!(
+            place_inbound(&storage, own, "e2", edit("y"), &[], 2)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(storage.message("m1").unwrap().unwrap().text, "helo");
+
+        let Some(BridgeEvent::MessageChanged { message }) =
+            place_inbound(&storage, Sender::Peer("bob"), "e3", edit("hello"), &[], 3).unwrap()
+        else {
+            panic!("the author's edit changes the message");
+        };
+        assert_eq!((message.text.as_str(), message.edited), ("hello", true));
+    }
+
+    #[test]
+    fn a_reaction_is_the_newest_by_the_reactors_clock() {
+        let storage = LocalStore::open_in_memory().unwrap();
+        text_from(&storage, "bob", "m1", "hi");
+        let react = |emoji: Option<&str>, timestamp_ms| crate::content::Content::Reaction {
+            target: "m1".into(),
+            emoji: emoji.map(Into::into),
+            timestamp_ms,
+        };
+        let emojis = || -> Vec<String> {
+            let m = storage.message("m1").unwrap().unwrap();
+            m.reactions.into_iter().map(|r| r.emoji).collect()
+        };
+
+        place_inbound(
+            &storage,
+            Sender::Peer("bob"),
+            "r1",
+            react(Some("👍"), 10),
+            &[],
+            0,
+        )
+        .unwrap();
+        // Older, and a tie, are ignored; a redelivery changes nothing.
+        place_inbound(
+            &storage,
+            Sender::Peer("bob"),
+            "r2",
+            react(Some("😂"), 5),
+            &[],
+            0,
+        )
+        .unwrap();
+        place_inbound(&storage, Sender::Peer("bob"), "r3", react(None, 10), &[], 0).unwrap();
+        assert_eq!(emojis(), ["👍"]);
+
+        // Our own, copied from another device, is ours — beside bob's.
+        let own = Sender::OwnDevice { partner: "bob" };
+        place_inbound(&storage, own, "r4", react(Some("❤️"), 11), &[], 0).unwrap();
+        assert_eq!(emojis(), ["👍", "❤️"]);
+
+        place_inbound(&storage, Sender::Peer("bob"), "r5", react(None, 12), &[], 0).unwrap();
+        assert_eq!(emojis(), ["❤️"]);
+    }
+
+    #[test]
+    fn a_split_message_is_placed_once_every_frame_is_in() {
+        let storage = LocalStore::open_in_memory().unwrap();
+        let id = "6ae5e1ff-cd35-484d-a9ca-f2dc3fdb78ac";
+        let long = "x".repeat(9000);
+        let payload = {
+            use prost::Message;
+            crate::proto::messaging::v1::MessageContent {
+                content: Some(crate::proto::messaging::v1::message_content::Content::Text(
+                    crate::proto::messaging::v1::TextMessage {
+                        text: long.clone(),
+                        ..Default::default()
+                    },
+                )),
+                ..Default::default()
+            }
+            .encode_to_vec()
+        };
+        let frames = construct_core::knst::encode_chunks(
+            &payload,
+            crate::knst::CONTENT_E2EE_SIGNAL,
+            &construct_core::knst::message_id_bytes(id).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            frames.len() > 2,
+            "the test needs a message in several frames"
+        );
+
+        // Out of order and with a redelivered frame, as the stream may hand them over.
+        let mut order: Vec<usize> = (0..frames.len()).rev().collect();
+        order.insert(1, frames.len() - 1);
+        let mut whole = None;
+        for (n, i) in order.iter().enumerate() {
+            let crate::knst::Inbound::Chunk(chunk) = crate::knst::decode(&frames[*i]) else {
+                panic!("frame {i} is a chunk");
+            };
+            let held = storage
+                .hold_chunk("bob", &chunk, &format!("env-{n}"))
+                .unwrap();
+            assert_eq!(held.is_some(), n == order.len() - 1, "after frame {n}");
+            whole = held;
+        }
+        let crate::knst::Inbound::Content { content, .. } =
+            crate::knst::decode_assembled(id.into(), &whole.unwrap())
+        else {
+            panic!("the joined frames are content");
+        };
+        assert!(matches!(content, crate::content::Content::Message { text, .. } if text == long));
+    }
     use construct_core::crypto::{
         client_api::ClassicClient, suites::classic::ClassicSuiteProvider,
     };
@@ -1803,6 +2147,7 @@ mod tests {
                 direction: "sent".into(),
                 timestamp_ms: 1,
                 delivery_status: String::new(),
+                ..Default::default()
             })
             .unwrap();
         task.storage
