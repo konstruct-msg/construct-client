@@ -69,6 +69,8 @@ pub struct StoredContact {
     pub avatar: Option<Vec<u8>>,
     /// We share our profile with them.
     pub sharing: bool,
+    /// The name we gave them ourselves; it never leaves this device.
+    pub alias: Option<String>,
 }
 
 /// Our profile as we share it.
@@ -243,6 +245,12 @@ impl LocalStore {
     /// The people we share our profile with.
     pub fn sharing_with(&self) -> Result<Vec<String>> {
         Ok(self.store.sharing_with(Some(&self.own_account))?)
+    }
+
+    /// Our own name for `id`, kept here only; `None` or blank removes it.
+    pub fn set_alias(&self, id: &str, alias: Option<&str>) -> Result<bool> {
+        let alias = alias.map(str::trim).filter(|a| !a.is_empty());
+        Ok(self.store.set_contact_alias(id, alias)?)
     }
 
     pub fn set_sharing_with(&self, id: &str, sharing: bool) -> Result<bool> {
@@ -693,7 +701,13 @@ fn view_contact(c: Contact) -> StoredContact {
             .unwrap_or_default(),
         // As iOS names a person: the name they shared, their username, or the one generated
         // from their id — never a blank or a raw id.
-        display_name: crate::names::resolved(&c.display_name, &c.username, &c.id),
+        display_name: crate::names::resolved(
+            c.local_alias.as_deref(),
+            &c.display_name,
+            &c.username,
+            &c.id,
+        ),
+        alias: c.local_alias,
         avatar: c.avatar,
         sharing: c.am_i_sharing_with,
         user_id: c.id,

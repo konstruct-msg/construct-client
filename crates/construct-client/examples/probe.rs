@@ -22,7 +22,8 @@
 //!
 //! `--settings`: once started, print the account's settings (username, devices, receipts).
 //! `--set-username <name>`: change the username first; `--discoverable on|off` likewise;
-//! `--revoke <device id|others>` signs out a device of the account, or all but this one.
+//! `--revoke <device id|others>` signs out a device of the account, or all but this one;
+//! `--rename-device <name>` names this device for the account's others.
 //!
 //! `--profile <name>` [`--avatar <jpeg>`]: set our shared name and picture; `--share-with <id>`:
 //! share our profile with that contact. A profile shared with us prints `CONTACT`.
@@ -59,6 +60,7 @@ struct Args {
     set_username: Option<String>,
     discoverable: Option<bool>,
     revoke: Option<String>,
+    rename_device: Option<String>,
     profile: Option<String>,
     avatar: Option<String>,
     share_with: Option<String>,
@@ -81,6 +83,7 @@ fn parse_args() -> Args {
         set_username: None,
         discoverable: None,
         revoke: None,
+        rename_device: None,
         profile: None,
         avatar: None,
         share_with: None,
@@ -104,6 +107,7 @@ fn parse_args() -> Args {
             "--set-username" => args.set_username = Some(value()),
             "--discoverable" => args.discoverable = Some(value() == "on"),
             "--revoke" => args.revoke = Some(value()),
+            "--rename-device" => args.rename_device = Some(value()),
             "--profile" => args.profile = Some(value()),
             "--avatar" => args.avatar = Some(value()),
             "--share-with" => args.share_with = Some(value()),
@@ -191,6 +195,9 @@ async fn main() {
                         contact_id,
                         on: true,
                     });
+                }
+                if let Some(name) = args.rename_device.take() {
+                    client.send(ClientCommand::RenameDevice(name));
                 }
                 if let Some(target) = args.revoke.take() {
                     client.send(ClientCommand::RevokeDevices(
@@ -342,10 +349,20 @@ async fn main() {
             }
             ClientEvent::RegistrationStep(step) => println!("STEP {step:?}"),
             ClientEvent::Notice(n) => println!("NOTICE {n}"),
-            ClientEvent::Settings(s) => println!(
-                "SETTINGS username={:?} receipts={} discoverable={:?} devices={:?}",
-                s.username, s.delivery_receipts, s.discoverable, s.devices
-            ),
+            ClientEvent::Settings(s) => {
+                println!(
+                    "SETTINGS username={:?} receipts={} discoverable={:?} this_device={:?}",
+                    s.username, s.delivery_receipts, s.discoverable, s.device_name
+                );
+                for d in &s.devices {
+                    println!(
+                        "  DEVICE {} current={} described={:?}",
+                        &d.device.device_id[..8],
+                        d.device.is_current,
+                        d.description.as_ref().map(|x| (&x.name, x.platform))
+                    );
+                }
+            }
             ClientEvent::Recovery(state) => {
                 println!("RECOVERY {state:?}");
                 use construct_client::recovery::RecoveryState;

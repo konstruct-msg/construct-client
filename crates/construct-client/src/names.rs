@@ -27,9 +27,13 @@ pub fn is_generated(name: &str, user_id: &str) -> bool {
     name.trim().eq_ignore_ascii_case(&generated(user_id))
 }
 
-/// The name a person is shown by, as iOS resolves it (`ContactName.resolved`): the name they
-/// shared unless it is only their generated one, then their username, then the generated name.
-pub fn resolved(display_name: &str, username: &str, user_id: &str) -> String {
+/// The name a person is shown by, as iOS resolves it (`ContactName.resolved`): the name we gave
+/// them ourselves, then the name they shared unless it is only their generated one, then their
+/// username, then the generated name.
+pub fn resolved(alias: Option<&str>, display_name: &str, username: &str, user_id: &str) -> String {
+    if let Some(alias) = alias.map(str::trim).filter(|a| !a.is_empty()) {
+        return alias.to_owned();
+    }
     let display_name = display_name.trim();
     if !display_name.is_empty() && !is_generated(display_name, user_id) {
         return display_name.to_owned();
@@ -333,12 +337,22 @@ mod tests {
     #[test]
     fn a_generated_name_stands_for_no_name() {
         let id = "550e8400-e29b-41d4-a716-446655440000";
-        assert_eq!(resolved("Анна", "anna_k", id), "Анна");
+        assert_eq!(resolved(None, "Анна", "anna_k", id), "Анна");
         assert_eq!(
-            resolved("Cool Cobra", "anna_k", id),
+            resolved(None, "Cool Cobra", "anna_k", id),
             "anna_k",
             "Android's case"
         );
-        assert_eq!(resolved("", "", id), "cool cobra");
+        assert_eq!(resolved(None, "", "", id), "cool cobra");
+        assert_eq!(
+            resolved(Some(" Аня "), "Анна", "anna_k", id),
+            "Аня",
+            "ours wins"
+        );
+        assert_eq!(
+            resolved(Some("  "), "Анна", "anna_k", id),
+            "Анна",
+            "a blank one is none"
+        );
     }
 }

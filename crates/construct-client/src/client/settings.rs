@@ -6,11 +6,20 @@ use super::{Client, ClientEvent};
 use crate::grpc::GrpcError;
 
 /// The account as the settings screen shows it.
+/// A device of the account and what it says about itself, if a copy was sealed to us.
+#[derive(Debug, Clone)]
+pub struct DeviceEntry {
+    pub device: crate::grpc::Device,
+    pub description: Option<crate::device_meta::Description>,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct AccountSettings {
     /// `None` when the account has none, or the server was not reached.
     pub username: Option<String>,
-    pub devices: Vec<crate::grpc::Device>,
+    pub devices: Vec<DeviceEntry>,
+    /// What this device calls itself to the others.
+    pub device_name: String,
     pub delivery_receipts: bool,
     /// As last set on this device; `None` when never set here.
     pub discoverable: Option<bool>,
@@ -41,6 +50,7 @@ impl Client {
         let grpc = self.grpc.clone();
         let user_id = self.user_id.clone();
         let events = self.events.clone();
+        let secret = self.identity_secret.clone();
         tokio::spawn(async move {
             let own = store.own_profile().unwrap_or_default();
             let (username, devices) = tokio::join!(
@@ -51,9 +61,19 @@ impl Client {
                 notice(&events, format!("Devices not loaded: {e}"));
                 Vec::new()
             });
+            let devices = devices
+                .into_iter()
+                .map(|device| DeviceEntry {
+                    description: secret
+                        .as_ref()
+                        .and_then(|s| crate::device_meta::open(&device.sealed_metadata, s)),
+                    device,
+                })
+                .collect();
             let _ = events.send(ClientEvent::Settings(AccountSettings {
                 username: username.ok().flatten().or_else(|| store.own_username()),
                 devices,
+                device_name: device_name(&store),
                 delivery_receipts: store.sends_delivery_receipts(),
                 discoverable: store.discoverable(),
                 display_name: own.display_name,
@@ -128,6 +148,87 @@ impl Client {
         self.load_settings();
     }
 
+    /// Our own name for a contact: shown instead of any other, never sent.
+    pub(super) fn set_alias(&self, contact_id: String, alias: Option<String>) {
+        let Some(store) = self.store.as_ref() else {
+            return;
+        };
+        let alias = alias.map(|a| crate::profile::clean_display_name(&a));
+        if let Err(e) = store.set_alias(&contact_id, alias.as_deref()) {
+            return self.emit(ClientEvent::Notice(format!("Not changed: {e}")));
+        }
+        if let Ok(Some(contact)) = store.get_contact_by_id(&contact_id) {
+            self.emit(ClientEvent::Bridge(
+                crate::bridge::BridgeEvent::ContactUpdated { contact },
+            ));
+        }
+    }
+
+    pub(super) fn rename_device(&self, name: String) {
+        let Some(store) = self.store.as_ref() else {
+            return;
+        };
+        let name = crate::device_meta::clean_name(&name);
+        if let Err(e) = store.secure_save(PREF_DEVICE_NAME, name.as_bytes()) {
+            return self.emit(ClientEvent::Notice(format!("Not changed: {e}")));
+        }
+        self.publish_device_description(true);
+    }
+
+    /// Seal this device's description to every device of the account and give it to the server,
+    /// when the set moved since the last time (or `force`, after a rename). An unknown set, or a
+    /// refusal, leaves the blob published before standing; the next start tries again.
+    pub(super) fn publish_device_description(&self, force: bool) {
+        let Some(store) = self.store.clone() else {
+            return;
+        };
+        let grpc = self.grpc.clone();
+        let user_id = self.user_id.clone();
+        let reload = self.inbox.clone();
+        tokio::spawn(async move {
+            let bundles =
+                match crate::grpc::get_pre_key_bundles(&grpc, &user_id, Vec::new(), false).await {
+                    Ok(b) => b.bundles,
+                    Err(e) => return tracing::info!("own devices not listed, not published: {e}"),
+                };
+            let mut ids: Vec<String> = bundles.iter().map(|b| b.device_id.clone()).collect();
+            ids.sort();
+            let last: Vec<String> = store
+                .secure_load(PREF_DEVICE_PUBLISHED_FOR)
+                .ok()
+                .flatten()
+                .map(|v| {
+                    String::from_utf8_lossy(&v)
+                        .split('\n')
+                        .map(str::to_owned)
+                        .collect()
+                })
+                .unwrap_or_default();
+            if !force && !crate::device_meta::needs_publish(&ids, &last) {
+                return;
+            }
+            let keys: Vec<Vec<u8>> = bundles
+                .iter()
+                .map(|b| b.bundle.x3dh.identity_public.clone())
+                .collect();
+            let Some(blob) = crate::device_meta::seal(&device_name(&store), &keys) else {
+                return tracing::warn!("device description not sealed, not published");
+            };
+            match crate::grpc::set_device_metadata(&grpc, &blob).await {
+                Ok(()) => {
+                    // Kept only once the server took it, so a failure is retried.
+                    let _ = store.secure_save(PREF_DEVICE_PUBLISHED_FOR, ids.join("\n").as_bytes());
+                    tracing::info!(devices = ids.len(), "device description published");
+                    if force {
+                        let _ =
+                            reload.send(super::Inbox::Command(super::ClientCommand::LoadSettings));
+                    }
+                }
+                Err(e) => tracing::warn!("device description not published: {e}"),
+            }
+        });
+    }
+
     /// Sign out other devices of this account: `device_id`, or every one but this.
     pub(super) fn revoke_devices(&self, device_id: Option<String>) {
         let grpc = self.grpc.clone();
@@ -154,6 +255,20 @@ impl Client {
             let _ = reload.send(super::Inbox::Command(super::ClientCommand::LoadSettings));
         });
     }
+}
+
+const PREF_DEVICE_NAME: &str = "pref.device_name";
+const PREF_DEVICE_PUBLISHED_FOR: &str = "device_meta.published_for";
+
+/// The name this device goes by: the person's, or the platform's.
+fn device_name(store: &crate::local_store::LocalStore) -> String {
+    store
+        .secure_load(PREF_DEVICE_NAME)
+        .ok()
+        .flatten()
+        .and_then(|v| String::from_utf8(v).ok())
+        .filter(|n| !n.is_empty())
+        .unwrap_or_else(|| crate::device_meta::default_name().to_owned())
 }
 
 fn revoke_failure(id: &str, e: &GrpcError) -> String {

@@ -42,3 +42,4 @@ pub const USER_UPDATE_PROFILE: &str = "/shared.proto.services.v1.UserService/Upd
 pub const USER_CHECK_USERNAME: &str =
     "/shared.proto.services.v1.UserService/CheckUsernameAvailability";
 pub const USER_SET_DISCOVERABLE: &str = "/shared.proto.services.v1.UserService/SetDiscoverable";
+pub const DEVICE_SET_METADATA: &str = "/shared.proto.services.v1.DeviceService/SetDeviceMetadata";
