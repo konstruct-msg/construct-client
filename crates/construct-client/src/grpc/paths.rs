@@ -9,6 +9,7 @@ pub const AUTH_REFRESH: &str = "/shared.proto.services.v1.AuthService/RefreshTok
 pub const AUTH_SET_RECOVERY_KEY: &str = "/shared.proto.services.v1.AuthService/SetRecoveryKey";
 pub const AUTH_RECOVERY_STATUS: &str = "/shared.proto.services.v1.AuthService/GetRecoveryStatus";
 pub const AUTH_LOGOUT: &str = "/shared.proto.services.v1.AuthService/Logout";
+pub const USER_DELETE_ACCOUNT: &str = "/shared.proto.services.v1.UserService/DeleteAccount";
 pub const DEVICE_PUBLISH_CERTIFICATE: &str =
     "/shared.proto.services.v1.DeviceService/PublishDeviceCertificate";
 pub const DEVICE_CONFIRM_LINK: &str =

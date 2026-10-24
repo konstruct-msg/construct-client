@@ -25,6 +25,9 @@
 //! `--revoke <device id|others>` signs out a device of the account, or all but this one;
 //! `--rename-device <name>` names this device for the account's others.
 //!
+//! `--goodbye logout|everywhere|delete|local`: once started, sign out here, sign out every device,
+//! delete the account, or wipe only this device; prints `LOGGED_OUT` (or `DELETE_FAILED`) and stops.
+//!
 //! `--profile <name>` [`--avatar <jpeg>`]: set our shared name and picture; `--share-with <id>`:
 //! share our profile with that contact. A profile shared with us prints `CONTACT`.
 //!
@@ -64,6 +67,7 @@ struct Args {
     profile: Option<String>,
     avatar: Option<String>,
     share_with: Option<String>,
+    goodbye: Option<String>,
     wait_secs: u64,
 }
 
@@ -87,6 +91,7 @@ fn parse_args() -> Args {
         profile: None,
         avatar: None,
         share_with: None,
+        goodbye: None,
         wait_secs: 30,
     };
     let mut it = std::env::args().skip(1);
@@ -111,6 +116,7 @@ fn parse_args() -> Args {
             "--profile" => args.profile = Some(value()),
             "--avatar" => args.avatar = Some(value()),
             "--share-with" => args.share_with = Some(value()),
+            "--goodbye" => args.goodbye = Some(value()),
             "--wait" => args.wait_secs = value().parse().expect("--wait takes seconds"),
             other => panic!("unknown flag {other}"),
         }
@@ -209,6 +215,16 @@ async fn main() {
                 }
                 if args.settings {
                     client.send(ClientCommand::LoadSettings);
+                }
+                match args.goodbye.as_deref() {
+                    Some("logout") => client.send(ClientCommand::Logout),
+                    Some("everywhere") => client.send(ClientCommand::LogoutEverywhere),
+                    Some("delete") => {
+                        client.send(ClientCommand::DeleteAccount { local_only: false })
+                    }
+                    Some("local") => client.send(ClientCommand::DeleteAccount { local_only: true }),
+                    Some(other) => panic!("--goodbye {other}?"),
+                    None => {}
                 }
                 if let Some(code) = &args.approve {
                     match construct_client::device_certs::parse_join_code(code) {
@@ -354,6 +370,10 @@ async fn main() {
                     "SETTINGS username={:?} receipts={} discoverable={:?} this_device={:?}",
                     s.username, s.delivery_receipts, s.discoverable, s.device_name
                 );
+                println!(
+                    "  KEY {:?} media={} bytes in {} files {:?}",
+                    s.fingerprint, s.media_bytes, s.media_files, s.media
+                );
                 for d in &s.devices {
                     println!(
                         "  DEVICE {} current={} described={:?}",
@@ -380,6 +400,14 @@ async fn main() {
                 println!("LINK_CODE {code}");
             }
             ClientEvent::LinkFailed(e) => println!("LINK_FAILED {e}"),
+            ClientEvent::LoggedOut if args.goodbye.is_some() => {
+                println!("LOGGED_OUT");
+                return;
+            }
+            ClientEvent::DeleteAccountFailed(e) => {
+                println!("DELETE_FAILED {e}");
+                return;
+            }
             _ => {}
         }
     }

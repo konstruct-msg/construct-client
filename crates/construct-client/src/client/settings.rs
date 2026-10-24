@@ -27,6 +27,31 @@ pub struct AccountSettings {
     pub display_name: String,
     /// The picture we share, a JPEG.
     pub avatar: Option<Vec<u8>>,
+    pub user_id: String,
+    pub device_id: String,
+    /// Our identity key, short, to compare out of band (iOS `IdentityFingerprint`).
+    pub fingerprint: Option<String>,
+    /// Bytes the fetched attachments take, and how many there are.
+    pub media_bytes: u64,
+    pub media_files: usize,
+    pub media: crate::local_store::MediaPrefs,
+}
+
+/// A key's short fingerprint, as iOS shows it: the first 8 bytes of its SHA-256, in groups of four
+/// upper-case hex digits. A label for "which key is this", not a safety number.
+pub fn fingerprint(identity_public: &[u8]) -> Option<String> {
+    use sha2::Digest;
+    if identity_public.is_empty() {
+        return None;
+    }
+    let hex = hex::encode_upper(&sha2::Sha256::digest(identity_public)[..8]);
+    Some(
+        hex.as_bytes()
+            .chunks(4)
+            .map(|c| std::str::from_utf8(c).unwrap())
+            .collect::<Vec<_>>()
+            .join(" "),
+    )
 }
 
 /// A username as iOS takes it: trimmed, lower case, 3 to 20 letters, digits or `_`.
@@ -51,8 +76,12 @@ impl Client {
         let user_id = self.user_id.clone();
         let events = self.events.clone();
         let secret = self.identity_secret.clone();
+        let device_id = self.device_id.clone();
+        let fingerprint = self.our_identity_key.as_deref().and_then(fingerprint);
+        let media = self.media_cache();
         tokio::spawn(async move {
             let own = store.own_profile().unwrap_or_default();
+            let (media_bytes, media_files) = media.map(|m| m.usage()).unwrap_or_default();
             let (username, devices) = tokio::join!(
                 crate::grpc::own_username(&grpc, &user_id),
                 crate::grpc::list_devices(&grpc)
@@ -78,8 +107,42 @@ impl Client {
                 discoverable: store.discoverable(),
                 display_name: own.display_name,
                 avatar: own.avatar,
+                user_id,
+                device_id,
+                fingerprint,
+                media_bytes,
+                media_files,
+                media: store.media_prefs(),
             }));
         });
+    }
+
+    fn media_cache(&self) -> Option<crate::media::MediaCache> {
+        Some(crate::media::MediaCache::new(
+            self.data.as_ref()?.media_dir(),
+        ))
+    }
+
+    pub(super) fn clear_media_cache(&self) {
+        let Some(cache) = self.media_cache() else {
+            return;
+        };
+        if let Err(e) = cache.clear() {
+            self.emit(ClientEvent::Notice(format!("Not cleared: {e}")));
+        }
+        self.load_settings();
+    }
+
+    /// Kept, and the cache brought within them now.
+    pub(super) fn set_media_prefs(&self, prefs: crate::local_store::MediaPrefs) {
+        let (Some(store), Some(cache)) = (self.store.as_ref(), self.media_cache()) else {
+            return;
+        };
+        if let Err(e) = store.set_media_prefs(&prefs) {
+            return self.emit(ClientEvent::Notice(format!("Not changed: {e}")));
+        }
+        cache.evict(prefs.quota, prefs.keep_days);
+        self.load_settings();
     }
 
     pub(super) fn change_username(&self, raw: String) {
@@ -297,6 +360,16 @@ fn capitalize(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_fingerprint_reads_as_on_ios() {
+        // SHA-256 of 32 zero bytes begins 66687aadf862bd77.
+        assert_eq!(
+            fingerprint(&[0u8; 32]).as_deref(),
+            Some("6668 7AAD F862 BD77")
+        );
+        assert_eq!(fingerprint(&[]), None);
+    }
 
     #[test]
     fn a_username_is_taken_as_ios_takes_it() {
