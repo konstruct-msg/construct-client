@@ -520,6 +520,17 @@ impl App {
                     .unwrap_or("contact");
                 self.status = format!("Session ready with @{name}");
             }
+            // Only told: the devices still receive messages (owner's decision).
+            BridgeEvent::UnvouchedDevices {
+                peer_id,
+                device_ids,
+            } => {
+                let name = self.contact_name(&peer_id);
+                let count = device_ids.len();
+                self.status = format!(
+                    "⚠ @{name}: {count} new device(s) not vouched for by their other devices — compare safety numbers"
+                );
+            }
         }
     }
 

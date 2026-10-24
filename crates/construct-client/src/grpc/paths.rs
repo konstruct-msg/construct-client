@@ -7,6 +7,8 @@ pub const AUTH_REGISTER: &str = "/shared.proto.services.v1.AuthService/RegisterD
 pub const AUTH_AUTHENTICATE: &str = "/shared.proto.services.v1.AuthService/AuthenticateDevice";
 pub const AUTH_REFRESH: &str = "/shared.proto.services.v1.AuthService/RefreshToken";
 pub const AUTH_LOGOUT: &str = "/shared.proto.services.v1.AuthService/Logout";
+pub const DEVICE_PUBLISH_CERTIFICATE: &str =
+    "/shared.proto.services.v1.DeviceService/PublishDeviceCertificate";
 pub const DEVICE_CONFIRM_LINK: &str =
     "/shared.proto.services.v1.DeviceLinkService/ConfirmDeviceLink";
 pub const KEY_GET_BUNDLE: &str = "/shared.proto.services.v1.KeyService/GetPreKeyBundle";

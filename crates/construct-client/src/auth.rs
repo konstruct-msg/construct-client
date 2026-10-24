@@ -190,82 +190,52 @@ pub async fn register_new_device(
     })
 }
 
-/// Link this TUI client to an existing account using a link token
-/// generated on another device (iOS/Desktop Settings → Add Device).
-///
-/// Generates fresh device keys, then calls `ConfirmDeviceLink` with the token.
-pub async fn link_existing_device(client: &GrpcClient, link_token: &str) -> Result<AuthResult> {
-    // 1. Generate fresh device keys (same as register_new_device)
-    let signing_pair = Ed25519KeyPair::generate();
-    let identity_pair = X25519KeyPair::generate();
-    let spk_pair = X25519KeyPair::generate();
+/// This device, linked to an existing account by a code another device of it showed (Flow A).
+pub struct LinkedDevice {
+    pub result: AuthResult,
+    /// The core's key record, hybrid key included: the proof sent to the server is over that
+    /// key, so it is the one this device must publish.
+    pub key_record: Vec<u8>,
+}
 
-    let device_id = derive_device_id(&identity_pair.public_key);
-
-    let prologue = build_prologue(SuiteID::CLASSIC);
-    let mut spk_msg = prologue;
-    spk_msg.extend_from_slice(&spk_pair.public_key);
-    let sk = signing_pair.get_signing_key();
-    let spk_sig = sk.sign(&spk_msg);
-
-    // Build CFE-encoded private keys
-    use construct_core::{
-        cfe::{CfePrivateKeysV1, encode},
-        crypto::SecretBytes,
-    };
-    use serde_bytes::ByteBuf;
-    let private_keys = CfePrivateKeysV1 {
-        suite_id: 1, // CLASSIC
-        ik_priv: SecretBytes::from_slice(&identity_pair.private_key[..]),
-        sk_priv: SecretBytes::from_slice(&signing_pair.private_key[..]),
-        spk_priv: SecretBytes::from_slice(&spk_pair.private_key[..]),
-        spk_sig: ByteBuf::from(spk_sig.to_bytes().to_vec()),
-        spk_id: 0,
-        ik_pub: ByteBuf::from(identity_pair.public_key.to_vec()),
-        vk_pub: ByteBuf::from(signing_pair.public_key.to_vec()),
-        spk_pub: ByteBuf::from(spk_pair.public_key.to_vec()),
-        old_spks: vec![],
-        hybrid_sig_priv: None,
-    };
-    let keys_cfe_data = encode(
-        construct_core::cfe::CfeMessageType::PrivateKeys,
-        &private_keys,
-    )?;
-
+/// Link this device to an existing account with a code from another device of it (iOS or
+/// Desktop Settings → Add Device): make the keys, then `ConfirmDeviceLink` with the token and,
+/// when the code carried a secret, the proof of these keys under it — the old device vouches
+/// for exactly the keys the proof names.
+pub async fn link_existing_device(
+    client: &GrpcClient,
+    code: &crate::device_certs::LinkCode,
+) -> Result<LinkedDevice> {
+    let secret = code.secret.clone();
+    let keys = tokio::task::spawn_blocking(move || new_device_keys(secret.as_deref()))
+        .await
+        .context("key generation")??;
+    let device_id = keys.session_secrets.device_id.clone();
     client.set_device_id(Some(device_id.clone()));
     let pubs = crate::grpc::device_public_keys(
-        &signing_pair.public_key,
-        &identity_pair.public_key,
-        &spk_pair.public_key,
-        &spk_sig.to_bytes(),
+        &keys.verifying_key,
+        &keys.identity_public,
+        &keys.signed_prekey_public,
+        &keys.signed_prekey_signature,
     );
-    let tokens = crate::grpc::confirm_device_link(client, link_token, &device_id, pubs)
+    let proof = keys.link_key_proof.map(|p| p.to_vec()).unwrap_or_default();
+    let tokens = crate::grpc::confirm_device_link(client, &code.token, &device_id, pubs, proof)
         .await
         .context("confirm device link")?;
-    let user_id = tokens.user_id;
-    let access_token = tokens.access_token;
-    let refresh_token = tokens.refresh_token;
-    let expires_at = tokens.expires_at;
-    let _ = keys_cfe_data;
 
-    // 3. Build session (caller is responsible for saving — encrypted or plaintext)
-    let session = Session {
-        signing_key_hex: hex::encode(*signing_pair.private_key),
-        identity_key_hex: hex::encode(*identity_pair.private_key),
-        device_id: device_id.clone(),
-        user_id: user_id.clone(),
-        access_token: access_token.clone(),
-        refresh_token: refresh_token.clone(),
-        expires_at,
-        spk_key_hex: hex::encode(*spk_pair.private_key),
-        spk_sig_hex: hex::encode(spk_sig.to_bytes()),
-    };
-
-    Ok(AuthResult {
-        user_id,
-        device_id,
-        access_token,
-        session: Some(session),
+    let mut session = keys.session_secrets;
+    session.user_id = tokens.user_id.clone();
+    session.access_token = tokens.access_token.clone();
+    session.refresh_token = tokens.refresh_token;
+    session.expires_at = tokens.expires_at;
+    Ok(LinkedDevice {
+        result: AuthResult {
+            user_id: tokens.user_id,
+            device_id,
+            access_token: tokens.access_token,
+            session: Some(session),
+        },
+        key_record: keys.key_record,
     })
 }
 
@@ -338,6 +308,59 @@ const JOIN_POLL: Duration = Duration::from_secs(3);
 /// in the directory match.
 pub fn prepare_join() -> Result<JoinPrep> {
     use base64::Engine;
+
+    let keys = new_device_keys(None)?;
+    let device_id = keys.session_secrets.device_id.clone();
+    let fingerprint = construct_core::history::discovery::qr_fingerprint(
+        &keys.identity_public,
+        &keys.hybrid_public,
+    );
+    let device_name = format!("Konstruct on {}", os_label());
+    let platform = std::env::consts::OS.to_string();
+    let pubkey = base64::engine::general_purpose::STANDARD.encode(&keys.identity_public);
+    let qr = format!(
+        "konstruct://link-to-me?id={device_id}&pubkey={}&fp={}&name={}&platform={}",
+        percent_encode(&pubkey),
+        hex::encode(fingerprint),
+        percent_encode(&device_name),
+        percent_encode(&platform),
+    );
+
+    Ok(JoinPrep {
+        session_secrets: keys.session_secrets,
+        key_record: keys.key_record,
+        request: crate::grpc::JoinRequest {
+            device_id,
+            identity_public: keys.identity_public,
+            verifying_key: keys.verifying_key,
+            signed_prekey_public: keys.signed_prekey_public,
+            signed_prekey_signature: keys.signed_prekey_signature,
+            device_name,
+            platform,
+        },
+        qr,
+    })
+}
+
+/// The keys of a device about to join an account, in either flow.
+struct NewDeviceKeys {
+    /// The secrets, under the device id; the account and tokens come with the link.
+    session_secrets: Session,
+    /// The core's key record (`export_private_keys_cfe`), hybrid key included.
+    key_record: Vec<u8>,
+    identity_public: Vec<u8>,
+    verifying_key: Vec<u8>,
+    signed_prekey_public: Vec<u8>,
+    signed_prekey_signature: Vec<u8>,
+    hybrid_public: Vec<u8>,
+    /// Flow A: the answer to the secret in the old device's code (core `device_link_key_proof`).
+    link_key_proof: Option<[u8; 32]>,
+}
+
+/// Make a joining device's keys as iOS's `prepareLinkIdentity` does: the classic keys, then the
+/// hybrid signature key, all in one key record — whatever the old device vouches for names the
+/// hybrid key, so it exists before any code or proof does, and is kept.
+fn new_device_keys(link_secret: Option<&[u8]>) -> Result<NewDeviceKeys> {
     use construct_core::crypto::client_api::ClassicClient;
     use construct_core::orchestration::orchestrator::Orchestrator;
 
@@ -363,27 +386,16 @@ pub fn prepare_join() -> Result<JoinPrep> {
     let key_record = orchestrator
         .export_private_keys_cfe()
         .map_err(|e| anyhow::anyhow!("key record: {e}"))?;
+    let link_key_proof = link_secret
+        .map(|secret| orchestrator.device_link_key_proof(secret))
+        .transpose()
+        .map_err(|e| anyhow::anyhow!("link key proof: {e:?}"))?;
 
-    let fingerprint = construct_core::history::discovery::qr_fingerprint(
-        &identity_pair.public_key,
-        &hybrid_public,
-    );
-    let device_name = format!("Konstruct on {}", os_label());
-    let platform = std::env::consts::OS.to_string();
-    let pubkey = base64::engine::general_purpose::STANDARD.encode(identity_pair.public_key);
-    let qr = format!(
-        "konstruct://link-to-me?id={device_id}&pubkey={}&fp={}&name={}&platform={}",
-        percent_encode(&pubkey),
-        hex::encode(fingerprint),
-        percent_encode(&device_name),
-        percent_encode(&platform),
-    );
-
-    Ok(JoinPrep {
+    Ok(NewDeviceKeys {
         session_secrets: Session {
             signing_key_hex: hex::encode(*signing_pair.private_key),
             identity_key_hex: hex::encode(*identity_pair.private_key),
-            device_id: device_id.clone(),
+            device_id,
             user_id: String::new(),
             access_token: String::new(),
             refresh_token: String::new(),
@@ -392,16 +404,12 @@ pub fn prepare_join() -> Result<JoinPrep> {
             spk_sig_hex: hex::encode(spk_sig.to_bytes()),
         },
         key_record,
-        request: crate::grpc::JoinRequest {
-            device_id,
-            identity_public: identity_pair.public_key.to_vec(),
-            verifying_key: signing_pair.public_key.to_vec(),
-            signed_prekey_public: spk_pair.public_key.to_vec(),
-            signed_prekey_signature: spk_sig.to_bytes().to_vec(),
-            device_name,
-            platform,
-        },
-        qr,
+        identity_public: identity_pair.public_key.to_vec(),
+        verifying_key: signing_pair.public_key.to_vec(),
+        signed_prekey_public: spk_pair.public_key.to_vec(),
+        signed_prekey_signature: spk_sig.to_bytes().to_vec(),
+        hybrid_public,
+        link_key_proof,
     })
 }
 
@@ -498,6 +506,37 @@ mod tests {
         // Nothing in the query needs a decoder the phone does not run.
         let query = prep.qr.split('?').nth(1).unwrap();
         assert!(!query.contains('+') && !query.contains('/') && !query.contains(' '));
+    }
+
+    /// Flow A: the proof sent with `ConfirmDeviceLink` answers the code's secret over the keys
+    /// the record holds — the ones this device will publish and the old device vouches for.
+    #[test]
+    fn the_link_proof_is_over_the_keys_the_record_holds() {
+        use construct_core::crypto::client_api::ClassicClient;
+        use construct_core::orchestration::orchestrator::Orchestrator;
+        let secret = [7u8; 32];
+        let keys = new_device_keys(Some(&secret)).unwrap();
+
+        let record = construct_core::cfe::decode_as::<construct_core::cfe::CfePrivateKeysV1>(
+            &keys.key_record,
+            construct_core::cfe::CfeMessageType::PrivateKeys,
+        )
+        .unwrap();
+        let restored = Orchestrator::new(
+            ClassicClient::from_private_keys_cfe(record).unwrap(),
+            keys.session_secrets.device_id.clone(),
+        );
+        let hybrid = restored
+            .hybrid_signature_public_key()
+            .expect("hybrid key in the record");
+        let expected = construct_core::crypto::device_certificate::link_key_proof(
+            &secret,
+            &keys.identity_public,
+            &hybrid,
+        )
+        .unwrap();
+        assert_eq!(keys.link_key_proof, Some(expected));
+        assert_eq!(new_device_keys(None).unwrap().link_key_proof, None);
     }
 
     #[test]

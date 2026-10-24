@@ -24,6 +24,9 @@ use super::paths;
 pub struct FetchedPreKeyBundle {
     pub bundle: SessionBundle,
     pub device_id: String,
+    /// The certificate by which another device of the account vouches for this one, as the
+    /// server keeps it (`DevicePreKeyBundle.device_certificate`); the core judges it.
+    pub certificate: Option<Vec<u8>>,
 }
 
 /// The bundles of an account's devices — of `device_ids` only, or of every device when empty —
@@ -52,20 +55,28 @@ pub async fn get_pre_key_bundles(
         .await?;
     let resp = GetPreKeyBundlesResponse::decode(bytes.as_slice())
         .map_err(|e| GrpcError::transport(format!("GetPreKeyBundles decode: {e}")))?;
+    Ok(device_bundles(resp))
+}
+
+/// The bundles of a `GetPreKeyBundles` answer that hold together, each with its certificate.
+pub(crate) fn device_bundles(resp: GetPreKeyBundlesResponse) -> DeviceBundles {
     let mut bundles = Vec::new();
     for device in resp.bundles {
         let Some(bundle) = device.bundle else {
             continue;
         };
         match fetched_bundle(device.device_id, bundle, device.verifying_key.to_vec()) {
-            Ok(fetched) => bundles.push(fetched),
+            Ok(mut fetched) => {
+                fetched.certificate = device.device_certificate.map(|c| c.to_vec());
+                bundles.push(fetched);
+            }
             Err(e) => tracing::warn!(error = %e, "bundle left out"),
         }
     }
-    Ok(DeviceBundles {
+    DeviceBundles {
         bundles,
         active_devices: resp.active_devices,
-    })
+    }
 }
 
 fn fetched_bundle(
@@ -106,6 +117,7 @@ fn fetched_bundle(
     Ok(FetchedPreKeyBundle {
         bundle: SessionBundle { x3dh, kyber },
         device_id,
+        certificate: None,
     })
 }
 

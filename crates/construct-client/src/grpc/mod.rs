@@ -26,12 +26,14 @@ pub(crate) mod users;
 
 pub use auth::{
     AuthTokens, JoinRequest, JoinStatus, approve_join_request, authenticate_device,
-    check_join_request, confirm_device_link, device_public_keys, get_pow_challenge, refresh_token,
-    register_device, submit_join_request,
+    check_join_request, confirm_device_link, device_public_keys, get_pow_challenge,
+    publish_device_certificate, refresh_token, register_device, submit_join_request,
 };
 pub use client::GrpcClient;
 pub use error::GrpcError;
 pub use invite::accept_invite;
+#[cfg(test)]
+pub(crate) use keys::device_bundles;
 pub use keys::{
     FetchedPreKeyBundle, PrekeyUpload, SignedPrekeyRotation, append_one_time_prekeys,
     get_pre_key_bundles, get_prekey_count, get_signed_prekey_age, rotate_signed_prekey,
