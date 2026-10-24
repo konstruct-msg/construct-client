@@ -17,6 +17,7 @@ mod orchestrator;
 mod profile;
 mod settings;
 mod tokens;
+mod transfer;
 
 pub(crate) use auth::AuthMsg;
 pub use contacts::{FindStarted, SearchResult};
@@ -182,6 +183,14 @@ pub enum ClientCommand {
     },
     /// A code handed in at the lock screen.
     UnlockApp(Zeroizing<String>),
+    /// Write this device's history to a file sealed to `device_id`, another device of the
+    /// account, which imports it.
+    ExportHistory {
+        device_id: String,
+        path: std::path::PathBuf,
+    },
+    /// Read a history file another device of the account wrote for this one.
+    ImportHistory(std::path::PathBuf),
     /// Burn invites this device handed out, by their `jti`, so nobody can redeem them.
     RevokeInvites(Vec<String>),
     /// Delete every fetched attachment.
@@ -258,6 +267,10 @@ pub enum ClientEvent {
     /// The offer ended: the device that linked with it, or why not.
     LinkOfferEnded(Result<String, String>),
     LoggedOut,
+    /// A history file was written, and where; or why not.
+    HistoryExported(Result<(crate::history::HistorySummary, std::path::PathBuf), String>),
+    /// A history file was read into the store (a `Started` with the contacts follows); or why not.
+    HistoryImported(Result<crate::history::HistorySummary, String>),
     /// Whether the app lock is on, and its delay: after start and after each change.
     AppLock(AppLock),
     /// The code handed in matched, or why it did not.
@@ -308,6 +321,11 @@ enum Inbox {
     Recovery(crate::recovery::RecoveryState),
     /// The server was told of a sign-out or a deletion (or could not be): wipe now.
     Wipe,
+    /// A history import landed.
+    HistoryImported {
+        summary: crate::history::HistorySummary,
+        contacts: Vec<String>,
+    },
 }
 
 /// The front end's end of the client: send commands, nothing else.
@@ -445,6 +463,9 @@ impl Client {
                 Inbox::InviteAccepted { user_id, username } => self.add_contact(user_id, username),
                 Inbox::Recovery(state) => self.emit(ClientEvent::Recovery(state)),
                 Inbox::Wipe => self.logout(),
+                Inbox::HistoryImported { summary, contacts } => {
+                    self.history_imported(summary, contacts)
+                }
             }
         }
     }
@@ -507,6 +528,10 @@ impl Client {
             ClientCommand::DeleteAccount { local_only } => self.delete_account(local_only),
             ClientCommand::ClearMediaCache => self.clear_media_cache(),
             ClientCommand::RevokeInvites(jtis) => self.revoke_invites(jtis),
+            ClientCommand::ExportHistory { device_id, path } => {
+                self.export_history(device_id, path)
+            }
+            ClientCommand::ImportHistory(path) => self.import_history(path),
             ClientCommand::SetAppLock {
                 current,
                 code,

@@ -197,19 +197,51 @@ pub async fn prefetch(
         if cache.load(&file.media_id).is_some() {
             continue;
         }
-        match open(cache, anonymous, &file).await {
+        match open(cache, anonymous, &file, None).await {
             Ok(_) => tracing::info!("media {} fetched on arrival", file.media_id),
             Err(e) => tracing::warn!("media {} not fetched on arrival: {e}", file.media_id),
         }
     }
 }
 
+impl MediaCache {
+    /// The file's bytes as kept here: under the message's key, or, for one a history transfer
+    /// brought, under the key this device sealed it with (`local_key`).
+    pub fn plaintext(&self, file: &MediaFile, local_key: Option<&[u8]>) -> Option<Vec<u8>> {
+        let blob = self.load(&file.media_id)?;
+        construct_core::media::open_media(&file.key, &blob)
+            .ok()
+            .or_else(|| construct_core::media::open_media(local_key?, &blob).ok())
+    }
+
+    /// A file a history transfer brought as plaintext: sealed under a key of this device's, so
+    /// the cache stays noise without the store. Returns that key, for the store; `None` when a
+    /// blob is already kept under the id.
+    pub fn keep_imported(
+        &self,
+        media_id: &str,
+        plaintext: &[u8],
+    ) -> Result<Option<zeroize::Zeroizing<Vec<u8>>>, String> {
+        let Some(path) = self.path(media_id) else {
+            return Err("not a media id".into());
+        };
+        if path.exists() {
+            return Ok(None);
+        }
+        let sealed = construct_core::media::seal_media(plaintext).map_err(|e| e.to_string())?;
+        self.save(media_id, &sealed.blob)
+            .map_err(|e| e.to_string())?;
+        Ok(Some(zeroize::Zeroizing::new(sealed.key.to_vec())))
+    }
+}
+
 /// `file`, opened: from the cache, or fetched and then cached. A blob that does not open is not
-/// kept, so the next try fetches it again.
+/// kept, so the next try fetches it again. `local_key`: the key a history import sealed it with.
 pub async fn open(
     cache: &MediaCache,
     anonymous: &GrpcClient,
     file: &MediaFile,
+    local_key: Option<&[u8]>,
 ) -> Result<OpenedMedia, String> {
     let opened = |blob: &[u8]| {
         construct_core::media::open_media(&file.key, blob).map(|bytes| OpenedMedia {
@@ -218,11 +250,17 @@ pub async fn open(
             bytes,
         })
     };
-    if let Some(blob) = cache.load(&file.media_id) {
-        match opened(&blob) {
-            Ok(media) => return Ok(media),
-            Err(e) => {
-                tracing::warn!("cached media did not open, fetching again: {e}");
+    if cache.load(&file.media_id).is_some() {
+        match cache.plaintext(file, local_key) {
+            Some(bytes) => {
+                return Ok(OpenedMedia {
+                    mime: file.info.mime.clone(),
+                    filename: file.info.filename.clone(),
+                    bytes,
+                });
+            }
+            None => {
+                tracing::warn!("cached media did not open, fetching again");
                 cache.forget(&file.media_id);
             }
         }
@@ -274,7 +312,7 @@ mod tests {
         let (dir, cache) = temp_cache();
         let sealed = construct_core::media::seal_media(b"the picture").unwrap();
         cache.save("m1", &sealed.blob).unwrap();
-        let media = open(&cache, &offline(), &file_for("m1", &sealed.key))
+        let media = open(&cache, &offline(), &file_for("m1", &sealed.key), None)
             .await
             .unwrap();
         assert_eq!(media.bytes, b"the picture");
@@ -290,7 +328,7 @@ mod tests {
         let last = blob.len() - 1;
         blob[last] ^= 1;
         cache.save("m1", &blob).unwrap();
-        let result = open(&cache, &offline(), &file_for("m1", &sealed.key)).await;
+        let result = open(&cache, &offline(), &file_for("m1", &sealed.key), None).await;
         assert!(result.is_err(), "a changed blob is never shown");
         assert_eq!(cache.load("m1"), None, "and not kept for the next try");
         MediaCache::wipe(&dir).unwrap();
@@ -354,6 +392,32 @@ mod tests {
         cache.save("c", b"1").unwrap();
         cache.clear().unwrap();
         assert_eq!(cache.usage(), (0, 0));
+        MediaCache::wipe(&dir).unwrap();
+    }
+
+    #[test]
+    fn an_imported_file_is_kept_sealed_and_opens_with_this_devices_key() {
+        let (dir, cache) = temp_cache();
+        let key = cache
+            .keep_imported("m9", b"the photo")
+            .unwrap()
+            .expect("kept");
+        let blob = cache.load("m9").unwrap();
+        assert!(
+            !blob.windows(9).any(|w| w == b"the photo"),
+            "not on disk in the clear"
+        );
+        // The message's own key is not the one it was sealed with here.
+        let file = file_for("m9", &[1u8; 32]);
+        assert_eq!(cache.plaintext(&file, None), None);
+        assert_eq!(
+            cache.plaintext(&file, Some(&key)).as_deref(),
+            Some(&b"the photo"[..])
+        );
+        assert!(
+            cache.keep_imported("m9", b"other").unwrap().is_none(),
+            "a kept blob stays"
+        );
         MediaCache::wipe(&dir).unwrap();
     }
 

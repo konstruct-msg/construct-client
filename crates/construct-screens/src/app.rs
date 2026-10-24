@@ -399,6 +399,22 @@ impl App {
             }
             ClientEvent::LoggedOut => self.reset_after_logout(),
             ClientEvent::Notice(text) => self.status = text,
+            ClientEvent::HistoryExported(result) => {
+                self.status = match result {
+                    Ok((s, path)) => format!(
+                        "History written: {} messages → {}",
+                        s.messages,
+                        path.display()
+                    ),
+                    Err(e) => format!("History not written: {e}"),
+                }
+            }
+            ClientEvent::HistoryImported(result) => {
+                self.status = match result {
+                    Ok(s) => format!("History imported: {} messages", s.messages),
+                    Err(e) => format!("History not imported: {e}"),
+                }
+            }
             // The terminal has no lock screen yet; the desktop does.
             ClientEvent::AppLock(_) | ClientEvent::AppUnlocked(_) => {}
             ClientEvent::AppLockRefused(why) => self.status = why,

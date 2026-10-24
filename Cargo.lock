@@ -672,6 +672,7 @@ dependencies = [
  "bip39",
  "chacha20poly1305",
  "construct-server-trust",
+ "construct-store",
  "crc32fast",
  "curve25519-dalek",
  "ed25519-dalek",
