@@ -143,6 +143,13 @@ pub enum ClientCommand {
         display_name: Option<String>,
         avatar: AvatarChange,
     },
+    /// Our own name for a contact, kept on this device only; `None` removes it.
+    SetAlias {
+        contact_id: String,
+        alias: Option<String>,
+    },
+    /// The name this device shows to the account's other devices.
+    RenameDevice(String),
     /// Share our profile with a contact (it is sent to them now), or stop.
     ShareProfile {
         contact_id: String,
@@ -328,6 +335,8 @@ pub(crate) struct Client {
     contact_ids: Vec<String>,
     /// A link waiting for the phone's approval.
     link_task: Option<tokio::task::AbortHandle>,
+    /// This device's X25519 identity secret, to open the device descriptions sealed to it.
+    identity_secret: Option<Zeroizing<Vec<u8>>>,
     /// The username a new account registered with, until there is a store to keep it in.
     pending_username: Option<String>,
     /// An approved link's key record and starting cursor, until there is a store to write them to.
@@ -364,6 +373,7 @@ impl Client {
             link_task: None,
             pending_link: None,
             pending_username: None,
+            identity_secret: None,
         }
     }
 
@@ -430,6 +440,8 @@ impl Client {
                 avatar,
             } => self.set_profile(display_name, avatar),
             ClientCommand::ShareProfile { contact_id, on } => self.share_profile(contact_id, on),
+            ClientCommand::SetAlias { contact_id, alias } => self.set_alias(contact_id, alias),
+            ClientCommand::RenameDevice(name) => self.rename_device(name),
             ClientCommand::Logout => self.logout(),
         }
     }

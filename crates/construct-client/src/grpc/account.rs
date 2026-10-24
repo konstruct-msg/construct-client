@@ -6,8 +6,8 @@ use prost::Message;
 use crate::proto::services::v1::{
     CheckUsernameAvailabilityRequest, CheckUsernameAvailabilityResponse, GetUserProfileRequest,
     GetUserProfileResponse, ListDevicesRequest, ListDevicesResponse, RevokeDeviceRequest,
-    RevokeDeviceResponse, SetDiscoverableRequest, SetDiscoverableResponse,
-    UpdateUserProfileRequest, UpdateUserProfileResponse,
+    RevokeDeviceResponse, SetDeviceMetadataRequest, SetDiscoverableRequest,
+    SetDiscoverableResponse, UpdateUserProfileRequest, UpdateUserProfileResponse,
 };
 
 use super::client::GrpcClient;
@@ -23,6 +23,8 @@ pub struct Device {
     pub created_at: i64,
     pub is_current: bool,
     pub is_primary: bool,
+    /// Its name and platform sealed to the account's devices (`device_meta`); empty when none.
+    pub sealed_metadata: Vec<u8>,
 }
 
 /// Most devices an account lists; the stream is cut there.
@@ -48,6 +50,7 @@ pub async fn list_devices(client: &GrpcClient) -> Result<Vec<Device>, GrpcError>
                     created_at: info.created_at,
                     is_current: info.is_current,
                     is_primary: info.is_primary,
+                    sealed_metadata: info.sealed_metadata.to_vec(),
                 });
             }
             Ok(())
@@ -70,6 +73,18 @@ pub async fn revoke_device(client: &GrpcClient, device_id: &str) -> Result<(), G
     if !resp.success {
         return Err(GrpcError::transport("the server did not revoke the device"));
     }
+    Ok(())
+}
+
+/// `DeviceService.SetDeviceMetadata`: this device's sealed description; the server keeps it and
+/// cannot read it.
+pub async fn set_device_metadata(client: &GrpcClient, blob: &[u8]) -> Result<(), GrpcError> {
+    let req = SetDeviceMetadataRequest {
+        sealed_metadata: blob.to_vec().into(),
+    };
+    client
+        .unary(paths::DEVICE_SET_METADATA, &req.encode_to_vec())
+        .await?;
     Ok(())
 }
 

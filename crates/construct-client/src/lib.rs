@@ -13,6 +13,7 @@ pub mod bridge;
 pub mod config;
 pub mod content;
 pub mod device_certs;
+pub mod device_meta;
 mod grpc;
 mod invite;
 mod knst;

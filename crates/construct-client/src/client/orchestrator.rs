@@ -26,6 +26,7 @@ impl Client {
         // The task opens a certificate box (`SealedInner.sender_cert_ciphertext`) with it; Double
         // Ratchet decryption still happens inside the orchestrator.
         let identity_secret_for_sealed = identity_secret.clone();
+        self.identity_secret = Some(zeroize::Zeroizing::new(identity_secret.clone()));
 
         let signing_secret_for_prekeys = signing_secret.clone();
 
@@ -144,6 +145,7 @@ impl Client {
         orch_handle.send(construct_core::orchestration::actions::IncomingEvent::AppLaunched);
         self.orch_handle = Some(orch_handle.clone());
         self.profile_chores(avatars);
+        self.publish_device_description(false);
 
         inbound::spawn_relay(
             stream_rx,
