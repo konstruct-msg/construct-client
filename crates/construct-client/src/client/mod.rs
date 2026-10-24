@@ -12,10 +12,12 @@ mod identity;
 mod inbound;
 mod messages;
 mod orchestrator;
+mod settings;
 mod tokens;
 
 pub(crate) use auth::AuthMsg;
 pub use contacts::{FindStarted, SearchResult};
+pub use settings::{AccountSettings, normalize_username};
 
 use tokio::sync::mpsc;
 use zeroize::Zeroizing;
@@ -126,6 +128,13 @@ pub enum ClientCommand {
     },
     /// The recovery phrase, typed on a device that did not make it, so it learns the address.
     EnterRecoveryPhrase(Zeroizing<String>),
+    /// What the settings screen shows ([`ClientEvent::Settings`]).
+    LoadSettings,
+    ChangeUsername(String),
+    SetDiscoverable(bool),
+    SetDeliveryReceipts(bool),
+    /// Sign out another device of this account; `None`: every other one.
+    RevokeDevices(Option<String>),
     Logout,
 }
 
@@ -196,6 +205,9 @@ pub enum ClientEvent {
     RecoveryPhrase(Result<Zeroizing<String>, String>),
     /// A recovery command failed: the copy check, or a typed phrase.
     RecoveryFailed(String),
+    /// What the settings screen shows: sent on [`ClientCommand::LoadSettings`] and after each
+    /// change it makes.
+    Settings(AccountSettings),
     /// A one-line message for the user.
     Notice(String),
 }
@@ -303,6 +315,8 @@ pub(crate) struct Client {
     contact_ids: Vec<String>,
     /// A link waiting for the phone's approval.
     link_task: Option<tokio::task::AbortHandle>,
+    /// The username a new account registered with, until there is a store to keep it in.
+    pending_username: Option<String>,
     /// An approved link's key record and starting cursor, until there is a store to write them to.
     pending_link: Option<(Vec<u8>, Option<String>)>,
 }
@@ -336,6 +350,7 @@ impl Client {
             contact_ids: Vec::new(),
             link_task: None,
             pending_link: None,
+            pending_username: None,
         }
     }
 
@@ -392,6 +407,11 @@ impl Client {
             ClientCommand::RevealRecoveryPhrase => self.reveal_recovery_phrase(),
             ClientCommand::ConfirmRecoveryCopy { answers } => self.confirm_recovery_copy(&answers),
             ClientCommand::EnterRecoveryPhrase(phrase) => self.enter_recovery_phrase(phrase),
+            ClientCommand::LoadSettings => self.load_settings(),
+            ClientCommand::ChangeUsername(name) => self.change_username(name),
+            ClientCommand::SetDiscoverable(on) => self.set_discoverable(on),
+            ClientCommand::SetDeliveryReceipts(on) => self.set_delivery_receipts(on),
+            ClientCommand::RevokeDevices(device_id) => self.revoke_devices(device_id),
             ClientCommand::Logout => self.logout(),
         }
     }

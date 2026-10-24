@@ -19,6 +19,7 @@ mod knst;
 mod local_data;
 pub mod local_store;
 pub mod media;
+pub mod names;
 mod orchestrator_task;
 pub mod outgoing;
 mod own_copy;

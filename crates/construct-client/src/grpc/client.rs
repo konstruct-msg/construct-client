@@ -202,11 +202,12 @@ pub(crate) fn check_grpc_status(headers: &HeaderMap) -> Result<(), GrpcError> {
     if code == 0 {
         return Ok(());
     }
-    let msg = headers
-        .get("grpc-message")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .to_string();
+    let msg = percent_decode(
+        headers
+            .get("grpc-message")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or(""),
+    );
     if code == 16 {
         return Err(GrpcError::unauthenticated(msg));
     }
@@ -214,6 +215,27 @@ pub(crate) fn check_grpc_status(headers: &HeaderMap) -> Result<(), GrpcError> {
         return Err(GrpcError::permission_denied(msg));
     }
     Err(GrpcError::status(code, msg))
+}
+
+/// `grpc-message` is percent-encoded on the wire (gRPC over HTTP/2): "already%20taken".
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let hex = |b: Option<&u8>| b.and_then(|b| (*b as char).to_digit(16));
+        match (bytes[i], hex(bytes.get(i + 1)), hex(bytes.get(i + 2))) {
+            (b'%', Some(h), Some(l)) => {
+                out.push((h * 16 + l) as u8);
+                i += 3;
+            }
+            (b, ..) => {
+                out.push(b);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// Send `data` as the peer's flow-control window allows: a chunk per grant of capacity.
@@ -311,6 +333,19 @@ mod tests {
         let (token, device) = b.auth_headers();
         assert_eq!(token.as_deref(), Some("tok-1"));
         assert_eq!(device.as_deref(), Some("dev-1"));
+    }
+
+    #[test]
+    fn a_status_message_is_read_as_the_server_wrote_it() {
+        let mut headers = HeaderMap::new();
+        headers.insert("grpc-status", "6".parse().unwrap());
+        headers.insert(
+            "grpc-message",
+            "username%20is%20already%20taken".parse().unwrap(),
+        );
+        let err = check_grpc_status(&headers).unwrap_err();
+        assert_eq!(err.to_string(), "grpc 6: username is already taken");
+        assert_eq!(percent_decode("50%"), "50%");
     }
 
     #[test]

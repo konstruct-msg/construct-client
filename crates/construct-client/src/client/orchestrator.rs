@@ -96,6 +96,11 @@ impl Client {
             .map(|fields| fields.identity_public);
 
         let cursor = CursorTracker::load(&read_storage);
+        if let Some(name) = self.pending_username.take()
+            && let Err(e) = read_storage.set_own_username(&name)
+        {
+            tracing::warn!("username not kept: {e}");
+        }
         self.store = Some(read_storage);
         self.contact_ids = contact_ids.clone();
 

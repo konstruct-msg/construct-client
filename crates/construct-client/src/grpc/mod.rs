@@ -13,6 +13,7 @@
 //! - [`media`] — attachment downloads
 //! - [`auth`] / [`keys`] / [`users`] — typed RPCs
 
+mod account;
 mod auth;
 mod client;
 mod connection;
@@ -26,6 +27,10 @@ mod sealed;
 mod stream;
 pub(crate) mod users;
 
+pub use account::{
+    Device, list_devices, own_username, revoke_device, set_discoverable, set_username,
+    username_refusal,
+};
 pub use auth::{
     AuthTokens, JoinRequest, JoinStatus, approve_join_request, authenticate_device,
     check_join_request, confirm_device_link, device_public_keys, get_pow_challenge,

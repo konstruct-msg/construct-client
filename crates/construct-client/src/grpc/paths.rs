@@ -35,3 +35,10 @@ pub const DEVICE_CHECK_JOIN: &str =
 pub const MEDIA_DOWNLOAD: &str = "/shared.proto.services.v1.MediaService/DownloadMedia";
 pub const MEDIA_UPLOAD_TOKEN: &str = "/shared.proto.services.v1.MediaService/GenerateUploadToken";
 pub const MEDIA_UPLOAD: &str = "/shared.proto.services.v1.MediaService/UploadMedia";
+pub const DEVICE_LIST: &str = "/shared.proto.services.v1.DeviceService/ListDevices";
+pub const DEVICE_REVOKE: &str = "/shared.proto.services.v1.DeviceService/RevokeDevice";
+pub const USER_PROFILE: &str = "/shared.proto.services.v1.UserService/GetUserProfile";
+pub const USER_UPDATE_PROFILE: &str = "/shared.proto.services.v1.UserService/UpdateUserProfile";
+pub const USER_CHECK_USERNAME: &str =
+    "/shared.proto.services.v1.UserService/CheckUsernameAvailability";
+pub const USER_SET_DISCOVERABLE: &str = "/shared.proto.services.v1.UserService/SetDiscoverable";

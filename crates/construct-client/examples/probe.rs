@@ -20,6 +20,10 @@
 //! `--file <path>`: with `--add`, send that file too (a photo goes without its metadata). A file
 //! that arrives is fetched, opened and written to `$HOME/received-<name>`; `MEDIA` names it.
 //!
+//! `--settings`: once started, print the account's settings (username, devices, receipts).
+//! `--set-username <name>`: change the username first; `--discoverable on|off` likewise;
+//! `--revoke <device id|others>` signs out a device of the account, or all but this one.
+//!
 //! `--invite`: once the account's recovery key is in place, mint an invite link and print it.
 //!
 //! `--link` instead of `--username`: become a new device of an existing account — print the
@@ -48,6 +52,10 @@ struct Args {
     invite: bool,
     answer: Option<String>,
     file: Option<String>,
+    settings: bool,
+    set_username: Option<String>,
+    discoverable: Option<bool>,
+    revoke: Option<String>,
     wait_secs: u64,
 }
 
@@ -63,6 +71,10 @@ fn parse_args() -> Args {
         invite: false,
         answer: None,
         file: None,
+        settings: false,
+        set_username: None,
+        discoverable: None,
+        revoke: None,
         wait_secs: 30,
     };
     let mut it = std::env::args().skip(1);
@@ -79,6 +91,10 @@ fn parse_args() -> Args {
             "--invite" => args.invite = true,
             "--answer" => args.answer = Some(value()),
             "--file" => args.file = Some(value()),
+            "--settings" => args.settings = true,
+            "--set-username" => args.set_username = Some(value()),
+            "--discoverable" => args.discoverable = Some(value() == "on"),
+            "--revoke" => args.revoke = Some(value()),
             "--wait" => args.wait_secs = value().parse().expect("--wait takes seconds"),
             other => panic!("unknown flag {other}"),
         }
@@ -143,6 +159,20 @@ async fn main() {
             ClientEvent::Started(contacts) => {
                 started = true;
                 println!("STARTED contacts={}", contacts.len());
+                if let Some(name) = args.set_username.take() {
+                    client.send(ClientCommand::ChangeUsername(name));
+                }
+                if let Some(target) = args.revoke.take() {
+                    client.send(ClientCommand::RevokeDevices(
+                        (target != "others").then_some(target),
+                    ));
+                }
+                if let Some(on) = args.discoverable.take() {
+                    client.send(ClientCommand::SetDiscoverable(on));
+                }
+                if args.settings {
+                    client.send(ClientCommand::LoadSettings);
+                }
                 if let Some(code) = &args.approve {
                     match construct_client::device_certs::parse_join_code(code) {
                         Some(join) => client.send(ClientCommand::ApproveJoin {
@@ -160,7 +190,7 @@ async fn main() {
                 if let Some(user_id) = &args.add {
                     client.send(ClientCommand::AddContact {
                         user_id: user_id.clone(),
-                        username: format!("peer-{}", &user_id[..8.min(user_id.len())]),
+                        username: String::new(),
                     });
                 }
             }
@@ -275,6 +305,10 @@ async fn main() {
             }
             ClientEvent::RegistrationStep(step) => println!("STEP {step:?}"),
             ClientEvent::Notice(n) => println!("NOTICE {n}"),
+            ClientEvent::Settings(s) => println!(
+                "SETTINGS username={:?} receipts={} discoverable={:?} devices={:?}",
+                s.username, s.delivery_receipts, s.discoverable, s.devices
+            ),
             ClientEvent::Recovery(state) => {
                 println!("RECOVERY {state:?}");
                 use construct_client::recovery::RecoveryState;
