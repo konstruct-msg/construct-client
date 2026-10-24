@@ -103,10 +103,26 @@ impl OrchestratorHandle {
         message_id: String,
         content: crate::content::Content,
     ) {
+        let payload = crate::content::encode(&content);
         let _ = self.cmd_tx.send(OrchestratorCommand::Send {
             peer,
             message_id,
             content,
+            payload,
+        });
+    }
+
+    /// Send a `MessageContent` made elsewhere — a file's — to `peer`. Not sent when it reads as
+    /// no message.
+    pub(crate) fn send_payload(&self, peer: String, message_id: String, payload: Vec<u8>) {
+        let Some(content) = crate::content::parse(&payload) else {
+            return tracing::warn!(%message_id, "not a message — not sent");
+        };
+        let _ = self.cmd_tx.send(OrchestratorCommand::Send {
+            peer,
+            message_id,
+            content,
+            payload,
         });
     }
 
@@ -159,6 +175,8 @@ enum OrchestratorCommand {
         peer: String,
         message_id: String,
         content: crate::content::Content,
+        /// `content` as it goes on the wire.
+        payload: Vec<u8>,
     },
     /// Vouch for a device being linked to this account once the directory serves its keys.
     Vouch {
@@ -461,7 +479,8 @@ impl Task {
                 peer,
                 message_id,
                 content,
-            } => self.send_content(peer, message_id, content).await,
+                payload,
+            } => self.send_content(peer, message_id, content, payload).await,
             OrchestratorCommand::Vouch {
                 device_id,
                 evidence,
@@ -1174,9 +1193,16 @@ impl Task {
         peer: String,
         message_id: String,
         content: crate::content::Content,
+        payload: Vec<u8>,
     ) {
-        let payload = crate::content::encode(&content);
-        let is_message = matches!(content, crate::content::Content::Message { .. });
+        // Text the screens learned of from `MessageQueued`; a file they learn of here, once kept.
+        let is_message = matches!(
+            content,
+            crate::content::Content::Message {
+                attachment: None,
+                ..
+            }
+        );
         let placed = place_inbound(
             &self.storage,
             Sender::OwnDevice { partner: &peer },
@@ -1708,6 +1734,10 @@ fn place_inbound(
                 timestamp_ms: now_ms,
                 quote,
                 attachment,
+                media: crate::content::media_files(payload)
+                    .into_iter()
+                    .map(|f| f.info)
+                    .collect(),
                 ..Default::default()
             };
             let stored = if attachment.is_some() && !payload.is_empty() {
@@ -1851,6 +1881,36 @@ mod tests {
         )
         .unwrap();
         assert!(storage.message(id).unwrap().is_some());
+    }
+
+    #[test]
+    fn a_photo_arrives_with_its_file_and_keeps_the_key_to_fetch_it() {
+        let storage = LocalStore::open_in_memory().unwrap();
+        let file = crate::outgoing::Outgoing {
+            kind: crate::content::Attachment::Photo,
+            mime: "image/png".into(),
+            filename: Some("p.png".into()),
+            bytes: b"pixels".to_vec(),
+            width: 3,
+            height: 2,
+        };
+        let sealed = construct_core::media::seal_media(&file.bytes).unwrap();
+        let uploaded = crate::grpc::Uploaded {
+            media_id: "m-9".into(),
+            download_url: String::new(),
+        };
+        let payload = crate::outgoing::content(&file, &uploaded, &sealed, "", None);
+        let content = crate::content::parse(&payload).unwrap();
+        let Some(BridgeEvent::NewMessage { message }) =
+            place_inbound(&storage, Sender::Peer("bob"), "p1", content, &payload, 1).unwrap()
+        else {
+            panic!("a photo is a new message");
+        };
+        assert_eq!(message.media.len(), 1, "the screens are told of its file");
+        assert_eq!((message.media[0].width, message.media[0].height), (3, 2));
+        let held = storage.media_files("p1").unwrap();
+        assert_eq!(held[0].media_id, "m-9");
+        assert_eq!(held[0].key.as_slice(), sealed.key.as_slice());
     }
 
     #[test]

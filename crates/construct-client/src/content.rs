@@ -231,6 +231,124 @@ pub fn reaction_wins(incoming: i64, held: Option<i64>) -> bool {
     held.is_none_or(|held| incoming > held)
 }
 
+/// What the screens show of one file a message carries, before it is fetched. No key, no
+/// server id: those stay with the client ([`MediaFile`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct MediaInfo {
+    pub kind: Option<Attachment>,
+    /// As the sender declared it; nothing here trusts it beyond choosing how to draw the file.
+    pub mime: String,
+    pub filename: Option<String>,
+    /// The file's size as the sender declared it, in bytes; 0 when it did not.
+    pub size: u64,
+    pub width: u32,
+    pub height: u32,
+    pub duration_ms: u32,
+}
+
+/// A file a message carries: where it is on the server and the key that opens it.
+#[derive(Clone, PartialEq, Eq)]
+pub struct MediaFile {
+    pub media_id: String,
+    pub key: zeroize::Zeroizing<Vec<u8>>,
+    pub info: MediaInfo,
+}
+
+impl std::fmt::Debug for MediaFile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MediaFile")
+            .field("media_id", &self.media_id)
+            .field("info", &self.info)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Longest server media id taken; it names a file in the cache, so only `[A-Za-z0-9_-]`.
+const MAX_MEDIA_ID_LEN: usize = 128;
+
+/// The files in a `MessageContent`, in display order: an album's items, a single media, a voice
+/// note. An item without a usable server id or a 32-byte key is left out — nothing could fetch
+/// or open it.
+pub fn media_files(payload: &[u8]) -> Vec<MediaFile> {
+    use crate::proto::messaging::v1::MediaMessage;
+    use message_content::Content as C;
+    let Some(content) = MessageContent::decode(payload).ok().and_then(|c| c.content) else {
+        return Vec::new();
+    };
+    let media = |m: MediaMessage| {
+        let dimensions = m.dimensions.unwrap_or_default();
+        file(
+            &m.media_id,
+            &m.encryption_key,
+            MediaInfo {
+                kind: Some(media_attachment(m.media_type)),
+                mime: m.mime_type,
+                filename: m.filename.as_deref().and_then(safe_filename),
+                size: m.file_size,
+                width: dimensions.width,
+                height: dimensions.height,
+                duration_ms: m.duration_ms.unwrap_or(0),
+            },
+        )
+    };
+    match content {
+        C::Media(m) => media(m).into_iter().collect(),
+        C::MediaAlbum(album) => album.items.into_iter().filter_map(media).collect(),
+        // iOS has no field for the id: `codec` is `mime|mediaId|size` (`MediaWireCodec`).
+        C::Voice(voice) => {
+            let mut parts = voice.codec.split('|');
+            let mime = parts
+                .next()
+                .filter(|m| !m.is_empty())
+                .unwrap_or("audio/m4a");
+            let media_id = parts.next().unwrap_or("");
+            let size = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+            file(
+                media_id,
+                &voice.encryption_key,
+                MediaInfo {
+                    kind: Some(Attachment::Voice),
+                    mime: mime.to_owned(),
+                    size,
+                    duration_ms: voice.duration_ms,
+                    ..Default::default()
+                },
+            )
+            .into_iter()
+            .collect()
+        }
+        _ => Vec::new(),
+    }
+}
+
+fn file(media_id: &str, key: &[u8], info: MediaInfo) -> Option<MediaFile> {
+    (valid_media_id(media_id) && key.len() == construct_core::media::MEDIA_KEY_LEN).then(|| {
+        MediaFile {
+            media_id: media_id.to_owned(),
+            key: zeroize::Zeroizing::new(key.to_vec()),
+            info,
+        }
+    })
+}
+
+/// A server media id this client fetches and names a cache file after.
+pub fn valid_media_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= MAX_MEDIA_ID_LEN
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
+/// The sender's file name as a name to save under: its last path component, without control
+/// characters, not hidden, not empty.
+pub fn safe_filename(name: &str) -> Option<String> {
+    let base = name.rsplit(['/', '\\']).next().unwrap_or("");
+    let clean: String = base.chars().filter(|c| !c.is_control()).take(200).collect();
+    let clean = clean.trim().trim_start_matches('.').trim();
+    (!clean.is_empty()).then(|| clean.to_owned())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -381,5 +499,68 @@ mod tests {
         assert!(reaction_wins(6, Some(5)));
         assert!(!reaction_wins(5, Some(5)));
         assert!(!reaction_wins(4, Some(5)));
+    }
+
+    fn item(media_id: &str, key: &[u8], filename: Option<&str>) -> MediaMessage {
+        MediaMessage {
+            media_type: MediaType::Image as i32,
+            media_id: media_id.into(),
+            encryption_key: key.to_vec().into(),
+            mime_type: "image/jpeg".into(),
+            file_size: 1234,
+            filename: filename.map(Into::into),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn an_album_gives_its_files_in_order_and_drops_what_cannot_be_fetched() {
+        use crate::proto::messaging::v1::MediaAlbumMessage;
+        let key = [9u8; 32];
+        let payload = bytes(message_content::Content::MediaAlbum(MediaAlbumMessage {
+            items: vec![
+                item("a1", &key, Some("../../etc/photo.jpg")),
+                item("../store", &key, None),
+                item("a3", &key[..16], None),
+                item("a4", &key, Some(".hidden")),
+            ],
+            ..Default::default()
+        }));
+        let files = media_files(&payload);
+        let ids: Vec<_> = files.iter().map(|f| f.media_id.as_str()).collect();
+        assert_eq!(ids, ["a1", "a4"], "a path for an id, a short key: left out");
+        assert_eq!(files[0].key.as_slice(), &key);
+        assert_eq!(files[0].info.kind, Some(Attachment::Photo));
+        assert_eq!(files[0].info.size, 1234);
+        assert_eq!(files[0].info.filename.as_deref(), Some("photo.jpg"));
+        assert_eq!(files[1].info.filename.as_deref(), Some("hidden"));
+    }
+
+    #[test]
+    fn a_voice_note_names_its_file_in_the_codec() {
+        use crate::proto::messaging::v1::VoiceMessage;
+        let payload = bytes(message_content::Content::Voice(VoiceMessage {
+            encryption_key: vec![1u8; 32].into(),
+            duration_ms: 4200,
+            codec: "audio/mp4|v-77|5000".into(),
+            ..Default::default()
+        }));
+        let files = media_files(&payload);
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].media_id, "v-77");
+        assert_eq!(files[0].info.mime, "audio/mp4");
+        assert_eq!(files[0].info.size, 5000);
+        assert_eq!(files[0].info.duration_ms, 4200);
+        assert_eq!(files[0].info.kind, Some(Attachment::Voice));
+    }
+
+    #[test]
+    fn text_carries_no_files() {
+        let payload = bytes(message_content::Content::Text(TextMessage {
+            text: "hi".into(),
+            ..Default::default()
+        }));
+        assert!(media_files(&payload).is_empty());
+        assert!(media_files(b"not a proto").is_empty());
     }
 }

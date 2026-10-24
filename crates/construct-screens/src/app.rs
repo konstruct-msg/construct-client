@@ -415,6 +415,8 @@ impl App {
             }
             ClientEvent::RecoveryPhrase(_) => {}
             ClientEvent::RecoveryFailed(reason) => self.status = reason,
+            // The terminal names a file and never asks for one.
+            ClientEvent::Media { .. } => {}
         }
     }
 

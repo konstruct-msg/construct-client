@@ -32,3 +32,6 @@ pub const DEVICE_SUBMIT_JOIN: &str =
     "/shared.proto.services.v1.DeviceLinkService/SubmitJoinRequest";
 pub const DEVICE_CHECK_JOIN: &str =
     "/shared.proto.services.v1.DeviceLinkService/CheckJoinRequestStatus";
+pub const MEDIA_DOWNLOAD: &str = "/shared.proto.services.v1.MediaService/DownloadMedia";
+pub const MEDIA_UPLOAD_TOKEN: &str = "/shared.proto.services.v1.MediaService/GenerateUploadToken";
+pub const MEDIA_UPLOAD: &str = "/shared.proto.services.v1.MediaService/UploadMedia";

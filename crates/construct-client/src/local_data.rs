@@ -69,6 +69,11 @@ impl DataDir {
         self.dir.join(STORE_FILE)
     }
 
+    /// Where fetched attachments are kept, still encrypted (`media::MediaCache`).
+    pub fn media_dir(&self) -> PathBuf {
+        self.dir.join("media")
+    }
+
     /// Whether a store exists here, and how its key is kept. `None` when there is no store.
     pub fn existing(&self) -> Option<KeyKeeping> {
         existing_in(&self.dir)
@@ -102,6 +107,7 @@ impl DataDir {
         // A new account on this device replaces whatever store was here: without its key it was
         // ciphertext nobody could open.
         Store::remove_files(&self.store_path())?;
+        crate::media::MediaCache::wipe(&self.media_dir())?;
         self.remove_leftovers()?;
         let key = random_key();
         if key_file {
