@@ -467,6 +467,17 @@ impl App {
 
     fn handle_bridge_event(&mut self, evt: BridgeEvent) {
         match evt {
+            // A name they shared: the terminal shows names, not pictures.
+            BridgeEvent::ContactUpdated { contact } => {
+                if let Some(c) = self
+                    .chat_list
+                    .contacts
+                    .iter_mut()
+                    .find(|c| c.id == contact.user_id)
+                {
+                    c.display_name = contact.display_name;
+                }
+            }
             // Into the open conversation only if it is the writer's; it went into every
             // conversation that happened to be open until a linked device had several.
             BridgeEvent::NewMessage { message } => {

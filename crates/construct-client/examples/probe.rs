@@ -24,6 +24,9 @@
 //! `--set-username <name>`: change the username first; `--discoverable on|off` likewise;
 //! `--revoke <device id|others>` signs out a device of the account, or all but this one.
 //!
+//! `--profile <name>` [`--avatar <jpeg>`]: set our shared name and picture; `--share-with <id>`:
+//! share our profile with that contact. A profile shared with us prints `CONTACT`.
+//!
 //! `--invite`: once the account's recovery key is in place, mint an invite link and print it.
 //!
 //! `--link` instead of `--username`: become a new device of an existing account — print the
@@ -56,6 +59,9 @@ struct Args {
     set_username: Option<String>,
     discoverable: Option<bool>,
     revoke: Option<String>,
+    profile: Option<String>,
+    avatar: Option<String>,
+    share_with: Option<String>,
     wait_secs: u64,
 }
 
@@ -75,6 +81,9 @@ fn parse_args() -> Args {
         set_username: None,
         discoverable: None,
         revoke: None,
+        profile: None,
+        avatar: None,
+        share_with: None,
         wait_secs: 30,
     };
     let mut it = std::env::args().skip(1);
@@ -95,6 +104,9 @@ fn parse_args() -> Args {
             "--set-username" => args.set_username = Some(value()),
             "--discoverable" => args.discoverable = Some(value() == "on"),
             "--revoke" => args.revoke = Some(value()),
+            "--profile" => args.profile = Some(value()),
+            "--avatar" => args.avatar = Some(value()),
+            "--share-with" => args.share_with = Some(value()),
             "--wait" => args.wait_secs = value().parse().expect("--wait takes seconds"),
             other => panic!("unknown flag {other}"),
         }
@@ -161,6 +173,24 @@ async fn main() {
                 println!("STARTED contacts={}", contacts.len());
                 if let Some(name) = args.set_username.take() {
                     client.send(ClientCommand::ChangeUsername(name));
+                }
+                if let Some(name) = args.profile.take() {
+                    let avatar = match args.avatar.take() {
+                        Some(path) => construct_client::AvatarChange::Set(
+                            std::fs::read(path).expect("--avatar is readable"),
+                        ),
+                        None => construct_client::AvatarChange::Keep,
+                    };
+                    client.send(ClientCommand::SetProfile {
+                        display_name: Some(name),
+                        avatar,
+                    });
+                }
+                if let Some(contact_id) = args.share_with.take() {
+                    client.send(ClientCommand::ShareProfile {
+                        contact_id,
+                        on: true,
+                    });
                 }
                 if let Some(target) = args.revoke.take() {
                     client.send(ClientCommand::RevokeDevices(
@@ -291,6 +321,13 @@ async fn main() {
                 }
             }
             ClientEvent::Bridge(BridgeEvent::Error(e)) => println!("ERROR {e}"),
+            ClientEvent::Bridge(BridgeEvent::ContactUpdated { contact: c }) => println!(
+                "CONTACT {} name={:?} sharing={} avatar={:?}",
+                c.user_id,
+                c.display_name,
+                c.sharing,
+                c.avatar.as_ref().map(Vec::len)
+            ),
             ClientEvent::Bridge(BridgeEvent::UnvouchedDevices {
                 peer_id,
                 device_ids,

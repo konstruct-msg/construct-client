@@ -111,6 +111,7 @@ impl Client {
         // Sealed sends and the server's trust material go on a connection that never carries
         // the token.
         let anonymous = crate::grpc::GrpcClient::new(&self.server_url);
+        let avatars = anonymous.clone();
         let orch_handle = spawn_orchestrator_task(
             orchestrator,
             storage,
@@ -142,6 +143,7 @@ impl Client {
         // AppLaunched triggers the session GC / prewarm sweep.
         orch_handle.send(construct_core::orchestration::actions::IncomingEvent::AppLaunched);
         self.orch_handle = Some(orch_handle.clone());
+        self.profile_chores(avatars);
 
         inbound::spawn_relay(
             stream_rx,

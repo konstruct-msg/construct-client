@@ -19,6 +19,10 @@ pub enum BridgeEvent {
     MessageDeleted { peer_id: String, message_id: String },
     /// A message we sent was acknowledged by the server.
     MessageDelivered { message_id: String },
+    /// A person's name or avatar changed: a profile they shared, or its avatar downloaded.
+    ContactUpdated {
+        contact: crate::local_store::StoredContact,
+    },
     /// Stream connection status changed (connected / disconnected).
     StreamStatus { connected: bool },
     /// Stream is retrying after a drop.
