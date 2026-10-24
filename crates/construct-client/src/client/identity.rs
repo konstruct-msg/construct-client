@@ -81,13 +81,27 @@ impl Client {
                     .into(),
             )));
         };
-        let result = crate::invite::generate_invite_qr(
+        let ttl = crate::invite::QR_TTL_SECONDS;
+        let result = crate::invite::mint(
             &self.user_id,
             &self.device_id,
             &self.server_url,
             signing_key_hex,
-            Some(&address),
+            None,
+            ttl,
+            &address,
         )
+        .and_then(|invite| {
+            // Kept, so it can be revoked while unused; one invite is the QR and the link both.
+            let journal = self
+                .store
+                .as_ref()
+                .map(|store| store.record_issued_invite(&invite.jti, "qr", invite.ts * 1000, ttl));
+            if let Some(Err(e)) = journal {
+                tracing::warn!("invite not kept for revoking: {e}");
+            }
+            invite.https_link()
+        })
         .map_err(|e| format!("{e:#}"));
         self.emit(ClientEvent::InviteMinted(result));
     }

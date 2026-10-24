@@ -219,32 +219,6 @@ fn decode_binary(data: &[u8]) -> Result<Invite> {
     })
 }
 
-/// Mint a v5 QR invite (ttl 300s) as an HTTPS add-link iOS can open.
-///
-/// `addr` is the account's address (its recovery public key). This client does not create a
-/// recovery key yet, so it has no address and cannot mint an invite the server accepts — the
-/// server refuses an `addr` that is not the account's recovery key.
-pub fn generate_invite_qr(
-    user_id: &str,
-    device_id: &str,
-    server_url: &str,
-    signing_key_hex: &str,
-    addr: Option<&[u8]>,
-) -> Result<String> {
-    let addr =
-        addr.context("this account has no address (no recovery key) — cannot mint an invite")?;
-    mint(
-        user_id,
-        device_id,
-        server_url,
-        signing_key_hex,
-        None,
-        QR_TTL_SECONDS,
-        addr,
-    )?
-    .https_link()
-}
-
 pub fn mint(
     user_id: &str,
     device_id: &str,

@@ -31,7 +31,8 @@
 //! `--profile <name>` [`--avatar <jpeg>`]: set our shared name and picture; `--share-with <id>`:
 //! share our profile with that contact. A profile shared with us prints `CONTACT`.
 //!
-//! `--invite`: once the account's recovery key is in place, mint an invite link and print it.
+//! `--invite`: once the account's recovery key is in place, mint an invite link and print it;
+//! with `--revoke-invites`, then revoke every live invite (`INVITES` lists them).
 //!
 //! `--link` instead of `--username`: become a new device of an existing account — print the
 //! `konstruct://link-to-me` code for the phone to scan, then wait for its approval.
@@ -74,6 +75,7 @@ struct Args {
     goodbye: Option<String>,
     offer_link: bool,
     link_code: Option<String>,
+    revoke_invites: bool,
     wait_secs: u64,
 }
 
@@ -100,6 +102,7 @@ fn parse_args() -> Args {
         goodbye: None,
         offer_link: false,
         link_code: None,
+        revoke_invites: false,
         wait_secs: 30,
     };
     let mut it = std::env::args().skip(1);
@@ -126,6 +129,7 @@ fn parse_args() -> Args {
             "--share-with" => args.share_with = Some(value()),
             "--goodbye" => args.goodbye = Some(value()),
             "--offer-link" => args.offer_link = true,
+            "--revoke-invites" => args.revoke_invites = true,
             "--link-code" => args.link_code = Some(value()),
             "--wait" => args.wait_secs = value().parse().expect("--wait takes seconds"),
             other => panic!("unknown flag {other}"),
@@ -390,6 +394,13 @@ async fn main() {
                     "  KEY {:?} media={} bytes in {} files {:?}",
                     s.fingerprint, s.media_bytes, s.media_files, s.media
                 );
+                println!("  INVITES {}", s.invites.len());
+                if args.revoke_invites && !s.invites.is_empty() {
+                    args.revoke_invites = false;
+                    client.send(ClientCommand::RevokeInvites(
+                        s.invites.iter().map(|i| i.jti.clone()).collect(),
+                    ));
+                }
                 for d in &s.devices {
                     println!(
                         "  DEVICE {} current={} described={:?}",
@@ -408,7 +419,12 @@ async fn main() {
                 }
             }
             ClientEvent::InviteMinted(result) => match result {
-                Ok(link) => println!("INVITE {link}"),
+                Ok(link) => {
+                    println!("INVITE {link}");
+                    if args.revoke_invites {
+                        client.send(ClientCommand::LoadSettings);
+                    }
+                }
                 Err(e) => println!("INVITE_FAILED {e}"),
             },
             ClientEvent::LinkCode(code) => {
