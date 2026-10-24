@@ -35,6 +35,18 @@ pub struct AccountSettings {
     pub media_bytes: u64,
     pub media_files: usize,
     pub media: crate::local_store::MediaPrefs,
+    /// Invites this device handed out that may still be redeemed, newest first.
+    pub invites: Vec<InviteEntry>,
+}
+
+/// An invite handed out and not yet expired: revoking it burns it on the server.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InviteEntry {
+    pub jti: String,
+    /// `qr` or `link`, as iOS records it.
+    pub kind: String,
+    pub issued_at_ms: i64,
+    pub expires_at_ms: i64,
 }
 
 /// A key's short fingerprint, as iOS shows it: the first 8 bytes of its SHA-256, in groups of four
@@ -113,6 +125,7 @@ impl Client {
                 media_bytes,
                 media_files,
                 media: store.media_prefs(),
+                invites: live_invites(&store),
             }));
         });
     }
@@ -143,6 +156,48 @@ impl Client {
         }
         cache.evict(prefs.quota, prefs.keep_days);
         self.load_settings();
+    }
+
+    /// Burn invites on the server so nobody can redeem them. One already used or revoked is
+    /// forgotten too; one the server did not answer for stays, to try again.
+    pub(super) fn revoke_invites(&self, jtis: Vec<String>) {
+        let Some(store) = self.store.clone() else {
+            return;
+        };
+        let grpc = self.grpc.clone();
+        let events = self.events.clone();
+        let reload = self.inbox.clone();
+        tokio::spawn(async move {
+            let mut done = Vec::new();
+            let mut used = 0;
+            let mut failed = 0;
+            for jti in jtis {
+                match crate::grpc::revoke_invite(&grpc, &jti).await {
+                    Ok(revoked) => {
+                        used += usize::from(!revoked);
+                        done.push(jti);
+                    }
+                    Err(e) => {
+                        tracing::warn!(jti = %&jti[..8.min(jti.len())], "invite not revoked: {e}");
+                        failed += 1;
+                    }
+                }
+            }
+            if let Err(e) = store.forget_invites(&done) {
+                tracing::warn!("revoked invites not forgotten: {e}");
+            }
+            if failed > 0 {
+                notice(
+                    &events,
+                    format!("{failed} invite(s) not revoked: the server did not answer"),
+                );
+            } else if used > 0 {
+                notice(&events, format!("{used} invite(s) had already been used"));
+            } else if !done.is_empty() {
+                notice(&events, "Revoked: nobody can use it now".into());
+            }
+            let _ = reload.send(super::Inbox::Command(super::ClientCommand::LoadSettings));
+        });
     }
 
     pub(super) fn change_username(&self, raw: String) {
@@ -318,6 +373,26 @@ impl Client {
             let _ = reload.send(super::Inbox::Command(super::ClientCommand::LoadSettings));
         });
     }
+}
+
+fn live_invites(store: &crate::local_store::LocalStore) -> Vec<InviteEntry> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as i64);
+    store
+        .live_invites(now)
+        .unwrap_or_else(|e| {
+            tracing::warn!("invites not read: {e}");
+            Vec::new()
+        })
+        .into_iter()
+        .map(|i| InviteEntry {
+            expires_at_ms: i.issued_at + i64::from(i.ttl_seconds) * 1000,
+            jti: i.jti,
+            kind: i.kind,
+            issued_at_ms: i.issued_at,
+        })
+        .collect()
 }
 
 const PREF_DEVICE_NAME: &str = "pref.device_name";

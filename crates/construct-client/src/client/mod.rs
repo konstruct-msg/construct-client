@@ -11,6 +11,7 @@ mod contacts;
 mod identity;
 mod inbound;
 mod linking;
+mod lock;
 mod messages;
 mod orchestrator;
 mod profile;
@@ -19,8 +20,9 @@ mod tokens;
 
 pub(crate) use auth::AuthMsg;
 pub use contacts::{FindStarted, SearchResult};
+pub use lock::{AppLock, MIN_CODE_LEN};
 pub use profile::AvatarChange;
-pub use settings::{AccountSettings, normalize_username};
+pub use settings::{AccountSettings, InviteEntry, normalize_username};
 
 use tokio::sync::mpsc;
 use zeroize::Zeroizing;
@@ -170,6 +172,18 @@ pub enum ClientCommand {
     DeleteAccount {
         local_only: bool,
     },
+    /// Set, change or remove the app lock's code, or change its delay. Changing or removing a
+    /// code takes the `current` one; `code: None` keeps the code and sets the delay.
+    SetAppLock {
+        current: Option<Zeroizing<String>>,
+        code: Option<Zeroizing<String>>,
+        remove: bool,
+        delay_secs: u32,
+    },
+    /// A code handed in at the lock screen.
+    UnlockApp(Zeroizing<String>),
+    /// Burn invites this device handed out, by their `jti`, so nobody can redeem them.
+    RevokeInvites(Vec<String>),
     /// Delete every fetched attachment.
     ClearMediaCache,
     /// How attachments are fetched and kept.
@@ -244,6 +258,12 @@ pub enum ClientEvent {
     /// The offer ended: the device that linked with it, or why not.
     LinkOfferEnded(Result<String, String>),
     LoggedOut,
+    /// Whether the app lock is on, and its delay: after start and after each change.
+    AppLock(AppLock),
+    /// The code handed in matched, or why it did not.
+    AppUnlocked(Result<(), String>),
+    /// A change to the app lock was refused, and why.
+    AppLockRefused(String),
     /// The server did not delete the account; nothing was wiped. The reason, for the person.
     DeleteAccountFailed(String),
     /// Where the account's recovery key stands, for this device. Sent after each start and
@@ -362,6 +382,7 @@ pub(crate) struct Client {
     /// Our hybrid signature key: with the identity key, what a link code's `fp` pins.
     our_hybrid_key: Option<Vec<u8>>,
     offer_task: Option<tokio::task::AbortHandle>,
+    lock_tries: lock::Tries,
     orch_handle: Option<crate::orchestrator_task::OrchestratorHandle>,
     stream_tx: Option<mpsc::Sender<crate::streaming::StreamCmd>>,
     /// The people the stream is subscribed for, in the order they were added.
@@ -402,6 +423,7 @@ impl Client {
             our_identity_key: None,
             our_hybrid_key: None,
             offer_task: None,
+            lock_tries: Default::default(),
             orch_handle: None,
             stream_tx: None,
             contact_ids: Vec::new(),
@@ -484,6 +506,14 @@ impl Client {
             ClientCommand::LogoutEverywhere => self.sign_out(true),
             ClientCommand::DeleteAccount { local_only } => self.delete_account(local_only),
             ClientCommand::ClearMediaCache => self.clear_media_cache(),
+            ClientCommand::RevokeInvites(jtis) => self.revoke_invites(jtis),
+            ClientCommand::SetAppLock {
+                current,
+                code,
+                remove,
+                delay_secs,
+            } => self.set_app_lock(current, code, remove, delay_secs),
+            ClientCommand::UnlockApp(code) => self.unlock_app(code),
             ClientCommand::SetMediaPrefs(prefs) => self.set_media_prefs(prefs),
         }
     }

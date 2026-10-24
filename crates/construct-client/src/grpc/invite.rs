@@ -3,7 +3,10 @@
 use prost::Message;
 
 use crate::invite::Invite;
-use crate::proto::services::v1::{AcceptInviteRequest, AcceptInviteResponse, InviteToken};
+use crate::proto::services::v1::{
+    AcceptInviteRequest, AcceptInviteResponse, InviteToken, RevokeInviteRequest,
+    RevokeInviteResponse,
+};
 
 use super::client::GrpcClient;
 use super::error::GrpcError;
@@ -50,4 +53,18 @@ pub async fn accept_invite(
     Ok(AcceptedInvite {
         user_id: resp.user_id,
     })
+}
+
+/// `InviteService.RevokeInvite`: burn an unused invite. `Ok(false)`: it was already used or
+/// revoked — an answer, not an error (iOS `InviteRevocation`).
+pub async fn revoke_invite(client: &GrpcClient, jti: &str) -> Result<bool, GrpcError> {
+    let req = RevokeInviteRequest {
+        jti: jti.to_owned(),
+    };
+    let bytes = client
+        .unary(paths::INVITE_REVOKE, &req.encode_to_vec())
+        .await?;
+    let resp = RevokeInviteResponse::decode(bytes.as_slice())
+        .map_err(|e| GrpcError::transport(format!("RevokeInvite decode: {e}")))?;
+    Ok(resp.success)
 }

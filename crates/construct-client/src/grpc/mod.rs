@@ -39,7 +39,7 @@ pub use auth::{
 };
 pub use client::GrpcClient;
 pub use error::GrpcError;
-pub use invite::accept_invite;
+pub use invite::{accept_invite, revoke_invite};
 #[cfg(test)]
 pub(crate) use keys::device_bundles;
 pub use keys::{

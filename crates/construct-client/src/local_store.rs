@@ -9,8 +9,8 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use construct_store::{
-    Chat, Contact, Message, OwnProfile, PeerDevice, PendingChunk, Reaction, Store, delivery,
-    payload,
+    Chat, Contact, IssuedInvite, Message, OwnProfile, PeerDevice, PendingChunk, Reaction, Store,
+    delivery, payload,
 };
 
 pub use crate::content::{Attachment, MediaInfo, Quote};
@@ -218,6 +218,42 @@ impl LocalStore {
         v.extend_from_slice(&prefs.quota.unwrap_or(0).to_le_bytes());
         v.extend_from_slice(&prefs.keep_days.unwrap_or(0).to_le_bytes());
         self.secure_save(PREF_MEDIA, &v)
+    }
+
+    /// An invite this device handed out, so it can be revoked while unused (iOS `InviteJournal`;
+    /// the server keeps no list of them).
+    pub fn record_issued_invite(
+        &self,
+        jti: &str,
+        kind: &str,
+        issued_at_ms: i64,
+        ttl: u32,
+    ) -> Result<()> {
+        Ok(self.store.record_issued_invite(&IssuedInvite {
+            jti: jti.to_owned(),
+            kind: kind.to_owned(),
+            issued_at: issued_at_ms,
+            ttl_seconds: ttl,
+            sitting: None,
+        })?)
+    }
+
+    /// The invites still redeemable at `now_ms`, newest first; the expired are forgotten.
+    pub fn live_invites(&self, now_ms: i64) -> Result<Vec<IssuedInvite>> {
+        let (live, expired): (Vec<_>, Vec<_>) = self
+            .store
+            .issued_invites()?
+            .into_iter()
+            .partition(|i| i.issued_at + i64::from(i.ttl_seconds) * 1000 > now_ms);
+        if !expired.is_empty() {
+            let jtis: Vec<String> = expired.into_iter().map(|i| i.jti).collect();
+            self.store.delete_issued_invites(&jtis)?;
+        }
+        Ok(live)
+    }
+
+    pub fn forget_invites(&self, jtis: &[String]) -> Result<()> {
+        Ok(self.store.delete_issued_invites(jtis)?)
     }
 
     /// Our username, as last set from this device: the server does not tell it back
@@ -882,6 +918,26 @@ mod tests {
             timestamp_ms: ts,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn an_expired_invite_is_forgotten_and_a_live_one_kept() {
+        let s = LocalStore::open_in_memory().unwrap();
+        s.record_issued_invite("old", "qr", 1_000, 300).unwrap();
+        s.record_issued_invite("new", "qr", 500_000, 300).unwrap();
+        // At 600 s the first (ended at 301 s) is gone; the second lasts to 800 s.
+        let live = s.live_invites(600_000).unwrap();
+        assert_eq!(
+            live.iter().map(|i| i.jti.as_str()).collect::<Vec<_>>(),
+            ["new"]
+        );
+        assert_eq!(
+            s.store.issued_invites().unwrap().len(),
+            1,
+            "the expired row is deleted"
+        );
+        s.forget_invites(&["new".into()]).unwrap();
+        assert!(s.live_invites(600_000).unwrap().is_empty());
     }
 
     #[test]
