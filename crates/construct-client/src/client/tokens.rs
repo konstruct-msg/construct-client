@@ -90,6 +90,7 @@ impl Client {
                         pending_save: Some(full),
                         key_record: None,
                         link_cursor: None,
+                        username: None,
                     }))
                 }
                 Err(e) => AuthMsg::Failure(format!("Device re-auth failed: {e}")),

@@ -136,32 +136,66 @@ pub async fn download_media(
     media_id: &str,
     max_len: usize,
 ) -> Result<Vec<u8>, GrpcError> {
-    let mut send_req = anonymous.send_request_handle().await?;
-    let builder = Request::builder()
-        .method("POST")
-        .uri(MEDIA_DOWNLOAD)
-        .header("host", anonymous.authority());
-    let req = apply_auth_headers(builder, None, None)
-        .body(())
-        .map_err(|e| GrpcError::transport(format!("build request: {e}")))?;
-    let (resp_fut, mut send) = send_req
-        .send_request(req, false)
-        .map_err(|e| GrpcError::transport(format!("DownloadMedia: {e}")))?;
     let request = DownloadMediaRequest {
         media_id: media_id.to_owned(),
         ..Default::default()
     };
-    send_h2_data(&mut send, encode_frame(&request.encode_to_vec())).await?;
+    let mut blob = Vec::new();
+    server_streaming(
+        anonymous,
+        MEDIA_DOWNLOAD,
+        &request.encode_to_vec(),
+        false,
+        |message| {
+            let part = DownloadMediaResponse::decode(message)
+                .map_err(|e| GrpcError::transport(format!("DownloadMedia decode: {e}")))?;
+            if blob.len() + part.chunk.len() > max_len {
+                return Err(GrpcError::transport("DownloadMedia: larger than any media"));
+            }
+            blob.extend_from_slice(&part.chunk);
+            Ok(())
+        },
+    )
+    .await?;
+    Ok(blob)
+}
+
+/// A server-streaming call: one request, then each response message to `on_message` as it
+/// arrives. `signed_in`: with the client's token, else with none at all.
+pub(crate) async fn server_streaming(
+    client: &GrpcClient,
+    path: &str,
+    request: &[u8],
+    signed_in: bool,
+    mut on_message: impl FnMut(Bytes) -> Result<(), GrpcError>,
+) -> Result<(), GrpcError> {
+    let mut send_req = client.send_request_handle().await?;
+    let (token, device_id) = if signed_in {
+        client.auth_headers()
+    } else {
+        (None, None)
+    };
+    let builder = Request::builder()
+        .method("POST")
+        .uri(path)
+        .header("host", client.authority());
+    let req = apply_auth_headers(builder, token.as_deref(), device_id.as_deref())
+        .body(())
+        .map_err(|e| GrpcError::transport(format!("build request: {e}")))?;
+    let (resp_fut, mut send) = send_req
+        .send_request(req, false)
+        .map_err(|e| GrpcError::transport(format!("'{path}': {e}")))?;
+    send_h2_data(&mut send, encode_frame(request)).await?;
     send.send_data(Bytes::new(), true)
         .map_err(|e| GrpcError::transport(format!("end stream: {e}")))?;
 
     let response = tokio::time::timeout(IDLE_TIMEOUT, resp_fut)
         .await
-        .map_err(|_| GrpcError::transport("DownloadMedia timed out"))?
-        .map_err(|e| GrpcError::transport(format!("DownloadMedia response: {e}")))?;
+        .map_err(|_| GrpcError::transport(format!("'{path}' timed out")))?
+        .map_err(|e| GrpcError::transport(format!("'{path}' response: {e}")))?;
     if response.status() != http::StatusCode::OK {
         return Err(GrpcError::transport(format!(
-            "DownloadMedia HTTP {}",
+            "'{path}' HTTP {}",
             response.status()
         )));
     }
@@ -169,31 +203,27 @@ pub async fn download_media(
 
     let mut recv = response.into_body();
     let mut frames = BytesMut::new();
-    let mut blob = Vec::new();
     loop {
         let chunk = match tokio::time::timeout(IDLE_TIMEOUT, recv.data()).await {
-            Err(_) => return Err(GrpcError::transport("DownloadMedia stalled")),
+            Err(_) => return Err(GrpcError::transport(format!("'{path}' stalled"))),
             Ok(None) => break,
             Ok(Some(chunk)) => chunk.map_err(|e| GrpcError::transport(format!("recv: {e}")))?,
         };
         let _ = recv.flow_control().release_capacity(chunk.len());
         frames.extend_from_slice(&chunk);
         for message in take_messages(&mut frames)? {
-            let part = DownloadMediaResponse::decode(message)
-                .map_err(|e| GrpcError::transport(format!("DownloadMedia decode: {e}")))?;
-            if blob.len() + part.chunk.len() > max_len {
-                return Err(GrpcError::transport("DownloadMedia: larger than any media"));
-            }
-            blob.extend_from_slice(&part.chunk);
+            on_message(message)?;
         }
     }
     if let Ok(Some(trailers)) = recv.trailers().await {
         check_grpc_status(&trailers)?;
     }
     if !frames.is_empty() {
-        return Err(GrpcError::transport("DownloadMedia: cut off mid-message"));
+        return Err(GrpcError::transport(format!(
+            "'{path}': cut off mid-message"
+        )));
     }
-    Ok(blob)
+    Ok(())
 }
 
 /// The whole gRPC messages at the front of `buf`, taken out of it; a partial one stays.

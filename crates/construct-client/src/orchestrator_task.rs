@@ -1051,10 +1051,15 @@ impl Task {
 
     /// A delivery receipt (ct 14) for `message_id` back to the device that wrote it. Queued as
     /// a follow-up so it is written on the session the message just arrived on.
+    /// None when the person turned receipts off: then no sender learns that this device got
+    /// their message (iOS `DeliveryReceiptPreference`).
     fn delivery_receipt(&self, device: &str, message_id: &str) -> Option<IncomingEvent> {
         use crate::proto::signaling::v1::{
             DeliveryReceipt, DirectReceipt, ReceiptStatus, delivery_receipt::ReceiptType,
         };
+        if !self.storage.sends_delivery_receipts() {
+            return None;
+        }
         let account = self.address_of(device)?.0;
         let receipt = DeliveryReceipt {
             receipt_type: Some(ReceiptType::Direct(DirectReceipt {
@@ -2229,6 +2234,22 @@ mod tests {
 
         let messages = task.storage.get_messages("bob", 10).unwrap();
         assert_eq!(messages[0].delivery_status, "delivered");
+    }
+
+    #[test]
+    fn no_receipt_is_sent_once_they_are_turned_off() {
+        let mut task = test_task();
+        let key = vec![4u8; 32];
+        let device = construct_core::device_id::derive_device_id(&key);
+        task.peers.record(&task.storage, "bob", &device, &key);
+        assert!(
+            task.storage.sends_delivery_receipts(),
+            "on until turned off"
+        );
+        task.storage.set_sends_delivery_receipts(false).unwrap();
+        assert!(task.delivery_receipt(&device, "server-9").is_none());
+        task.storage.set_sends_delivery_receipts(true).unwrap();
+        assert!(task.delivery_receipt(&device, "server-9").is_some());
     }
 
     #[test]

@@ -34,6 +34,8 @@ pub(crate) struct AuthSuccess {
     pub(super) key_record: Option<Vec<u8>>,
     /// Where a linked device starts reading the stream.
     pub(super) link_cursor: Option<String>,
+    /// The username a new account was registered with; the server does not tell it back.
+    pub(super) username: Option<String>,
 }
 
 /// Where the session (keys and tokens) lives in the store.
@@ -199,6 +201,7 @@ impl Client {
                         pending_save: result.session,
                         key_record: None,
                         link_cursor: None,
+                        username: None,
                     }))
                 }
                 Err(e) => AuthMsg::Failure(format!("{e:#}")),
@@ -237,6 +240,7 @@ impl Client {
                         pending_save: result.session,
                         key_record: None,
                         link_cursor: None,
+                        username: name,
                     }))
                 }
                 Err(e) => AuthMsg::Failure(format!("{e:#}")),
@@ -274,6 +278,7 @@ impl Client {
                         pending_save: result.session,
                         key_record: Some(linked.key_record),
                         link_cursor,
+                        username: None,
                     }))
                 }
                 Err(e) => AuthMsg::Failure(format!("{e:#}")),
@@ -303,7 +308,9 @@ impl Client {
             pending_save,
             key_record,
             link_cursor,
+            username,
         } = success;
+        self.pending_username = username;
         self.pending_link = key_record.map(|record| (record, link_cursor));
         self.user_id = user_id;
         self.device_id = device_id.clone();
@@ -400,6 +407,7 @@ impl Client {
                 pending_save: Some(session),
                 key_record: Some(prep.key_record),
                 link_cursor,
+                username: None,
             }))));
         });
         self.link_task = Some(task.abort_handle());

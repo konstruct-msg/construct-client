@@ -52,6 +52,10 @@ pub struct StoredReaction {
     pub emoji: String,
 }
 
+const PREF_DELIVERY_RECEIPTS: &str = "pref.delivery_receipts";
+const PREF_DISCOVERABLE: &str = "pref.discoverable";
+const PREF_OWN_USERNAME: &str = "pref.own_username";
+
 /// How long a split message waits for its missing frames (iOS `PendingReassemblyStore`).
 const CHUNK_RETENTION_MS: i64 = 24 * 60 * 60 * 1000;
 
@@ -134,6 +138,46 @@ impl LocalStore {
 
     pub fn secure_delete(&self, key: &str) -> Result<()> {
         Ok(self.store.remove(key)?)
+    }
+
+    // ── Choices the person made in settings, kept with the rest of the account ──
+
+    /// Whether this device tells senders a message arrived (iOS `sendDeliveryReceipts`, on by
+    /// default).
+    pub fn sends_delivery_receipts(&self) -> bool {
+        self.flag(PREF_DELIVERY_RECEIPTS).unwrap_or(true)
+    }
+
+    pub fn set_sends_delivery_receipts(&self, on: bool) -> Result<()> {
+        self.secure_save(PREF_DELIVERY_RECEIPTS, &[u8::from(on)])
+    }
+
+    /// Whether the account can be found by its username, as last set here; the server does not
+    /// say (iOS keeps it the same way).
+    pub fn discoverable(&self) -> Option<bool> {
+        self.flag(PREF_DISCOVERABLE)
+    }
+
+    pub fn set_discoverable(&self, on: bool) -> Result<()> {
+        self.secure_save(PREF_DISCOVERABLE, &[u8::from(on)])
+    }
+
+    /// Our username, as last set from this device: the server does not tell it back
+    /// (`GetUserProfile` leaves it out for our own account), so it is kept here, as on iOS.
+    pub fn own_username(&self) -> Option<String> {
+        let bytes = self.secure_load(PREF_OWN_USERNAME).ok()??;
+        String::from_utf8(bytes).ok().filter(|u| !u.is_empty())
+    }
+
+    pub fn set_own_username(&self, username: &str) -> Result<()> {
+        self.secure_save(PREF_OWN_USERNAME, username.as_bytes())
+    }
+
+    fn flag(&self, key: &str) -> Option<bool> {
+        match self.secure_load(key) {
+            Ok(Some(v)) => v.first().map(|b| *b != 0),
+            _ => None,
+        }
     }
 
     // ── Stream cursor (Redis stream id, advanced only after durable persist) ──
@@ -499,11 +543,9 @@ fn view_contact(c: Contact) -> StoredContact {
             .as_deref()
             .map(|k| base64::engine::general_purpose::STANDARD.encode(k))
             .unwrap_or_default(),
-        display_name: if c.display_name.is_empty() {
-            c.username
-        } else {
-            c.display_name
-        },
+        // As iOS names a person: the name they shared, their username, or the one generated
+        // from their id — never a blank or a raw id.
+        display_name: crate::names::resolved(&c.display_name, &c.username, &c.id),
         user_id: c.id,
     }
 }

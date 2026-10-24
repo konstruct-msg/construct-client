@@ -417,6 +417,8 @@ impl App {
             ClientEvent::RecoveryFailed(reason) => self.status = reason,
             // The terminal names a file and never asks for one.
             ClientEvent::Media { .. } => {}
+            // The terminal has no settings screen.
+            ClientEvent::Settings(_) => {}
         }
     }
 
