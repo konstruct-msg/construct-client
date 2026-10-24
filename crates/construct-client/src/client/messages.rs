@@ -96,6 +96,81 @@ impl Client {
         }
     }
 
+    /// Send a file the person chose: prepared (a photo loses its metadata), sealed by the core,
+    /// uploaded, then sent like any message. Runs aside; the screens see it once it is kept
+    /// ([`crate::bridge::BridgeEvent::OwnMessage`]), and a failure as a notice.
+    pub(super) fn send_file(
+        &self,
+        contact_id: String,
+        name: String,
+        bytes: Vec<u8>,
+        caption: String,
+    ) {
+        let Some(orch) = self.orch_handle.clone() else {
+            return;
+        };
+        let grpc = self.grpc.clone();
+        let events = self.events.clone();
+        tokio::spawn(async move {
+            let fail = |reason: String| {
+                tracing::warn!("file not sent: {reason}");
+                let _ = events.send(ClientEvent::Notice(format!("File not sent: {reason}")));
+            };
+            let file = crate::outgoing::prepare(&name, bytes);
+            let sealed = match construct_core::media::seal_media(&file.bytes) {
+                Ok(sealed) => sealed,
+                Err(e) => return fail(e.to_string()),
+            };
+            let uploaded =
+                match crate::grpc::upload_media(&grpc, &sealed.blob, &sealed.sha256).await {
+                    Ok(uploaded) => uploaded,
+                    Err(e) => return fail(e.to_string()),
+                };
+            tracing::info!(media_id = %uploaded.media_id, kind = ?file.kind, "file uploaded");
+            let payload = crate::outgoing::content(&file, &uploaded, &sealed, &caption, None);
+            orch.send_payload(contact_id, Uuid::new_v4().to_string(), payload);
+        });
+    }
+
+    /// Fetch and open file `index` of message `message_id`; the result comes as
+    /// [`ClientEvent::Media`]. Runs aside, so a large download holds up nothing else.
+    pub(super) fn load_media(&self, message_id: String, index: usize) {
+        let (Some(store), Some(data)) = (self.store.as_ref(), self.data.as_ref()) else {
+            return;
+        };
+        let file = match store.media_files(&message_id) {
+            Ok(mut files) if index < files.len() => files.swap_remove(index),
+            Ok(_) => {
+                return self.emit(ClientEvent::Media {
+                    message_id,
+                    index,
+                    result: Err("the message carries no such file".into()),
+                });
+            }
+            Err(e) => {
+                return self.emit(ClientEvent::Media {
+                    message_id,
+                    index,
+                    result: Err(e.to_string()),
+                });
+            }
+        };
+        let cache = crate::media::MediaCache::new(data.media_dir());
+        let anonymous = self.anonymous.clone();
+        let events = self.events.clone();
+        tokio::spawn(async move {
+            let result = crate::media::open(&cache, &anonymous, &file).await;
+            if let Err(e) = &result {
+                tracing::warn!("media {} not opened: {e}", file.media_id);
+            }
+            let _ = events.send(ClientEvent::Media {
+                message_id,
+                index,
+                result,
+            });
+        });
+    }
+
     /// An edit or a reaction, under an id of its own (iOS: a fresh action id each).
     fn send_action(&self, peer: String, content: Content) {
         if let Some(ref orch) = self.orch_handle {

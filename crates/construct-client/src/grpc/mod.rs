@@ -10,6 +10,7 @@
 //! Layout:
 //! - [`client`] — connection, unary, token
 //! - [`stream`] — MessageStream bidi
+//! - [`media`] — attachment downloads
 //! - [`auth`] / [`keys`] / [`users`] — typed RPCs
 
 mod auth;
@@ -19,6 +20,7 @@ mod error;
 pub(crate) mod framing;
 mod invite;
 mod keys;
+mod media;
 mod paths;
 mod sealed;
 mod stream;
@@ -40,6 +42,7 @@ pub use keys::{
     get_pre_key_bundles, get_prekey_count, get_signed_prekey_age, rotate_signed_prekey,
     upload_prekeys_full,
 };
+pub use media::{Uploaded, download_media, upload_media};
 pub use sealed::{
     SenderCertificate, get_sender_certificate, get_server_trust_delegations, send_own_device_copy,
     send_sealed_message,

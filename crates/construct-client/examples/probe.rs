@@ -17,6 +17,9 @@
 //! `--answer <text>`: to the first message that arrives, reply with `text`, react 👍, then edit
 //! the reply — the message actions, end to end.
 //!
+//! `--file <path>`: with `--add`, send that file too (a photo goes without its metadata). A file
+//! that arrives is fetched, opened and written to `$HOME/received-<name>`; `MEDIA` names it.
+//!
 //! `--invite`: once the account's recovery key is in place, mint an invite link and print it.
 //!
 //! `--link` instead of `--username`: become a new device of an existing account — print the
@@ -44,6 +47,7 @@ struct Args {
     approve: Option<String>,
     invite: bool,
     answer: Option<String>,
+    file: Option<String>,
     wait_secs: u64,
 }
 
@@ -58,6 +62,7 @@ fn parse_args() -> Args {
         approve: None,
         invite: false,
         answer: None,
+        file: None,
         wait_secs: 30,
     };
     let mut it = std::env::args().skip(1);
@@ -73,6 +78,7 @@ fn parse_args() -> Args {
             "--approve" => args.approve = Some(value()),
             "--invite" => args.invite = true,
             "--answer" => args.answer = Some(value()),
+            "--file" => args.file = Some(value()),
             "--wait" => args.wait_secs = value().parse().expect("--wait takes seconds"),
             other => panic!("unknown flag {other}"),
         }
@@ -177,7 +183,16 @@ async fn main() {
                         contact_id: user_id.clone(),
                         text,
                     });
-                    sent = Some(user_id);
+                    sent = Some(user_id.clone());
+                }
+                if let Some(path) = args.file.take() {
+                    let bytes = std::fs::read(&path).expect("--file is readable");
+                    client.send(ClientCommand::SendFile {
+                        contact_id: user_id,
+                        name: path,
+                        bytes,
+                        caption: "a file from the probe".into(),
+                    });
                 }
             }
             ClientEvent::Bridge(BridgeEvent::NewMessage { message: m }) => {
@@ -185,6 +200,13 @@ async fn main() {
                     "RECEIVED from={} id={} text={:?} quote={:?} attachment={:?}",
                     m.peer_id, m.id, m.text, m.quote, m.attachment
                 );
+                for (index, info) in m.media.iter().enumerate() {
+                    println!("  FILE {index} {info:?}");
+                    client.send(ClientCommand::LoadMedia {
+                        message_id: m.id.clone(),
+                        index,
+                    });
+                }
                 if let Some(text) = args.answer.take() {
                     client.send(ClientCommand::Reply {
                         contact_id: m.peer_id.clone(),
@@ -199,8 +221,32 @@ async fn main() {
                 }
             }
             ClientEvent::Bridge(BridgeEvent::OwnMessage { message: m }) => {
-                println!("OWN_COPY to={} id={} text={:?}", m.peer_id, m.id, m.text);
+                println!(
+                    "OWN_COPY to={} id={} text={:?} media={:?}",
+                    m.peer_id, m.id, m.text, m.media
+                );
             }
+            ClientEvent::Media {
+                message_id,
+                index,
+                result,
+            } => match result {
+                Ok(media) => {
+                    let name = media
+                        .filename
+                        .unwrap_or_else(|| format!("{message_id}-{index}"));
+                    let path = std::path::Path::new(&std::env::var("HOME").unwrap_or_default())
+                        .join(format!("received-{name}"));
+                    std::fs::write(&path, &media.bytes).expect("written");
+                    println!(
+                        "MEDIA {message_id} {index} {} bytes {} -> {}",
+                        media.bytes.len(),
+                        media.mime,
+                        path.display()
+                    );
+                }
+                Err(e) => println!("MEDIA_FAILED {message_id} {index} {e}"),
+            },
             ClientEvent::Bridge(BridgeEvent::MessageChanged { message: m }) => {
                 println!(
                     "CHANGED id={} text={:?} edited={} reactions={:?}",
