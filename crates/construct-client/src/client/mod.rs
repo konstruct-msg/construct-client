@@ -83,6 +83,15 @@ pub enum ClientCommand {
     ExportIdentityKey,
     /// Mint an invite for our QR code.
     MintInvite,
+    /// Show the recovery phrase that waits for its copy ([`ClientEvent::RecoveryPhrase`]).
+    RevealRecoveryPhrase,
+    /// The copy is made: words of the phrase by position (from 0), as the person gives them
+    /// back. Right — the phrase is erased from this device.
+    ConfirmRecoveryCopy {
+        answers: Vec<(usize, String)>,
+    },
+    /// The recovery phrase, typed on a device that did not make it, so it learns the address.
+    EnterRecoveryPhrase(Zeroizing<String>),
     Logout,
 }
 
@@ -138,6 +147,13 @@ pub enum ClientEvent {
     /// Linking stopped: refused, expired, or the server could not be reached.
     LinkFailed(String),
     LoggedOut,
+    /// Where the account's recovery key stands, for this device. Sent after each start and
+    /// whenever it changes.
+    Recovery(crate::recovery::RecoveryState),
+    /// The phrase waiting for its copy, or why it cannot be shown.
+    RecoveryPhrase(Result<Zeroizing<String>, String>),
+    /// A recovery command failed: the copy check, or a typed phrase.
+    RecoveryFailed(String),
     /// A one-line message for the user.
     Notice(String),
 }
@@ -166,6 +182,8 @@ enum Inbox {
         user_id: String,
         username: String,
     },
+    /// The recovery key's state after background work.
+    Recovery(crate::recovery::RecoveryState),
 }
 
 /// The front end's end of the client: send commands, nothing else.
@@ -284,6 +302,7 @@ impl Client {
                 Inbox::TokenRefresh(msg) => self.apply_token_refresh(msg),
                 Inbox::StreamAuthRequired => self.refresh_token_now(),
                 Inbox::InviteAccepted { user_id, username } => self.add_contact(user_id, username),
+                Inbox::Recovery(state) => self.emit(ClientEvent::Recovery(state)),
             }
         }
     }
@@ -309,6 +328,9 @@ impl Client {
             ClientCommand::SafetyNumber { contact_id } => self.safety_number(contact_id),
             ClientCommand::ExportIdentityKey => self.export_identity_key(),
             ClientCommand::MintInvite => self.mint_invite(),
+            ClientCommand::RevealRecoveryPhrase => self.reveal_recovery_phrase(),
+            ClientCommand::ConfirmRecoveryCopy { answers } => self.confirm_recovery_copy(&answers),
+            ClientCommand::EnterRecoveryPhrase(phrase) => self.enter_recovery_phrase(phrase),
             ClientCommand::Logout => self.logout(),
         }
     }

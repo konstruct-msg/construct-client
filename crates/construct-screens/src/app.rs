@@ -398,6 +398,22 @@ impl App {
             }
             ClientEvent::LoggedOut => self.reset_after_logout(),
             ClientEvent::Notice(text) => self.status = text,
+            // The terminal has no screen for the phrase yet: it says where things stand.
+            ClientEvent::Recovery(state) => {
+                use construct_client::recovery::RecoveryState;
+                match state {
+                    RecoveryState::CopyPending => {
+                        self.status = "Recovery key made; its phrase still needs a copy".into()
+                    }
+                    RecoveryState::NeedsPhrase => {
+                        self.status =
+                            "This device needs the recovery phrase before it can show a QR".into()
+                    }
+                    RecoveryState::Ready | RecoveryState::Unknown => {}
+                }
+            }
+            ClientEvent::RecoveryPhrase(_) => {}
+            ClientEvent::RecoveryFailed(reason) => self.status = reason,
         }
     }
 

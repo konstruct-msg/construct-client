@@ -176,6 +176,61 @@ pub async fn publish_device_certificate(
     }
 }
 
+/// `GetRecoveryStatus`: whether the account has a recovery key, and the server's fingerprint of
+/// it — the key's leading hex, for comparing with a key derived on this device.
+pub struct RecoveryStatus {
+    pub is_setup: bool,
+    pub fingerprint: Option<String>,
+}
+
+/// `AuthService.GetRecoveryStatus` — authenticated, for this account.
+pub async fn get_recovery_status(client: &GrpcClient) -> Result<RecoveryStatus, GrpcError> {
+    use crate::proto::services::v1::{GetRecoveryStatusRequest, GetRecoveryStatusResponse};
+    let bytes = client
+        .unary(
+            paths::AUTH_RECOVERY_STATUS,
+            &GetRecoveryStatusRequest {}.encode_to_vec(),
+        )
+        .await?;
+    let resp = GetRecoveryStatusResponse::decode(bytes.as_slice())
+        .map_err(|e| GrpcError::transport(format!("GetRecoveryStatus decode: {e}")))?;
+    Ok(RecoveryStatus {
+        is_setup: resp.is_setup,
+        fingerprint: resp.fingerprint.filter(|f| !f.is_empty()),
+    })
+}
+
+/// `AuthService.SetRecoveryKey` — authenticated: the account's recovery public key, with a
+/// signature by it over `CONSTRUCT_RECOVERY_SETUP:{user_id}:{timestamp}`. The same key twice is
+/// accepted; another key than the one set is refused with gRPC 6 (ALREADY_EXISTS).
+pub async fn set_recovery_key(
+    client: &GrpcClient,
+    public_key: &[u8],
+    signature: &[u8],
+    timestamp: i64,
+) -> Result<(), GrpcError> {
+    use crate::proto::services::v1::{SetRecoveryKeyRequest, SetRecoveryKeyResponse};
+    let req = SetRecoveryKeyRequest {
+        recovery_public_key: public_key.to_vec().into(),
+        setup_signature: signature.to_vec().into(),
+        timestamp,
+        ..Default::default()
+    };
+    let bytes = client
+        .unary(paths::AUTH_SET_RECOVERY_KEY, &req.encode_to_vec())
+        .await?;
+    let resp = SetRecoveryKeyResponse::decode(bytes.as_slice())
+        .map_err(|e| GrpcError::transport(format!("SetRecoveryKey decode: {e}")))?;
+    if resp.success {
+        Ok(())
+    } else {
+        Err(GrpcError::status(
+            2,
+            resp.error.unwrap_or_else(|| "recovery key not set".into()),
+        ))
+    }
+}
+
 /// This device's keys for the phone to approve (Flow B): what `SubmitJoinRequest` carries.
 pub struct JoinRequest {
     pub device_id: String,

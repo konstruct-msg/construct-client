@@ -22,6 +22,7 @@ mod own_copy;
 mod peers;
 mod prekeys;
 mod proto;
+pub mod recovery;
 mod sealing;
 mod streaming;
 mod trust;

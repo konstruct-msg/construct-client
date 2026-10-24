@@ -14,6 +14,8 @@
 //! or just its `id`) become a device of this account — what the phone does when it scans the
 //! code — and vouches for it when the code carries `fp`.
 //!
+//! `--invite`: once the account's recovery key is in place, mint an invite link and print it.
+//!
 //! `--link` instead of `--username`: become a new device of an existing account — print the
 //! `konstruct://link-to-me` code for the phone to scan, then wait for its approval.
 //!
@@ -37,6 +39,7 @@ struct Args {
     send: Option<String>,
     link: bool,
     approve: Option<String>,
+    invite: bool,
     wait_secs: u64,
 }
 
@@ -49,6 +52,7 @@ fn parse_args() -> Args {
         send: None,
         link: false,
         approve: None,
+        invite: false,
         wait_secs: 30,
     };
     let mut it = std::env::args().skip(1);
@@ -62,6 +66,7 @@ fn parse_args() -> Args {
             "--send" => args.send = Some(value()),
             "--link" => args.link = true,
             "--approve" => args.approve = Some(value()),
+            "--invite" => args.invite = true,
             "--wait" => args.wait_secs = value().parse().expect("--wait takes seconds"),
             other => panic!("unknown flag {other}"),
         }
@@ -184,6 +189,18 @@ async fn main() {
             ClientEvent::MessageQueued { message_id, .. } => println!("QUEUED {message_id}"),
             ClientEvent::RegistrationStep(step) => println!("STEP {step:?}"),
             ClientEvent::Notice(n) => println!("NOTICE {n}"),
+            ClientEvent::Recovery(state) => {
+                println!("RECOVERY {state:?}");
+                use construct_client::recovery::RecoveryState;
+                if args.invite && matches!(state, RecoveryState::CopyPending | RecoveryState::Ready)
+                {
+                    client.send(ClientCommand::MintInvite);
+                }
+            }
+            ClientEvent::InviteMinted(result) => match result {
+                Ok(link) => println!("INVITE {link}"),
+                Err(e) => println!("INVITE_FAILED {e}"),
+            },
             ClientEvent::LinkCode(code) => {
                 started = true;
                 println!("LINK_CODE {code}");
