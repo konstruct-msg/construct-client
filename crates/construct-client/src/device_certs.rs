@@ -83,7 +83,6 @@ pub(crate) enum Evidence {
     /// Flow B: the new device's code carried the fingerprint of its keys.
     QrFingerprint(Vec<u8>),
     /// Flow A: our code carried `secret`; the new device answered with `proof`.
-    #[allow(dead_code)] // this client shows no Flow A code yet
     QrSecret { secret: Vec<u8>, proof: Vec<u8> },
 }
 

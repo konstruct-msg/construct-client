@@ -133,6 +133,60 @@ pub async fn confirm_device_link(
     tokens_from(resp.tokens)
 }
 
+/// `DeviceService.InitiateDeviceLink` — authenticated: a token for a new device to present, and
+/// when it expires (Unix seconds).
+pub async fn initiate_device_link(client: &GrpcClient) -> Result<(String, i64), GrpcError> {
+    use crate::proto::services::v1::{InitiateDeviceLinkRequest, InitiateDeviceLinkResponse};
+    let bytes = client
+        .unary(
+            paths::DEVICE_INITIATE_LINK,
+            &InitiateDeviceLinkRequest {}.encode_to_vec(),
+        )
+        .await?;
+    let resp = InitiateDeviceLinkResponse::decode(bytes.as_slice())
+        .map_err(|e| GrpcError::transport(format!("InitiateDeviceLink decode: {e}")))?;
+    if resp.link_token.is_empty() {
+        return Err(GrpcError::transport("the server gave no link token"));
+    }
+    Ok((resp.link_token, resp.expires_at))
+}
+
+/// What became of a link token this device handed out.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LinkResult {
+    Pending,
+    /// A device linked with it, and answered the code's secret with `proof`.
+    Confirmed {
+        device_id: String,
+        proof: Vec<u8>,
+    },
+    Expired,
+}
+
+/// `DeviceService.GetDeviceLinkResult` — authenticated.
+pub async fn device_link_result(client: &GrpcClient, token: &str) -> Result<LinkResult, GrpcError> {
+    use crate::proto::services::v1::{
+        GetDeviceLinkResultRequest, GetDeviceLinkResultResponse,
+        get_device_link_result_response::Status,
+    };
+    let req = GetDeviceLinkResultRequest {
+        link_token: token.to_owned(),
+    };
+    let bytes = client
+        .unary(paths::DEVICE_LINK_RESULT, &req.encode_to_vec())
+        .await?;
+    let resp = GetDeviceLinkResultResponse::decode(bytes.as_slice())
+        .map_err(|e| GrpcError::transport(format!("GetDeviceLinkResult decode: {e}")))?;
+    Ok(match resp.status() {
+        Status::Pending => LinkResult::Pending,
+        Status::Confirmed if !resp.device_id.is_empty() => LinkResult::Confirmed {
+            device_id: resp.device_id,
+            proof: resp.link_key_proof.to_vec(),
+        },
+        Status::Confirmed | Status::Expired => LinkResult::Expired,
+    })
+}
+
 /// `AuthService.ApproveJoinRequest` — authenticated: a device of this account lets the device
 /// that asked to join become one of its devices.
 pub async fn approve_join_request(client: &GrpcClient, device_id: &str) -> Result<(), GrpcError> {
