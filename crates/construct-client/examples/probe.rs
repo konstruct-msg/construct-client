@@ -43,7 +43,8 @@
 //!
 //! `--history-to <device id> --history-file <path>`: once started, write this device's history
 //! to that file for that device of the account (`HISTORY_EXPORTED`); `--import-history <path>`:
-//! read one (`HISTORY_IMPORTED`).
+//! read one (`HISTORY_IMPORTED`). `--history-nearby-to <device id>`: send it over the local
+//! network to that device, which takes it by itself while it runs (`HISTORY_NEARBY` steps).
 //!
 //! `--find <username or invite link>` instead of `--add`: a username is looked up (only accounts
 //! that made themselves discoverable are found), an invite link is redeemed; either is added and
@@ -83,6 +84,7 @@ struct Args {
     history_to: Option<String>,
     history_file: Option<String>,
     import_history: Option<String>,
+    history_nearby_to: Option<String>,
     wait_secs: u64,
 }
 
@@ -113,6 +115,7 @@ fn parse_args() -> Args {
         history_to: None,
         history_file: None,
         import_history: None,
+        history_nearby_to: None,
         wait_secs: 30,
     };
     let mut it = std::env::args().skip(1);
@@ -143,6 +146,7 @@ fn parse_args() -> Args {
             "--history-to" => args.history_to = Some(value()),
             "--history-file" => args.history_file = Some(value()),
             "--import-history" => args.import_history = Some(value()),
+            "--history-nearby-to" => args.history_nearby_to = Some(value()),
             "--link-code" => args.link_code = Some(value()),
             "--wait" => args.wait_secs = value().parse().expect("--wait takes seconds"),
             other => panic!("unknown flag {other}"),
@@ -258,6 +262,9 @@ async fn main() {
                 }
                 if let Some(path) = args.import_history.take() {
                     client.send(ClientCommand::ImportHistory(path.into()));
+                }
+                if let Some(device_id) = args.history_nearby_to.take() {
+                    client.send(ClientCommand::OfferHistoryNearby { device_id });
                 }
                 match args.goodbye.as_deref() {
                     Some("logout") => client.send(ClientCommand::Logout),
@@ -461,6 +468,7 @@ async fn main() {
             ClientEvent::LinkOfferEnded(ended) => println!("LINK_OFFER_ENDED {ended:?}"),
             ClientEvent::HistoryExported(result) => println!("HISTORY_EXPORTED {result:?}"),
             ClientEvent::HistoryImported(result) => println!("HISTORY_IMPORTED {result:?}"),
+            ClientEvent::HistoryNearby(step) => println!("HISTORY_NEARBY {step:?}"),
             ClientEvent::LoggedOut if args.goodbye.is_some() => {
                 println!("LOGGED_OUT");
                 return;

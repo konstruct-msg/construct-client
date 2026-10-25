@@ -191,6 +191,13 @@ pub enum ClientCommand {
     },
     /// Read a history file another device of the account wrote for this one.
     ImportHistory(std::path::PathBuf),
+    /// Send this device's history to `device_id`, another device of the account on the same
+    /// network, which takes it by itself while it runs.
+    OfferHistoryNearby {
+        device_id: String,
+    },
+    /// Stop a transfer over the local network, either way.
+    CancelHistoryNearby,
     /// Burn invites this device handed out, by their `jti`, so nobody can redeem them.
     RevokeInvites(Vec<String>),
     /// Delete every fetched attachment.
@@ -270,7 +277,10 @@ pub enum ClientEvent {
     /// A history file was written, and where; or why not.
     HistoryExported(Result<(crate::history::HistorySummary, std::path::PathBuf), String>),
     /// A history file was read into the store (a `Started` with the contacts follows); or why not.
+    /// Also how history received over the local network lands.
     HistoryImported(Result<crate::history::HistorySummary, String>),
+    /// Where a transfer over the local network stands.
+    HistoryNearby(crate::history::NearbyStep),
     /// Whether the app lock is on, and its delay: after start and after each change.
     AppLock(AppLock),
     /// The code handed in matched, or why it did not.
@@ -407,6 +417,10 @@ pub(crate) struct Client {
     contact_ids: Vec<String>,
     /// A link waiting for the phone's approval.
     link_task: Option<tokio::task::AbortHandle>,
+    /// History being sent over the local network.
+    nearby_task: Option<tokio::task::AbortHandle>,
+    /// Waiting, while signed in, for history another device offers this one.
+    history_listener: Option<tokio::task::AbortHandle>,
     /// This device's X25519 identity secret, to open the device descriptions sealed to it.
     identity_secret: Option<Zeroizing<Vec<u8>>>,
     /// The username a new account registered with, until there is a store to keep it in.
@@ -446,6 +460,8 @@ impl Client {
             stream_tx: None,
             contact_ids: Vec::new(),
             link_task: None,
+            nearby_task: None,
+            history_listener: None,
             pending_link: None,
             pending_username: None,
             identity_secret: None,
@@ -532,6 +548,8 @@ impl Client {
                 self.export_history(device_id, path)
             }
             ClientCommand::ImportHistory(path) => self.import_history(path),
+            ClientCommand::OfferHistoryNearby { device_id } => self.offer_history_nearby(device_id),
+            ClientCommand::CancelHistoryNearby => self.cancel_history_nearby(),
             ClientCommand::SetAppLock {
                 current,
                 code,

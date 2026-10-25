@@ -155,6 +155,7 @@ impl Client {
         self.orch_handle = Some(orch_handle.clone());
         self.profile_chores(avatars);
         self.publish_device_description(false);
+        self.start_history_listener(std::time::Duration::ZERO);
 
         inbound::spawn_relay(
             stream_rx,
