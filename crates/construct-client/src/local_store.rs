@@ -56,9 +56,20 @@ pub struct StoredReaction {
 const PREF_DELIVERY_RECEIPTS: &str = "pref.delivery_receipts";
 const PREF_DISCOVERABLE: &str = "pref.discoverable";
 const PREF_MEDIA: &str = "pref.media";
+const PREF_MEDIA_LOCAL_KEY: &str = "media.local_key.";
 
 /// How long a split message waits for its missing frames (iOS `PendingReassemblyStore`).
 const CHUNK_RETENTION_MS: i64 = 24 * 60 * 60 * 1000;
+
+/// The rows a history export reads: messages with their chat's peer, oldest first.
+pub(crate) struct HistoryRows {
+    pub contacts: Vec<Contact>,
+    pub chats: Vec<Chat>,
+    pub messages: Vec<(Message, Option<String>)>,
+    pub reactions: Vec<Reaction>,
+    pub peer_devices: Vec<PeerDevice>,
+    pub calls: Vec<construct_store::CallRecord>,
+}
 
 /// How attachments are fetched and kept, as iOS offers it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -438,6 +449,95 @@ impl LocalStore {
 
     // ── Messages ──────────────────────────────────────────────────────────────
 
+    // ── History transfer: the rows it reads and writes (crate::history) ──
+
+    /// Everything a history export carries, as the store holds it.
+    pub(crate) fn history_rows(&self) -> Result<HistoryRows> {
+        let chats = self.store.chats()?;
+        let peer_of: std::collections::HashMap<String, String> = chats
+            .iter()
+            .map(|c| (c.id.clone(), c.peer_id.clone()))
+            .collect();
+        let mut messages = Vec::new();
+        let mut after: Option<(String, String)> = None;
+        loop {
+            let page = self
+                .store
+                .all_messages_after(after.as_ref().map(|(k, i)| (k.as_str(), i.as_str())), 500)?;
+            let Some(last) = page.last() else { break };
+            after = Some((last.order_key.clone(), last.id.clone()));
+            for mut m in page {
+                // This client never stored a profile share as a message: a 1 is its old mark
+                // for an ordinary one (see `content_type`).
+                if m.content_type == 1 {
+                    m.content_type = 0;
+                }
+                let peer = peer_of.get(&m.chat_id).cloned();
+                messages.push((m, peer));
+            }
+        }
+        messages.sort_by(|a, b| {
+            a.0.timestamp
+                .cmp(&b.0.timestamp)
+                .then_with(|| a.0.id.cmp(&b.0.id))
+        });
+        Ok(HistoryRows {
+            contacts: self.store.every_contact(Some(&self.own_account))?,
+            chats,
+            messages,
+            reactions: self.store.all_reactions()?,
+            peer_devices: self.store.all_peer_devices()?,
+            calls: self.store.calls(u32::MAX)?,
+        })
+    }
+
+    /// The key this device sealed an imported file with (`MediaCache::keep_imported`).
+    pub fn media_local_key(&self, media_id: &str) -> Option<zeroize::Zeroizing<Vec<u8>>> {
+        self.secure_load(&format!("{PREF_MEDIA_LOCAL_KEY}{media_id}"))
+            .ok()
+            .flatten()
+            .map(zeroize::Zeroizing::new)
+    }
+
+    pub fn set_media_local_key(&self, media_id: &str, key: &[u8]) -> Result<()> {
+        self.secure_save(&format!("{PREF_MEDIA_LOCAL_KEY}{media_id}"), key)
+    }
+
+    /// The store, for the history importer's merges (`construct_core::history::project`).
+    pub(crate) fn raw(&self) -> &Store {
+        &self.store
+    }
+
+    /// A message a history transfer brought, into the chat with `peer`; the chat's line follows
+    /// it when it is the newest. `false`: already held, left as it was.
+    pub(crate) fn import_history_message(&self, mut m: Message, peer: &str) -> Result<bool> {
+        let chat_id = self.chat_with(peer)?;
+        m.chat_id = chat_id.clone();
+        let search = match payload::Payload::decode(&m.body) {
+            payload::Payload::Text(t) => Some(t.to_string()),
+            _ => None,
+        };
+        let added = matches!(
+            self.store.insert_message(&m, search.as_deref())?,
+            construct_store::Insert::Inserted
+        );
+        let newer = self
+            .store
+            .chat(&chat_id)?
+            .is_none_or(|c| c.last_message_time.is_none_or(|t| t <= m.timestamp));
+        if added && newer {
+            let line = preview(&view_message(m.clone(), peer, &[]));
+            self.store
+                .set_chat_preview(&chat_id, Some(&line), Some(m.timestamp))?;
+        }
+        Ok(added)
+    }
+
+    /// The chat with `peer`, made if there is none yet.
+    pub(crate) fn chat_for(&self, peer: &str) -> Result<String> {
+        self.chat_with(peer)
+    }
+
     /// The chat with `peer`, made on first use. One chat per peer; its id is the peer's account.
     fn chat_with(&self, peer: &str) -> Result<String> {
         if let Some(chat) = self.store.chat_for_peer(peer)? {
@@ -482,7 +582,7 @@ impl LocalStore {
                 timestamp: msg.timestamp_ms,
                 order_key: payload::local_order_key(msg.timestamp_ms, &msg.id),
                 body,
-                content_type: 1,
+                content_type: content_type(msg),
                 delivery_status: if sent_by_me {
                     delivery::SENDING
                 } else {
@@ -855,6 +955,13 @@ fn view_message(m: Message, peer: &str, reactions: &[Reaction]) -> StoredMessage
         peer_id: peer.to_string(),
         timestamp_ms: m.timestamp,
     }
+}
+
+/// iOS `MessageContentType`: 0 a message, 2 one with a file. Until 2026-10-25 every row was
+/// written 1, which iOS reads as a profile share — not transcript — so a history export (the
+/// core's) would leave them out; [`LocalStore::history_rows`] reads 1 as 0.
+fn content_type(msg: &StoredMessage) -> i16 {
+    if msg.attachment.is_some() { 2 } else { 0 }
 }
 
 /// The chat list's line for a message: its text, or what it carries.

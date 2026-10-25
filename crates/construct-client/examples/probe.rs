@@ -41,6 +41,10 @@
 //! to link with it; `--link-code <code>` instead of `--username`: become a device of the account
 //! that showed it.
 //!
+//! `--history-to <device id> --history-file <path>`: once started, write this device's history
+//! to that file for that device of the account (`HISTORY_EXPORTED`); `--import-history <path>`:
+//! read one (`HISTORY_IMPORTED`).
+//!
 //! `--find <username or invite link>` instead of `--add`: a username is looked up (only accounts
 //! that made themselves discoverable are found), an invite link is redeemed; either is added and
 //! sent to.
@@ -76,6 +80,9 @@ struct Args {
     offer_link: bool,
     link_code: Option<String>,
     revoke_invites: bool,
+    history_to: Option<String>,
+    history_file: Option<String>,
+    import_history: Option<String>,
     wait_secs: u64,
 }
 
@@ -103,6 +110,9 @@ fn parse_args() -> Args {
         offer_link: false,
         link_code: None,
         revoke_invites: false,
+        history_to: None,
+        history_file: None,
+        import_history: None,
         wait_secs: 30,
     };
     let mut it = std::env::args().skip(1);
@@ -130,6 +140,9 @@ fn parse_args() -> Args {
             "--goodbye" => args.goodbye = Some(value()),
             "--offer-link" => args.offer_link = true,
             "--revoke-invites" => args.revoke_invites = true,
+            "--history-to" => args.history_to = Some(value()),
+            "--history-file" => args.history_file = Some(value()),
+            "--import-history" => args.import_history = Some(value()),
             "--link-code" => args.link_code = Some(value()),
             "--wait" => args.wait_secs = value().parse().expect("--wait takes seconds"),
             other => panic!("unknown flag {other}"),
@@ -235,6 +248,16 @@ async fn main() {
                 }
                 if args.offer_link {
                     client.send(ClientCommand::OfferLink);
+                }
+                if let (Some(device_id), Some(path)) = (args.history_to.take(), &args.history_file)
+                {
+                    client.send(ClientCommand::ExportHistory {
+                        device_id,
+                        path: path.into(),
+                    });
+                }
+                if let Some(path) = args.import_history.take() {
+                    client.send(ClientCommand::ImportHistory(path.into()));
                 }
                 match args.goodbye.as_deref() {
                     Some("logout") => client.send(ClientCommand::Logout),
@@ -436,6 +459,8 @@ async fn main() {
                 println!("LINK_OFFER {} expires_at={expires_at}", code.as_str())
             }
             ClientEvent::LinkOfferEnded(ended) => println!("LINK_OFFER_ENDED {ended:?}"),
+            ClientEvent::HistoryExported(result) => println!("HISTORY_EXPORTED {result:?}"),
+            ClientEvent::HistoryImported(result) => println!("HISTORY_IMPORTED {result:?}"),
             ClientEvent::LoggedOut if args.goodbye.is_some() => {
                 println!("LOGGED_OUT");
                 return;

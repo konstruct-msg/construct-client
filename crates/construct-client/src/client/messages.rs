@@ -156,10 +156,17 @@ impl Client {
             }
         };
         let cache = crate::media::MediaCache::new(data.media_dir());
+        let local_key = store.media_local_key(&file.media_id);
         let anonymous = self.anonymous.clone();
         let events = self.events.clone();
         tokio::spawn(async move {
-            let result = crate::media::open(&cache, &anonymous, &file).await;
+            let result = crate::media::open(
+                &cache,
+                &anonymous,
+                &file,
+                local_key.as_deref().map(|k| &k[..]),
+            )
+            .await;
             if let Err(e) = &result {
                 tracing::warn!("media {} not opened: {e}", file.media_id);
             }

@@ -15,6 +15,7 @@ pub mod content;
 pub mod device_certs;
 pub mod device_meta;
 mod grpc;
+pub mod history;
 mod invite;
 mod knst;
 mod local_data;

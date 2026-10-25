@@ -126,6 +126,47 @@ impl OrchestratorHandle {
         });
     }
 
+    /// A sender of a history file for `peer`, keyed by this device.
+    pub(crate) async fn history_file_sender(
+        &self,
+        user_id: [u8; 16],
+        peer: construct_core::history::session::PeerKeys,
+    ) -> Result<construct_core::history::session::Sender, String> {
+        let (reply, answer) = tokio::sync::oneshot::channel();
+        self.cmd_tx
+            .send(OrchestratorCommand::History(HistoryJob::FileSender {
+                user_id,
+                peer,
+                reply,
+            }))
+            .map_err(|_| "the session has stopped".to_string())?;
+        answer
+            .await
+            .map_err(|_| "the session has stopped".to_string())?
+            .map_err(|f| f.as_str().to_string())
+    }
+
+    /// Hand a waiting history receiver the sending device's keys.
+    pub(crate) async fn history_accept(
+        &self,
+        receiver: Box<construct_core::history::session::Receiver>,
+        known: construct_core::history::frames::KnownKeys,
+        pin: construct_core::history::frames::Pin,
+    ) -> Result<HistoryAccepted, String> {
+        let (reply, answer) = tokio::sync::oneshot::channel();
+        self.cmd_tx
+            .send(OrchestratorCommand::History(HistoryJob::Accept {
+                receiver,
+                known,
+                pin,
+                reply,
+            }))
+            .map_err(|_| "the session has stopped".to_string())?;
+        answer
+            .await
+            .map_err(|_| "the session has stopped".to_string())
+    }
+
     /// Our profile to every device of `peer`.
     pub(crate) fn send_profile(&self, peer: String, payload: Vec<u8>) {
         let _ = self.cmd_tx.send(OrchestratorCommand::SendControl {
@@ -142,6 +183,13 @@ impl OrchestratorHandle {
             .send(OrchestratorCommand::ServerDelegations { delegations });
     }
 }
+
+/// A history receiver back from `accept`, and what it returned: a nearby reply to write, or for a
+/// file nothing.
+pub(crate) type HistoryAccepted = (
+    Box<construct_core::history::session::Receiver>,
+    Result<Option<Vec<u8>>, construct_core::history::HistoryFailure>,
+);
 
 #[derive(Debug, Clone)]
 pub(crate) struct StreamMessageContext {
@@ -163,8 +211,40 @@ impl StreamMessageContext {
     }
 }
 
-#[derive(Debug, Clone)]
+/// Work on a history transfer that needs this device's keys, which the orchestrator holds.
+enum HistoryJob {
+    /// A history file for another device of the account: the sender, keyed by this device.
+    FileSender {
+        user_id: [u8; 16],
+        peer: construct_core::history::session::PeerKeys,
+        reply: tokio::sync::oneshot::Sender<
+            Result<
+                construct_core::history::session::Sender,
+                construct_core::history::HistoryFailure,
+            >,
+        >,
+    },
+    /// The keys a history receiver waits for: verified and agreed with this device's keys.
+    Accept {
+        receiver: Box<construct_core::history::session::Receiver>,
+        known: construct_core::history::frames::KnownKeys,
+        pin: construct_core::history::frames::Pin,
+        reply: tokio::sync::oneshot::Sender<HistoryAccepted>,
+    },
+}
+
+impl std::fmt::Debug for HistoryJob {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::FileSender { .. } => "HistoryJob::FileSender",
+            Self::Accept { .. } => "HistoryJob::Accept",
+        })
+    }
+}
+
+#[derive(Debug)]
 enum OrchestratorCommand {
+    History(HistoryJob),
     ForgetContact {
         contact_id: String,
     },
@@ -506,6 +586,26 @@ impl Task {
 
     async fn handle_command(&mut self, command: OrchestratorCommand) {
         match command {
+            OrchestratorCommand::History(HistoryJob::FileSender {
+                user_id,
+                peer,
+                reply,
+            }) => {
+                let _ = reply.send(construct_core::history::session::Sender::file(
+                    &self.orchestrator,
+                    user_id,
+                    &peer,
+                ));
+            }
+            OrchestratorCommand::History(HistoryJob::Accept {
+                mut receiver,
+                known,
+                pin,
+                reply,
+            }) => {
+                let result = receiver.accept(&self.orchestrator, &known, &pin);
+                let _ = reply.send((receiver, result));
+            }
             OrchestratorCommand::ForgetContact { contact_id } => self.forget_contact(&contact_id),
             OrchestratorCommand::RememberContact { contact_id } => {
                 tracing::debug!(%contact_id, "remembered contact for stream routing");

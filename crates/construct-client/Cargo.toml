@@ -16,7 +16,7 @@ post-quantum = ["construct-core/post-quantum"]
 [dependencies]
 # Crypto (Orchestrator). Production public host (ams.konstruct.cc) is HTTP/2; QUIC/H3 is
 # quic.konstruct.cc with a pinned gateway cert (iOS construct-transport), not this client.
-construct-core = { path = "../../../construct-core" }
+construct-core = { path = "../../../construct-core", features = ["store"] }
 
 # gRPC over HTTP/2
 h2 = "0.4"
