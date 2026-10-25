@@ -79,6 +79,7 @@ pub(crate) async fn advertise(instance: &str) -> Result<Advertised, String> {
     .map_err(mdns)?
     .enable_addr_auto();
     let fullname = info.get_fullname().to_string();
+    tracing::info!(%instance, port, "history: offered on the local network");
     daemon.0.register(info).map_err(mdns)?;
     Ok(Advertised {
         daemon,
@@ -138,11 +139,19 @@ pub(crate) async fn connect(instance: &str) -> Result<TcpStream, String> {
 async fn find(daemon: &ServiceDaemon, instance: &str) -> Result<Vec<SocketAddr>, String> {
     let events = daemon.browse(SERVICE_TYPE).map_err(mdns)?;
     let wanted = format!("{instance}.{SERVICE_TYPE}");
+    tracing::info!(%instance, "history: looking for the other device on the local network");
     loop {
         let event = events
             .recv_async()
             .await
             .map_err(|_| "local network: the search stopped".to_string())?;
+        if let ServiceEvent::ServiceResolved(service) = &event {
+            tracing::info!(
+                name = %service.fullname,
+                addresses = ?service.get_addresses_v4(),
+                "history: a transfer is offered on the local network"
+            );
+        }
         if let ServiceEvent::ServiceResolved(service) = event
             && service.fullname.eq_ignore_ascii_case(&wanted)
         {
