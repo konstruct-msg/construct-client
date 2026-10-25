@@ -598,6 +598,7 @@ impl Client {
     fn stop_session(&mut self) {
         // Dropping the handle stops the orchestrator task; the stream worker is told.
         self.orch_handle = None;
+        self.stop_history_listener();
         if let Some(ref tx) = self.stream_tx.take() {
             let _ = tx.try_send(crate::streaming::StreamCmd::Shutdown);
         }

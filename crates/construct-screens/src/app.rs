@@ -420,6 +420,7 @@ impl App {
                 self.status = match step {
                     NearbyStep::Waiting => "History: waiting for the other device…".into(),
                     NearbyStep::Moving => "History: transferring…".into(),
+                    NearbyStep::Receiving => "History: receiving from another device…".into(),
                     NearbyStep::Sent(s) => {
                         format!("History sent: {} messages, {} files", s.messages, s.media)
                     }

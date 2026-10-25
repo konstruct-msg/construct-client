@@ -2,9 +2,17 @@
 //! (`crate::history`).
 
 use std::path::PathBuf;
+use std::time::Duration;
 
 use super::{Client, ClientEvent, Inbox};
 use crate::history::NearbyStep;
+
+/// After the listener could not use the network, or an offer went away, it looks again this much
+/// later.
+const LISTEN_AGAIN: Duration = Duration::from_secs(5);
+
+/// A transfer cancelled here is not taken again for this long.
+const LISTEN_AFTER_CANCEL: Duration = Duration::from_secs(30);
 
 impl Client {
     pub(super) fn export_history(&mut self, device_id: String, path: PathBuf) {
@@ -106,49 +114,73 @@ impl Client {
         self.nearby_task = Some(task.abort_handle());
     }
 
-    pub(super) fn receive_history_nearby(&mut self) {
-        self.cancel_history_nearby();
+    /// Listen, while signed in, for another device of the account offering its history to this
+    /// one, and take it when it comes (`history::receive_nearby`); then listen again. `after`
+    /// holds it back, so a cancelled transfer is not picked up again at once.
+    pub(super) fn start_history_listener(&mut self, after: Duration) {
+        self.stop_history_listener();
         let (Some(store), Some(orch)) = (self.store.clone(), self.orch_handle.clone()) else {
-            return self.emit(ClientEvent::HistoryNearby(NearbyStep::Failed(
-                "not signed in".into(),
-            )));
+            return;
         };
         let cache = match self.data_dir() {
             Ok(data) => crate::media::MediaCache::new(data.media_dir()),
-            Err(e) => return self.emit(ClientEvent::HistoryNearby(NearbyStep::Failed(e))),
+            Err(e) => return tracing::warn!("history listener not started: {e}"),
         };
         let grpc = self.grpc.clone();
         let (user_id, own_device) = (self.user_id.clone(), self.device_id.clone());
         let (events, inbox) = (self.events.clone(), self.inbox.clone());
         let task = tokio::spawn(async move {
+            tokio::time::sleep(after).await;
             let step = |s| {
                 let _ = events.send(ClientEvent::HistoryNearby(s));
             };
-            let (summary, contacts, stopped) = crate::history::receive_nearby(
-                &orch,
-                &grpc,
-                &store,
-                &cache,
-                &user_id,
-                &own_device,
-                step,
-            )
-            .await;
-            tracing::info!(?summary, "history received over the local network");
-            if summary != crate::history::HistorySummary::default() || stopped.is_none() {
-                let _ = inbox.send(Inbox::HistoryImported { summary, contacts });
-            }
-            if let Some(e) = stopped {
-                tracing::warn!("history transfer over the local network stopped: {e}");
-                step(NearbyStep::Failed(e));
+            loop {
+                match crate::history::receive_nearby(
+                    &orch,
+                    &grpc,
+                    &store,
+                    &cache,
+                    &user_id,
+                    &own_device,
+                    step,
+                )
+                .await
+                {
+                    Ok((summary, contacts, stopped)) => {
+                        tracing::info!(?summary, "history received over the local network");
+                        if summary != crate::history::HistorySummary::default() || stopped.is_none()
+                        {
+                            let _ = inbox.send(Inbox::HistoryImported { summary, contacts });
+                        }
+                        if let Some(e) = stopped {
+                            tracing::warn!("history transfer over the local network stopped: {e}");
+                            step(NearbyStep::Failed(e));
+                        }
+                    }
+                    Err(e) => {
+                        tracing::info!("history listener: {e}");
+                        tokio::time::sleep(LISTEN_AGAIN).await;
+                    }
+                }
             }
         });
-        self.nearby_task = Some(task.abort_handle());
+        self.history_listener = Some(task.abort_handle());
     }
 
+    pub(super) fn stop_history_listener(&mut self) {
+        if let Some(task) = self.history_listener.take() {
+            task.abort();
+        }
+    }
+
+    /// Stop a transfer either way. One being received stops with the listener, which starts
+    /// again a little later.
     pub(super) fn cancel_history_nearby(&mut self) {
         if let Some(task) = self.nearby_task.take() {
             task.abort();
+        }
+        if self.history_listener.is_some() {
+            self.start_history_listener(LISTEN_AFTER_CANCEL);
         }
     }
 

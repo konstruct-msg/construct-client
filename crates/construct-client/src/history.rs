@@ -42,10 +42,13 @@ pub struct HistorySummary {
 /// Where a transfer over the local network stands.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NearbyStep {
-    /// Waiting for the other device to appear on this network.
+    /// Sending: waiting for the other device to connect.
     Waiting,
-    /// Connected; history is moving.
+    /// Sending: connected; history is moving.
     Moving,
+    /// Another device of the account connected and is sending its history here. Nobody asked
+    /// for it on this device: it was asked for on the sending one.
+    Receiving,
     /// Everything was sent.
     Sent(HistorySummary),
     /// The other device declined to send.
@@ -61,6 +64,9 @@ const FLUSH_AT: usize = 1 << 20;
 const PHASE_TRANSCRIPT: u32 = 1;
 const PHASE_MEDIA: u32 = 2;
 const PHASE_BOTH: u32 = 3;
+
+/// After the transcript, how long the sending device may take to offer the files.
+const MEDIA_PHASE_WAIT: Duration = Duration::from_secs(2 * 60);
 
 /// How long a device that connected may take to answer the opening.
 const REPLY_WAIT: Duration = Duration::from_secs(60);
@@ -491,9 +497,14 @@ pub(crate) async fn offer_nearby(
 /// it did — a cut second phase keeps the first.
 pub(crate) type Landed = (HistorySummary, Vec<String>, Option<String>);
 
-/// Take history another device of the account offers over the local network: find it by the name
-/// both compute for this device, connect, and import a phase per connection until the files are in
-/// (or it sends everything at once, or declines).
+/// Wait for another device of the account to offer history to this one over the local network —
+/// it is advertised under the name both compute for this device — and import a phase per
+/// connection until the files are in (or it sends everything at once, or declines). The person
+/// chose to send on that device; here it is taken without asking again, since the core admits
+/// only a device of this account that signs for itself, and an import only adds.
+///
+/// `Err` when nothing was received: the network was not usable, or the offer went away before it
+/// could be taken. Nothing to tell the person.
 pub(crate) async fn receive_nearby(
     orch: &OrchestratorHandle,
     grpc: &GrpcClient,
@@ -502,18 +513,21 @@ pub(crate) async fn receive_nearby(
     user_id: &str,
     own_device: &str,
     step: impl Fn(NearbyStep),
-) -> Landed {
+) -> Result<Landed, String> {
     let instance = instance_for(user_id, own_device);
+    let user = account_raw(user_id)?;
+    let first = crate::nearby::connect(&instance, None).await?;
+    step(NearbyStep::Receiving);
     let mut importer = Importer::new(store, cache);
-    let user = match account_raw(user_id) {
-        Ok(user) => user,
-        Err(e) => return (importer.summary, importer.contacts, Some(e)),
-    };
+    let mut stream = Some(first);
     loop {
-        step(NearbyStep::Waiting);
         let received = async {
-            let stream = crate::nearby::connect(&instance).await?;
-            step(NearbyStep::Moving);
+            let stream = match stream.take() {
+                Some(stream) => stream,
+                None => crate::nearby::connect(&instance, Some(MEDIA_PHASE_WAIT))
+                    .await
+                    .map_err(|e| format!("the files did not follow: {e}"))?,
+            };
             receive_stream(
                 stream,
                 Source::Nearby,
@@ -526,14 +540,15 @@ pub(crate) async fn receive_nearby(
             .await
         }
         .await;
+        let landed = |e| Ok((importer.summary.clone(), importer.contacts.clone(), e));
         match received {
             Ok(Received::Phase(PHASE_TRANSCRIPT)) => continue,
-            Ok(Received::Phase(_)) => return (importer.summary, importer.contacts, None),
+            Ok(Received::Phase(_)) => return landed(None),
             Ok(Received::Skipped) => {
                 step(NearbyStep::Skipped);
-                return (importer.summary, importer.contacts, None);
+                return landed(None);
             }
-            Err(e) => return (importer.summary, importer.contacts, Some(e)),
+            Err(e) => return landed(Some(e)),
         }
     }
 }

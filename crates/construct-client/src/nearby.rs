@@ -112,15 +112,18 @@ impl Drop for Advertised {
     }
 }
 
-/// Find `instance` on the local network and connect to it, within [`WAIT`].
-pub(crate) async fn connect(instance: &str) -> Result<TcpStream, String> {
+/// Find `instance` on the local network and connect to it, within `wait`, or whenever it
+/// appears.
+pub(crate) async fn connect(instance: &str, wait: Option<Duration>) -> Result<TcpStream, String> {
     let daemon = Daemon::start()?;
-    let found = tokio::time::timeout(WAIT, find(&daemon.0, instance)).await;
-    drop(daemon);
-    let addrs = match found {
-        Ok(addrs) => addrs?,
-        Err(_) => return Err("the other device was not found on this network".into()),
+    let found = match wait {
+        Some(wait) => tokio::time::timeout(wait, find(&daemon.0, instance))
+            .await
+            .map_err(|_| "the other device was not found on this network".to_string()),
+        None => Ok(find(&daemon.0, instance).await),
     };
+    drop(daemon);
+    let addrs = found??;
     let mut last = String::from("the other device was not reachable");
     for addr in addrs {
         match tokio::time::timeout(Duration::from_secs(10), TcpStream::connect(addr)).await {
@@ -198,7 +201,7 @@ mod tests {
         let decoy = answering(&other, b"no").await;
         let looking = tokio::spawn({
             let name = name.clone();
-            async move { connect(&name).await.expect("found by name") }
+            async move { connect(&name, Some(WAIT)).await.expect("found by name") }
         });
         tokio::time::sleep(Duration::from_secs(2)).await;
         let device = answering(&name, b"ok").await;
