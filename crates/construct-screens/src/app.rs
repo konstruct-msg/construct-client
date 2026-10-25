@@ -415,6 +415,18 @@ impl App {
                     Err(e) => format!("History not imported: {e}"),
                 }
             }
+            ClientEvent::HistoryNearby(step) => {
+                use construct_client::history::NearbyStep;
+                self.status = match step {
+                    NearbyStep::Waiting => "History: waiting for the other device…".into(),
+                    NearbyStep::Moving => "History: transferring…".into(),
+                    NearbyStep::Sent(s) => {
+                        format!("History sent: {} messages, {} files", s.messages, s.media)
+                    }
+                    NearbyStep::Skipped => "History: the other device declined".into(),
+                    NearbyStep::Failed(e) => format!("History not transferred: {e}"),
+                }
+            }
             // The terminal has no lock screen yet; the desktop does.
             ClientEvent::AppLock(_) | ClientEvent::AppUnlocked(_) => {}
             ClientEvent::AppLockRefused(why) => self.status = why,

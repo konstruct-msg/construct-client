@@ -630,6 +630,7 @@ impl Client {
         self.our_identity_key = None;
         self.our_hybrid_key = None;
         self.cancel_link_offer();
+        self.cancel_history_nearby();
         self.user_id.clear();
         self.device_id.clear();
         self.access_token.clear();

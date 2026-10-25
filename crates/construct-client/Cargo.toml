@@ -29,7 +29,7 @@ http = "1"
 prost = "0.13"
 
 # Async runtime
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync", "io-util"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync", "io-util", "fs"] }
 tokio-stream = "0.1"
 async-stream = "0.3"
 futures = "0.3"
@@ -59,6 +59,9 @@ signature = "2"
 base64 = "0.22.1"
 uuid = { version = "1", features = ["v4"] }
 tracing = "0.1"
+
+# History over the local network: the name iOS browses for (Bonjour), in Rust, no system daemon.
+mdns-sd = "0.21"
 
 # The store key in the OS key store: Keychain, Secret Service, Credential Manager.
 [target.'cfg(target_os = "macos")'.dependencies]

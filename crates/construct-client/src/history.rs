@@ -1,20 +1,25 @@
-//! History moved between two devices of this account as a file (CTHF), the way iOS saves one
-//! when the devices cannot see each other (`client/specs/DEVICE_LINK_HISTORY_TRANSFER.md`).
+//! History moved between two devices of this account, the way iOS moves it
+//! (`client/specs/DEVICE_LINK_HISTORY_TRANSFER.md`): over the local network (CTT1 v2, two
+//! connections — the transcript, then the files), or as a file (CTHF) when the devices cannot see
+//! each other.
 //!
 //! The core does the protocol: the header, the key agreed with the recipient's keys, the sealed
 //! chunks, the record order (`construct_core::history::session`), and how records and store rows
 //! map to each other (`history::project`), so a transfer lands here as it does on iOS. This module
-//! moves bytes between the core, the store, the media cache and a file.
+//! moves bytes between the core, the store, the media cache and a file or a socket
+//! (`crate::nearby`).
 
 use std::collections::HashSet;
-use std::io::{Read, Write};
 use std::path::Path;
+use std::time::Duration;
 
 use construct_core::history::cth1::Event;
+use construct_core::history::discovery::{discovery_instance_name, discovery_tag};
 use construct_core::history::frames::{KnownKeys, Pin};
 use construct_core::history::project::{self, MessageExport, MessageImport};
-use construct_core::history::session::{PeerKeys, Receiver, Source, Status};
+use construct_core::history::session::{PeerKeys, Receiver, Sender, Source, Status};
 use construct_core::history::{self, HistoryFailure, record_type as rt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::content::MediaFile;
 use crate::grpc::GrpcClient;
@@ -34,15 +39,43 @@ pub struct HistorySummary {
     pub media_skipped: usize,
 }
 
-/// Written to the file in pieces of about this much.
+/// Where a transfer over the local network stands.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NearbyStep {
+    /// Waiting for the other device to appear on this network.
+    Waiting,
+    /// Connected; history is moving.
+    Moving,
+    /// Everything was sent.
+    Sent(HistorySummary),
+    /// The other device declined to send.
+    Skipped,
+    /// It stopped, and why. What was received before is kept and reported as imported.
+    Failed(String),
+}
+
+/// Written out in pieces of about this much.
 const FLUSH_AT: usize = 1 << 20;
+
+/// Which records a stream carries (K18): the transcript, the files, or both.
+const PHASE_TRANSCRIPT: u32 = 1;
+const PHASE_MEDIA: u32 = 2;
+const PHASE_BOTH: u32 = 3;
+
+/// How long a device that connected may take to answer the opening.
+const REPLY_WAIT: Duration = Duration::from_secs(60);
+
+/// Spec §6: right after a link the directory may not serve the new device's keys yet; asked again
+/// this often, this many times (iOS: 2 s × 15).
+const PEER_KEYS_RETRY: Duration = Duration::from_secs(2);
+const PEER_KEYS_ATTEMPTS: u32 = 15;
 
 fn fail(f: HistoryFailure) -> String {
     format!("history transfer refused: {}", f.as_str())
 }
 
 fn io(e: std::io::Error) -> String {
-    format!("history file: {e}")
+    format!("history transfer: {e}")
 }
 
 fn store_err(e: impl std::fmt::Display) -> String {
@@ -58,6 +91,7 @@ fn account_raw(user_id: &str) -> Result<[u8; 16], String> {
 
 /// `HistoryManifest`, encoded by its field numbers (construct-protos `client/history_snapshot.proto`).
 fn manifest(
+    phase: u32,
     snapshot_id: [u8; 16],
     user_id: [u8; 16],
     source_device_id: &str,
@@ -87,9 +121,23 @@ fn manifest(
     uint32::encode(10, &count(summary.reactions), &mut m);
     uint32::encode(11, &count(media_count), &mut m);
     uint64::encode(12, &media_bytes, &mut m);
-    // A file carries both phases (K18).
-    uint32::encode(13, &3, &mut m);
+    uint32::encode(13, &phase, &mut m);
     m
+}
+
+/// The phase a manifest names (field 13); `None` for one that does not parse.
+fn manifest_phase(mut proto: &[u8]) -> Option<u32> {
+    use prost::encoding::{DecodeContext, WireType, decode_key, decode_varint, skip_field};
+    let mut phase = None;
+    while !proto.is_empty() {
+        let (tag, wire_type) = decode_key(&mut proto).ok()?;
+        if tag == 13 && wire_type == WireType::Varint {
+            phase = u32::try_from(decode_varint(&mut proto).ok()?).ok();
+        } else {
+            skip_field(wire_type, tag, &mut proto, DecodeContext::default()).ok()?;
+        }
+    }
+    phase
 }
 
 /// The bundle of `device_id`, a device of our own account, as the directory serves it.
@@ -123,7 +171,7 @@ fn hybrid_of(
         .ok_or_else(|| "that device has no hybrid key: it cannot take part in a transfer".into())
 }
 
-/// What the file is sealed to: the recipient's identity, hybrid and Kyber signed prekey.
+/// What a transfer is sealed to: the recipient's identity, hybrid and Kyber signed prekey.
 async fn peer_keys(grpc: &GrpcClient, user_id: &str, device_id: &str) -> Result<PeerKeys, String> {
     let bundle = own_bundle(grpc, user_id, device_id).await?;
     let identity_public: [u8; 32] = bundle
@@ -146,8 +194,9 @@ async fn peer_keys(grpc: &GrpcClient, user_id: &str, device_id: &str) -> Result<
     })
 }
 
-/// What the importer checks the file's sender against: the directory's keys for it. A file has
-/// no QR to pin it, so the directory is the only pin (spec: `bundle_only`, and it is logged).
+/// What the importer checks the sender against: the directory's keys for it. A file has no QR to
+/// pin it, and neither has a device this one was linked to by showing its own code (Flow B), so
+/// the directory is the only pin (spec: `bundle_only`, and it is logged).
 async fn known_keys(
     grpc: &GrpcClient,
     user_id: &str,
@@ -163,11 +212,16 @@ async fn known_keys(
 /// Records as the stream carries them: the type byte and the protobuf.
 type Records = Vec<(u8, Vec<u8>)>;
 
+/// What this device sends: its transcript and the files its messages refer to.
+struct Outgoing {
+    records: Records,
+    media: Vec<MediaFile>,
+    summary: HistorySummary,
+}
+
 /// The records of a transcript in the order the protocol requires, and the files its messages
 /// refer to.
-pub(crate) fn collect(
-    store: &LocalStore,
-) -> Result<(Records, Vec<MediaFile>, HistorySummary), String> {
+fn collect(store: &LocalStore) -> Result<Outgoing, String> {
     let rows = store.history_rows().map_err(store_err)?;
     let own = store.own_account().to_string();
     let mut summary = HistorySummary::default();
@@ -209,7 +263,84 @@ pub(crate) fn collect(
         records.push((rt::REACTION, project::export_reaction(r)));
         summary.reactions += 1;
     }
-    Ok((records, media, summary))
+    Ok(Outgoing {
+        records,
+        media,
+        summary,
+    })
+}
+
+/// One phase of `out` through `sender` into `w`: the manifest, then the transcript, the files, or
+/// both. Returns what it carried.
+#[allow(clippy::too_many_arguments)]
+async fn write_phase<W: AsyncWrite + Unpin>(
+    w: &mut W,
+    sender: &mut Sender,
+    phase: u32,
+    out: &Outgoing,
+    store: &LocalStore,
+    cache: &MediaCache,
+    user: [u8; 16],
+    own_device: &str,
+) -> Result<HistorySummary, String> {
+    let mut buf = Vec::with_capacity(FLUSH_AT * 2);
+    let media_bytes = out.media.iter().map(|f| f.info.size).sum();
+    let head = manifest(
+        phase,
+        sender.snapshot_id(),
+        user,
+        own_device,
+        &out.summary,
+        out.media.len(),
+        media_bytes,
+    );
+    sender
+        .push_record(rt::MANIFEST, &head, &mut buf)
+        .map_err(fail)?;
+    let mut carried = HistorySummary::default();
+    if phase != PHASE_MEDIA {
+        for (kind, record) in &out.records {
+            sender.push_record(*kind, record, &mut buf).map_err(fail)?;
+            flush(w, &mut buf, false).await?;
+        }
+        carried = HistorySummary {
+            media: 0,
+            media_skipped: 0,
+            ..out.summary.clone()
+        };
+    }
+    if phase != PHASE_TRANSCRIPT {
+        for f in &out.media {
+            let key = store.media_local_key(&f.media_id);
+            match cache.plaintext(f, key.as_deref().map(|k| &k[..])) {
+                Some(bytes) if (bytes.len() as u64) < history::MAX_RECORD_BYTES => {
+                    sender
+                        .begin_media(&f.media_id, &f.info.mime, bytes.len() as u64, &mut buf)
+                        .map_err(fail)?;
+                    sender.push_media(&bytes, &mut buf).map_err(fail)?;
+                    carried.media += 1;
+                }
+                _ => carried.media_skipped += 1,
+            }
+            flush(w, &mut buf, false).await?;
+        }
+    }
+    sender.finish(&mut buf).map_err(fail)?;
+    flush(w, &mut buf, true).await?;
+    w.flush().await.map_err(io)?;
+    Ok(carried)
+}
+
+async fn flush<W: AsyncWrite + Unpin>(
+    w: &mut W,
+    buf: &mut Vec<u8>,
+    all: bool,
+) -> Result<(), String> {
+    if all || buf.len() >= FLUSH_AT {
+        w.write_all(buf).await.map_err(io)?;
+        buf.clear();
+    }
+    Ok(())
 }
 
 /// Write this device's history to `path`, sealed to `device_id`, another device of the account.
@@ -231,61 +362,236 @@ pub(crate) async fn export_to_file(
     let user = account_raw(user_id)?;
     let peer = peer_keys(grpc, user_id, device_id).await?;
     let mut sender = orch.history_file_sender(user, peer).await?;
-    let (records, media, mut summary) = collect(store)?;
+    let out = collect(store)?;
 
     let partial = path.with_extension("part");
-    let mut file = std::fs::File::create(&partial).map_err(io)?;
-    let written = (|| -> Result<(), String> {
-        let mut out = Vec::with_capacity(FLUSH_AT * 2);
-        out.extend_from_slice(sender.first_frame());
-        let media_bytes = media.iter().map(|f| f.info.size).sum();
-        let head = manifest(
-            sender.snapshot_id(),
+    let mut file = tokio::fs::File::create(&partial).await.map_err(io)?;
+    let written = async {
+        file.write_all(sender.first_frame()).await.map_err(io)?;
+        let carried = write_phase(
+            &mut file,
+            &mut sender,
+            PHASE_BOTH,
+            &out,
+            store,
+            cache,
             user,
             own_device,
-            &summary,
-            media.len(),
-            media_bytes,
-        );
-        sender
-            .push_record(rt::MANIFEST, &head, &mut out)
-            .map_err(fail)?;
-        for (kind, record) in &records {
-            sender.push_record(*kind, record, &mut out).map_err(fail)?;
-            flush(&mut file, &mut out, false)?;
-        }
-        for f in &media {
-            let key = store.media_local_key(&f.media_id);
-            match cache.plaintext(f, key.as_deref().map(|k| &k[..])) {
-                Some(bytes) if (bytes.len() as u64) < history::MAX_RECORD_BYTES => {
-                    sender
-                        .begin_media(&f.media_id, &f.info.mime, bytes.len() as u64, &mut out)
-                        .map_err(fail)?;
-                    sender.push_media(&bytes, &mut out).map_err(fail)?;
-                    summary.media += 1;
-                }
-                _ => summary.media_skipped += 1,
-            }
-            flush(&mut file, &mut out, false)?;
-        }
-        sender.finish(&mut out).map_err(fail)?;
-        flush(&mut file, &mut out, true)?;
-        file.sync_all().map_err(io)
-    })();
-    if let Err(e) = written {
-        let _ = std::fs::remove_file(&partial);
-        return Err(e);
+        )
+        .await?;
+        file.sync_all().await.map_err(io)?;
+        Ok::<_, String>(carried)
     }
-    std::fs::rename(&partial, path).map_err(io)?;
+    .await;
+    drop(file);
+    match written {
+        Ok(carried) => {
+            tokio::fs::rename(&partial, path).await.map_err(io)?;
+            Ok(carried)
+        }
+        Err(e) => {
+            let _ = tokio::fs::remove_file(&partial).await;
+            Err(e)
+        }
+    }
+}
+
+/// The name a transfer to `device_id` is advertised under on the local network.
+fn instance_for(user_id: &str, device_id: &str) -> String {
+    discovery_instance_name(&discovery_tag(
+        &user_id.to_lowercase(),
+        &device_id.to_lowercase(),
+    ))
+}
+
+/// [`peer_keys`], asked again while the directory does not serve them yet.
+async fn peer_keys_waiting(
+    grpc: &GrpcClient,
+    user_id: &str,
+    device_id: &str,
+) -> Result<PeerKeys, String> {
+    let mut attempt = 1;
+    loop {
+        match peer_keys(grpc, user_id, device_id).await {
+            Ok(keys) => return Ok(keys),
+            Err(e) if attempt >= PEER_KEYS_ATTEMPTS => return Err(e),
+            Err(e) => {
+                tracing::info!(
+                    attempt,
+                    "history: the other device's keys are not served yet: {e}"
+                );
+                attempt += 1;
+                tokio::time::sleep(PEER_KEYS_RETRY).await;
+            }
+        }
+    }
+}
+
+/// Send this device's history to `device_id` over the local network, the way iOS does: advertise,
+/// and on each of two connections send the opening, check the reply, and stream a phase — the
+/// transcript, then the files.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn offer_nearby(
+    orch: &OrchestratorHandle,
+    grpc: &GrpcClient,
+    store: &LocalStore,
+    cache: &MediaCache,
+    user_id: &str,
+    own_device: &str,
+    device_id: &str,
+    step: impl Fn(NearbyStep),
+) -> Result<HistorySummary, String> {
+    if device_id.eq_ignore_ascii_case(own_device) {
+        return Err("choose another device of the account".into());
+    }
+    let user = account_raw(user_id)?;
+    let peer = peer_keys_waiting(grpc, user_id, device_id).await?;
+    let out = collect(store)?;
+    // One listener for both connections: the receiver looks the name up again for the second,
+    // and finds the same port.
+    let advertised = crate::nearby::advertise(&instance_for(user_id, device_id)).await?;
+    let mut summary = HistorySummary::default();
+    for phase in [PHASE_TRANSCRIPT, PHASE_MEDIA] {
+        step(NearbyStep::Waiting);
+        let mut stream = advertised.accept().await?;
+        step(NearbyStep::Moving);
+        let mut sender = orch.history_nearby_sender(user, peer.clone()).await?;
+        stream.write_all(sender.first_frame()).await.map_err(io)?;
+        let mut reply = vec![0u8; history::frames::REPLY_LEN];
+        match tokio::time::timeout(REPLY_WAIT, stream.read_exact(&mut reply)).await {
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => return Err(io(e)),
+            Err(_) => return Err("the other device did not answer".into()),
+        }
+        sender.accept_reply(&reply).map_err(fail)?;
+        let carried = write_phase(
+            &mut stream,
+            &mut sender,
+            phase,
+            &out,
+            store,
+            cache,
+            user,
+            own_device,
+        )
+        .await?;
+        let _ = stream.shutdown().await;
+        tracing::info!(phase, ?carried, "history phase sent");
+        if phase == PHASE_TRANSCRIPT {
+            summary = carried;
+        } else {
+            summary.media = carried.media;
+            summary.media_skipped = carried.media_skipped;
+        }
+    }
     Ok(summary)
 }
 
-fn flush(file: &mut std::fs::File, out: &mut Vec<u8>, all: bool) -> Result<(), String> {
-    if all || out.len() >= FLUSH_AT {
-        file.write_all(out).map_err(io)?;
-        out.clear();
+/// What a transfer brought in: its summary, the accounts it named, and why it stopped short, if
+/// it did — a cut second phase keeps the first.
+pub(crate) type Landed = (HistorySummary, Vec<String>, Option<String>);
+
+/// Take history another device of the account offers over the local network: find it by the name
+/// both compute for this device, connect, and import a phase per connection until the files are in
+/// (or it sends everything at once, or declines).
+pub(crate) async fn receive_nearby(
+    orch: &OrchestratorHandle,
+    grpc: &GrpcClient,
+    store: &LocalStore,
+    cache: &MediaCache,
+    user_id: &str,
+    own_device: &str,
+    step: impl Fn(NearbyStep),
+) -> Landed {
+    let instance = instance_for(user_id, own_device);
+    let mut importer = Importer::new(store, cache);
+    let user = match account_raw(user_id) {
+        Ok(user) => user,
+        Err(e) => return (importer.summary, importer.contacts, Some(e)),
+    };
+    loop {
+        step(NearbyStep::Waiting);
+        let received = async {
+            let stream = crate::nearby::connect(&instance).await?;
+            step(NearbyStep::Moving);
+            receive_stream(
+                stream,
+                Source::Nearby,
+                orch,
+                grpc,
+                user_id,
+                user,
+                &mut importer,
+            )
+            .await
+        }
+        .await;
+        match received {
+            Ok(Received::Phase(PHASE_TRANSCRIPT)) => continue,
+            Ok(Received::Phase(_)) => return (importer.summary, importer.contacts, None),
+            Ok(Received::Skipped) => {
+                step(NearbyStep::Skipped);
+                return (importer.summary, importer.contacts, None);
+            }
+            Err(e) => return (importer.summary, importer.contacts, Some(e)),
+        }
     }
-    Ok(())
+}
+
+/// How a stream ended.
+enum Received {
+    /// It carried this phase, all of it.
+    Phase(u32),
+    /// The sending device declined.
+    Skipped,
+}
+
+/// Read one stream — a file, or a connection — into the store through `importer`. On a
+/// connection the reply to the opening is written back on it.
+async fn receive_stream<S: AsyncRead + AsyncWrite + Unpin>(
+    mut stream: S,
+    source: Source,
+    orch: &OrchestratorHandle,
+    grpc: &GrpcClient,
+    user_id: &str,
+    user: [u8; 16],
+    importer: &mut Importer<'_>,
+) -> Result<Received, String> {
+    let mut receiver = Receiver::new(source, user);
+    let mut buf = Vec::new();
+    importer.phase = None;
+    loop {
+        let need = receiver.need();
+        buf.resize(need, 0);
+        let n = read_up_to(&mut stream, &mut buf).await?;
+        if n == 0 && need > 0 {
+            receiver.end_of_input().map_err(fail)?;
+            break;
+        }
+        let (events, status) = receiver.feed(&buf[..n]).map_err(fail)?;
+        for event in events {
+            importer.event(event)?;
+        }
+        match status {
+            Status::NeedMore => {}
+            Status::AwaitKeys { sender_device_id } => {
+                let sender = hex::encode(sender_device_id);
+                let known = known_keys(grpc, user_id, &sender).await?;
+                tracing::info!(device = %short(&sender), "history: sender pinned by the directory only");
+                let (back, accepted) = orch
+                    .history_accept(Box::new(receiver), known, Pin::BundleOnly)
+                    .await?;
+                receiver = *back;
+                if let Some(reply) = accepted.map_err(fail)? {
+                    stream.write_all(&reply).await.map_err(io)?;
+                    stream.flush().await.map_err(io)?;
+                }
+            }
+            Status::Done => break,
+            Status::Skipped => return Ok(Received::Skipped),
+        }
+    }
+    Ok(Received::Phase(importer.phase.unwrap_or(PHASE_BOTH)))
 }
 
 /// Read a history file into the store: what it brings is added, what this device holds is kept
@@ -300,46 +606,31 @@ pub(crate) async fn import_file(
     path: &Path,
 ) -> Result<(HistorySummary, Vec<String>), String> {
     let user = account_raw(user_id)?;
-    let mut file = std::fs::File::open(path).map_err(io)?;
-    let mut receiver = Receiver::new(Source::File, user);
+    let file = tokio::fs::File::open(path).await.map_err(io)?;
     let mut importer = Importer::new(store, cache);
-    let mut buf = Vec::new();
-    loop {
-        let need = receiver.need();
-        buf.resize(need, 0);
-        let n = read_up_to(&mut file, &mut buf)?;
-        if n == 0 {
-            receiver.end_of_input().map_err(fail)?;
-            break;
-        }
-        let (events, status) = receiver.feed(&buf[..n]).map_err(fail)?;
-        for event in events {
-            importer.event(event)?;
-        }
-        match status {
-            Status::NeedMore => {}
-            Status::AwaitKeys { sender_device_id } => {
-                let sender = hex::encode(sender_device_id);
-                let known = known_keys(grpc, user_id, &sender).await?;
-                tracing::info!(device = %short(&sender), "history file: sender pinned by the directory only");
-                let (back, accepted) = orch
-                    .history_accept(Box::new(receiver), known, Pin::BundleOnly)
-                    .await?;
-                receiver = *back;
-                accepted.map_err(fail)?;
-            }
-            Status::Done => break,
-            Status::Skipped => return Err("the file holds no history".into()),
-        }
+    // A file has nothing to answer: writes to it are never made.
+    let stream = tokio::io::join(file, tokio::io::sink());
+    match receive_stream(
+        stream,
+        Source::File,
+        orch,
+        grpc,
+        user_id,
+        user,
+        &mut importer,
+    )
+    .await?
+    {
+        Received::Skipped => Err("the file holds no history".into()),
+        Received::Phase(_) => Ok((importer.summary, importer.contacts)),
     }
-    Ok((importer.summary, importer.contacts))
 }
 
-/// Read until `buf` is full or the file ends; how much was read.
-fn read_up_to(file: &mut std::fs::File, buf: &mut [u8]) -> Result<usize, String> {
+/// Read until `buf` is full or the input ends; how much was read.
+async fn read_up_to<R: AsyncRead + Unpin>(r: &mut R, buf: &mut [u8]) -> Result<usize, String> {
     let mut at = 0;
     while at < buf.len() {
-        match file.read(&mut buf[at..]).map_err(io)? {
+        match r.read(&mut buf[at..]).await.map_err(io)? {
             0 => break,
             n => at += n,
         }
@@ -356,6 +647,8 @@ struct Importer<'a> {
     contacts: Vec<String>,
     /// The file being received: its id and the bytes so far.
     media: Option<(String, Vec<u8>)>,
+    /// The phase the current stream's manifest names.
+    phase: Option<u32>,
 }
 
 impl<'a> Importer<'a> {
@@ -369,6 +662,7 @@ impl<'a> Importer<'a> {
             summary: HistorySummary::default(),
             contacts: Vec::new(),
             media: None,
+            phase: None,
         }
     }
 
@@ -468,7 +762,9 @@ impl<'a> Importer<'a> {
                     raw.record_peer_device(&device).map_err(store_err)?;
                 }
             }
-            // The manifest is the core's to check; a call this client has nowhere to show.
+            // The manifest is the core's to check; what it says is next is ours.
+            rt::MANIFEST => self.phase = manifest_phase(proto),
+            // A call this client has nowhere to show.
             _ => {}
         }
         Ok(())
@@ -489,6 +785,7 @@ mod tests {
             ..Default::default()
         };
         let m = manifest(
+            PHASE_TRANSCRIPT,
             [9; 16],
             [7; 16],
             "ABCDEF0123456789abcdef0123456789",
@@ -512,6 +809,7 @@ mod tests {
         reader
             .push(&stream, &mut events)
             .expect("the core takes the manifest");
+        assert_eq!(manifest_phase(&m), Some(PHASE_TRANSCRIPT));
         assert!(matches!(
             events.first(),
             Some(Event::Record {

@@ -146,6 +146,26 @@ impl OrchestratorHandle {
             .map_err(|f| f.as_str().to_string())
     }
 
+    /// A nearby history offer to `peer`, keyed by this device: its opening first, then the reply.
+    pub(crate) async fn history_nearby_sender(
+        &self,
+        user_id: [u8; 16],
+        peer: construct_core::history::session::PeerKeys,
+    ) -> Result<construct_core::history::session::Sender, String> {
+        let (reply, answer) = tokio::sync::oneshot::channel();
+        self.cmd_tx
+            .send(OrchestratorCommand::History(HistoryJob::NearbySender {
+                user_id,
+                peer,
+                reply,
+            }))
+            .map_err(|_| "the session has stopped".to_string())?;
+        answer
+            .await
+            .map_err(|_| "the session has stopped".to_string())?
+            .map_err(|f| f.as_str().to_string())
+    }
+
     /// Hand a waiting history receiver the sending device's keys.
     pub(crate) async fn history_accept(
         &self,
@@ -224,6 +244,17 @@ enum HistoryJob {
             >,
         >,
     },
+    /// A nearby offer to another device of the account, keyed by this device.
+    NearbySender {
+        user_id: [u8; 16],
+        peer: construct_core::history::session::PeerKeys,
+        reply: tokio::sync::oneshot::Sender<
+            Result<
+                construct_core::history::session::Sender,
+                construct_core::history::HistoryFailure,
+            >,
+        >,
+    },
     /// The keys a history receiver waits for: verified and agreed with this device's keys.
     Accept {
         receiver: Box<construct_core::history::session::Receiver>,
@@ -237,6 +268,7 @@ impl std::fmt::Debug for HistoryJob {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
             Self::FileSender { .. } => "HistoryJob::FileSender",
+            Self::NearbySender { .. } => "HistoryJob::NearbySender",
             Self::Accept { .. } => "HistoryJob::Accept",
         })
     }
@@ -595,6 +627,21 @@ impl Task {
                     &self.orchestrator,
                     user_id,
                     &peer,
+                ));
+            }
+            OrchestratorCommand::History(HistoryJob::NearbySender {
+                user_id,
+                peer,
+                reply,
+            }) => {
+                // The Flow B pin, when there was one, was the directory's keys being checked
+                // against the code; the reply is checked against those keys.
+                let _ = reply.send(construct_core::history::session::Sender::nearby(
+                    &self.orchestrator,
+                    user_id,
+                    &peer,
+                    false,
+                    None,
                 ));
             }
             OrchestratorCommand::History(HistoryJob::Accept {
