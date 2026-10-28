@@ -47,3 +47,7 @@ pub const USER_CHECK_USERNAME: &str =
     "/shared.proto.services.v1.UserService/CheckUsernameAvailability";
 pub const USER_SET_DISCOVERABLE: &str = "/shared.proto.services.v1.UserService/SetDiscoverable";
 pub const DEVICE_SET_METADATA: &str = "/shared.proto.services.v1.DeviceService/SetDeviceMetadata";
+pub const STICKER_LIST_PACKS: &str = "/shared.proto.services.v1.StickerService/ListStickerPacks";
+pub const STICKER_MANIFEST: &str =
+    "/shared.proto.services.v1.StickerService/GetStickerPackManifest";
+pub const STICKER_PACK_BLOBS: &str = "/shared.proto.services.v1.StickerService/GetStickerPackBlobs";

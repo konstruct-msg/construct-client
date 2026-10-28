@@ -2003,6 +2003,7 @@ fn place_inbound(
                     .into_iter()
                     .map(|f| f.info)
                     .collect(),
+                sticker: crate::content::sticker(payload),
                 ..Default::default()
             };
             let stored = if attachment.is_some() && !payload.is_empty() {
@@ -2134,6 +2135,35 @@ mod tests {
             attachment: None,
         };
         place_inbound(storage, Sender::Peer(peer), id, content, &[], 1).unwrap();
+    }
+
+    /// A sticker, from a peer or sent from here, reaches the screens with its reference — when
+    /// it arrives, and read back from the store.
+    #[test]
+    fn a_sticker_is_kept_with_its_reference() {
+        let storage = LocalStore::open_in_memory().unwrap();
+        let sticker = crate::stickers::StickerRef {
+            pack_id: "ab".repeat(32),
+            index: 5,
+            emoji: "🐱".into(),
+        };
+        let payload = crate::content::encode_sticker(&sticker).unwrap();
+        for (from, id) in [
+            (Sender::Peer("bob"), "s1"),
+            (Sender::OwnDevice { partner: "bob" }, "s2"),
+        ] {
+            let content = crate::content::parse(&payload).unwrap();
+            let event = place_inbound(&storage, from, id, content, &payload, 1).unwrap();
+            let (Some(BridgeEvent::NewMessage { message })
+            | Some(BridgeEvent::OwnMessage { message })) = event
+            else {
+                panic!("a sticker is a message");
+            };
+            assert_eq!(message.sticker.as_ref(), Some(&sticker));
+        }
+        let kept = storage.get_messages("bob", 10).unwrap();
+        assert!(kept.iter().all(|m| m.sticker.as_ref() == Some(&sticker)));
+        assert_eq!(kept.len(), 2);
     }
 
     #[test]

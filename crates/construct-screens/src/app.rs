@@ -462,6 +462,10 @@ impl App {
             ClientEvent::Media { .. } => {}
             // The terminal has no settings screen.
             ClientEvent::Settings(_) => {}
+            // Nor pictures: a sticker shows as its emoji.
+            ClientEvent::Stickers { .. }
+            | ClientEvent::StickerImage { .. }
+            | ClientEvent::StickerCatalog(_) => {}
         }
     }
 

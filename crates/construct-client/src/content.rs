@@ -94,11 +94,16 @@ pub fn parse(payload: &[u8]) -> Option<Content> {
             quote: voice.quoted.and_then(quote),
             attachment: Some(Attachment::Voice),
         },
-        C::Sticker(sticker) => Content::Message {
-            text: sticker.emoji,
-            quote: None,
-            attachment: Some(Attachment::Sticker),
-        },
+        // A reference that fails the validator is corrupt content, not a sticker
+        // (`knst_sticker_ref.json`).
+        C::Sticker(sticker) => {
+            crate::stickers::StickerRef::from_wire(&sticker)?;
+            Content::Message {
+                text: sticker.emoji,
+                quote: None,
+                attachment: Some(Attachment::Sticker),
+            }
+        }
         C::Location(_) => attachment_only(Attachment::Location),
         C::Contact(_) => attachment_only(Attachment::Contact),
         C::Poll(_) => attachment_only(Attachment::Poll),
@@ -244,6 +249,26 @@ pub struct MediaInfo {
     pub width: u32,
     pub height: u32,
     pub duration_ms: u32,
+}
+
+/// The sticker a `MessageContent` names, when it names a valid one.
+pub fn sticker(payload: &[u8]) -> Option<crate::stickers::StickerRef> {
+    match MessageContent::decode(payload).ok()?.content? {
+        message_content::Content::Sticker(r) => crate::stickers::StickerRef::from_wire(&r),
+        _ => None,
+    }
+}
+
+/// The `MessageContent` bytes of a sticker, as iOS sends one (`ChatSendCoordinator.sendSticker`):
+/// the reference alone, no caption, no quote.
+pub fn encode_sticker(sticker: &crate::stickers::StickerRef) -> Option<Vec<u8>> {
+    Some(
+        MessageContent {
+            content: Some(message_content::Content::Sticker(sticker.to_wire()?)),
+            ..Default::default()
+        }
+        .encode_to_vec(),
+    )
 }
 
 /// A file a message carries: where it is on the server and the key that opens it.
@@ -453,14 +478,19 @@ mod tests {
                 attachment: Some(Attachment::Photo),
             })
         );
-        let sticker = bytes(message_content::Content::Sticker(StickerRef {
-            emoji: "🐱".into(),
-            ..Default::default()
-        }));
+        let sticker = |pack_id: Vec<u8>| {
+            bytes(message_content::Content::Sticker(StickerRef {
+                pack_id: pack_id.into(),
+                emoji: "🐱".into(),
+                ..Default::default()
+            }))
+        };
         assert!(matches!(
-            parse(&sticker),
+            parse(&sticker(vec![7; 32])),
             Some(Content::Message { attachment: Some(Attachment::Sticker), text, .. }) if text == "🐱"
         ));
+        // A reference without a pack is corrupt, not a sticker.
+        assert_eq!(parse(&sticker(Vec::new())), None);
     }
 
     #[test]
