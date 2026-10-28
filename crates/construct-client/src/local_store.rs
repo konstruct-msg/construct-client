@@ -45,6 +45,9 @@ pub struct StoredMessage {
     /// The files it carries, in display order; fetched by index ([`LocalStore::media_files`]).
     #[serde(default)]
     pub media: Vec<MediaInfo>,
+    /// The sticker it is; its picture comes from the pack (`stickers::Library::image`).
+    #[serde(default)]
+    pub sticker: Option<crate::stickers::StickerRef>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -902,6 +905,7 @@ fn now_ms() -> i64 {
 /// A stored row as the screens read it.
 fn view_message(m: Message, peer: &str, reactions: &[Reaction]) -> StoredMessage {
     let mut media = Vec::new();
+    let mut sticker = None;
     let (text, quote, attachment) = match payload::Payload::decode(&m.body) {
         payload::Payload::Text(text) => (text.to_string(), None, None),
         payload::Payload::MessageContent(bytes) => match crate::content::parse(bytes) {
@@ -914,6 +918,7 @@ fn view_message(m: Message, peer: &str, reactions: &[Reaction]) -> StoredMessage
                     .into_iter()
                     .map(|f| f.info)
                     .collect();
+                sticker = crate::content::sticker(bytes);
                 (text, quote, attachment)
             }
             _ => (String::new(), None, Some(Attachment::Other)),
@@ -951,6 +956,7 @@ fn view_message(m: Message, peer: &str, reactions: &[Reaction]) -> StoredMessage
             })
             .collect(),
         media,
+        sticker,
         id: m.id,
         peer_id: peer.to_string(),
         timestamp_ms: m.timestamp,

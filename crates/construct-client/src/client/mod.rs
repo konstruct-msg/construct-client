@@ -16,6 +16,7 @@ mod messages;
 mod orchestrator;
 mod profile;
 mod settings;
+mod stickers;
 mod tokens;
 mod transfer;
 
@@ -24,6 +25,7 @@ pub use contacts::{FindStarted, SearchResult};
 pub use lock::{AppLock, MIN_CODE_LEN};
 pub use profile::AvatarChange;
 pub use settings::{AccountSettings, InviteEntry, normalize_username};
+pub use stickers::StickerPackView;
 
 use tokio::sync::mpsc;
 use zeroize::Zeroizing;
@@ -204,6 +206,22 @@ pub enum ClientCommand {
     ClearMediaCache,
     /// How attachments are fetched and kept.
     SetMediaPrefs(crate::local_store::MediaPrefs),
+    /// The sticker picker: [`ClientEvent::Stickers`].
+    LoadStickers,
+    /// A sticker's picture: [`ClientEvent::StickerImage`], once its pack is here.
+    LoadSticker(crate::stickers::StickerRef),
+    /// Send sticker `index` of pack `pack_id` (offered in the picker) to `contact_id`.
+    SendSticker {
+        contact_id: String,
+        pack_id: String,
+        index: u32,
+    },
+    /// The packs the server offers: [`ClientEvent::StickerCatalog`].
+    LoadStickerCatalog,
+    /// Fetch a pack and offer it in the picker.
+    AddStickerPack(String),
+    /// Stop offering a pack in the picker.
+    RemoveStickerPack(String),
 }
 
 /// What the client tells a front end.
@@ -281,6 +299,18 @@ pub enum ClientEvent {
     HistoryImported(Result<crate::history::HistorySummary, String>),
     /// Where a transfer over the local network stands.
     HistoryNearby(crate::history::NearbyStep),
+    /// The sticker picker: the packs offered, and the stickers sent lately, newest first.
+    Stickers {
+        packs: Vec<StickerPackView>,
+        recent: Vec<crate::stickers::StickerRef>,
+    },
+    /// A sticker's picture (a WebP); `None` when it cannot be had, and the emoji stands for it.
+    StickerImage {
+        sticker: crate::stickers::StickerRef,
+        image: Option<Vec<u8>>,
+    },
+    /// The packs the server offers that the picker does not; or why they could not be read.
+    StickerCatalog(Result<Vec<crate::stickers::CatalogPack>, String>),
     /// Whether the app lock is on, and its delay: after start and after each change.
     AppLock(AppLock),
     /// The code handed in matched, or why it did not.
@@ -421,6 +451,8 @@ pub(crate) struct Client {
     nearby_task: Option<tokio::task::AbortHandle>,
     /// Waiting, while signed in, for history another device offers this one.
     history_listener: Option<tokio::task::AbortHandle>,
+    /// Sticker packs being fetched, and those that recently could not be.
+    sticker_fetches: stickers::Fetches,
     /// This device's X25519 identity secret, to open the device descriptions sealed to it.
     identity_secret: Option<Zeroizing<Vec<u8>>>,
     /// The username a new account registered with, until there is a store to keep it in.
@@ -462,6 +494,7 @@ impl Client {
             link_task: None,
             nearby_task: None,
             history_listener: None,
+            sticker_fetches: Default::default(),
             pending_link: None,
             pending_username: None,
             identity_secret: None,
@@ -558,6 +591,16 @@ impl Client {
             } => self.set_app_lock(current, code, remove, delay_secs),
             ClientCommand::UnlockApp(code) => self.unlock_app(code),
             ClientCommand::SetMediaPrefs(prefs) => self.set_media_prefs(prefs),
+            ClientCommand::LoadStickers => self.load_stickers(),
+            ClientCommand::LoadSticker(sticker) => self.load_sticker(sticker),
+            ClientCommand::SendSticker {
+                contact_id,
+                pack_id,
+                index,
+            } => self.send_sticker(contact_id, pack_id, index),
+            ClientCommand::LoadStickerCatalog => self.load_sticker_catalog(),
+            ClientCommand::AddStickerPack(pack) => self.add_sticker_pack(pack),
+            ClientCommand::RemoveStickerPack(pack) => self.remove_sticker_pack(pack),
         }
     }
 

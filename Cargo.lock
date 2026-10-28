@@ -666,7 +666,7 @@ dependencies = [
 
 [[package]]
 name = "construct-core"
-version = "0.58.0"
+version = "0.59.0"
 dependencies = [
  "aes-gcm",
  "argon2",
@@ -715,7 +715,7 @@ dependencies = [
 
 [[package]]
 name = "construct-server-trust"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "hex",
  "sha2",

@@ -74,6 +74,11 @@ impl DataDir {
         self.dir.join("media")
     }
 
+    /// Where sticker packs are kept (`stickers::Library`): public files, checked by hash.
+    pub fn stickers_dir(&self) -> PathBuf {
+        self.dir.join("stickers")
+    }
+
     /// Whether a store exists here, and how its key is kept. `None` when there is no store.
     pub fn existing(&self) -> Option<KeyKeeping> {
         existing_in(&self.dir)

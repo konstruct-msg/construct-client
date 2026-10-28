@@ -32,6 +32,7 @@ pub mod profile;
 mod proto;
 pub mod recovery;
 mod sealing;
+pub mod stickers;
 mod streaming;
 mod trust;
 

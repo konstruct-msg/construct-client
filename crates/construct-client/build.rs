@@ -15,6 +15,7 @@ fn compile_protos() {
         format!("{protos_dir}/core/identity.proto"),
         format!("{protos_dir}/core/pagination.proto"),
         format!("{protos_dir}/messaging/content.proto"),
+        format!("{protos_dir}/messaging/sticker_pack.proto"),
         format!("{protos_dir}/messaging/e2ee.proto"),
         format!("{protos_dir}/signaling/presence.proto"),
         format!("{protos_dir}/signaling/webrtc.proto"),
@@ -26,6 +27,7 @@ fn compile_protos() {
         format!("{protos_dir}/services/notification_service.proto"),
         format!("{protos_dir}/services/server_trust_service.proto"),
         format!("{protos_dir}/services/media_service.proto"),
+        format!("{protos_dir}/services/sticker_service.proto"),
     ];
 
     let protos_path = std::path::Path::new(&protos_dir);
@@ -56,4 +58,6 @@ fn compile_protos() {
     let protos_abs = protos_abs.display();
     println!("cargo:rustc-env=CONSTRUCT_PROTOS_DIR={protos_abs}");
     println!("cargo:rerun-if-changed={protos_abs}/conformance/knst_content_types.json");
+    println!("cargo:rerun-if-changed={protos_abs}/conformance/knst_sticker_ref.json");
+    println!("cargo:rerun-if-changed={protos_abs}/conformance/knst_sticker_pack.json");
 }

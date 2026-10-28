@@ -12,7 +12,11 @@
 /// Core types: Envelope, Identity, Crypto, Pagination.
 pub mod core {
     pub mod v1 {
-        #![allow(clippy::large_enum_variant, clippy::doc_lazy_continuation)]
+        #![allow(
+            clippy::large_enum_variant,
+            clippy::doc_lazy_continuation,
+            clippy::doc_overindented_list_items
+        )]
         include!(concat!(env!("OUT_DIR"), "/shared.proto.core.v1.rs"));
     }
 }
@@ -20,7 +24,11 @@ pub mod core {
 /// Messaging wire types: MessageContent, session control.
 pub mod messaging {
     pub mod v1 {
-        #![allow(clippy::large_enum_variant, clippy::doc_lazy_continuation)]
+        #![allow(
+            clippy::large_enum_variant,
+            clippy::doc_lazy_continuation,
+            clippy::doc_overindented_list_items
+        )]
         include!(concat!(env!("OUT_DIR"), "/shared.proto.messaging.v1.rs"));
     }
 }
@@ -28,7 +36,11 @@ pub mod messaging {
 /// Service request/response types: Auth, Key, Messaging, User, Notification.
 pub mod services {
     pub mod v1 {
-        #![allow(clippy::large_enum_variant, clippy::doc_lazy_continuation)]
+        #![allow(
+            clippy::large_enum_variant,
+            clippy::doc_lazy_continuation,
+            clippy::doc_overindented_list_items
+        )]
         include!(concat!(env!("OUT_DIR"), "/shared.proto.services.v1.rs"));
     }
 }
@@ -36,7 +48,11 @@ pub mod services {
 /// Signaling types: DeliveryReceipt, PresenceUpdate, WebRTC.
 pub mod signaling {
     pub mod v1 {
-        #![allow(clippy::large_enum_variant, clippy::doc_lazy_continuation)]
+        #![allow(
+            clippy::large_enum_variant,
+            clippy::doc_lazy_continuation,
+            clippy::doc_overindented_list_items
+        )]
         include!(concat!(env!("OUT_DIR"), "/shared.proto.signaling.v1.rs"));
     }
 }

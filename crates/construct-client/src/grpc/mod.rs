@@ -11,6 +11,7 @@
 //! - [`client`] — connection, unary, token
 //! - [`stream`] — MessageStream bidi
 //! - [`media`] — attachment downloads
+//! - [`stickers`] — sticker packs, fetched without a token
 //! - [`auth`] / [`keys`] / [`users`] — typed RPCs
 
 mod account;
@@ -24,6 +25,7 @@ mod keys;
 mod media;
 mod paths;
 mod sealed;
+mod stickers;
 mod stream;
 pub(crate) mod users;
 
@@ -52,5 +54,6 @@ pub use sealed::{
     SenderCertificate, get_sender_certificate, get_server_trust_delegations, send_own_device_copy,
     send_sealed_message,
 };
+pub use stickers::{sticker_manifest, sticker_pack_blobs, sticker_packs};
 pub use stream::open_message_stream;
 pub use users::find_user;
