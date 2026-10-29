@@ -22,6 +22,17 @@ use super::paths;
 pub struct SenderCertificate {
     pub bytes: Vec<u8>,
     pub expires_at: i64,
+    /// The server's X25519 key that tokens (and intake tags) are sealed to; empty when the
+    /// server sent none.
+    pub token_key: Vec<u8>,
+}
+
+/// A sealed message the server took: its id, and what it made of the intake tag
+/// (`IntakeVerdict`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SealedSent {
+    pub message_id: String,
+    pub intake_verdict: i32,
 }
 
 /// `AuthService.GetSenderCertificate` — authenticated: the certificate names this device.
@@ -42,15 +53,17 @@ pub async fn get_sender_certificate(client: &GrpcClient) -> Result<SenderCertifi
     Ok(SenderCertificate {
         bytes: resp.certificate.to_vec(),
         expires_at: resp.expires_at,
+        token_key: resp.token_encryption_key.to_vec(),
     })
 }
 
 /// `MessagingService.SendSealedMessage` on `anonymous`. Returns the id the server gave the
-/// message, which is what the recipient acknowledges in its delivery receipt.
+/// message, which is what the recipient acknowledges in its delivery receipt, and the verdict
+/// on its intake tag.
 pub async fn send_sealed_message(
     anonymous: &GrpcClient,
     inner: &SealedInner,
-) -> Result<String, GrpcError> {
+) -> Result<SealedSent, GrpcError> {
     let timestamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
@@ -77,7 +90,37 @@ pub async fn send_sealed_message(
     if !resp.success {
         return Err(GrpcError::transport("SendSealedMessage: not accepted"));
     }
-    Ok(resp.message_id)
+    Ok(SealedSent {
+        message_id: resp.message_id,
+        intake_verdict: resp.intake_verdict,
+    })
+}
+
+/// `AuthService.IssueTokens` — authenticated; the points are blinded, so the tokens they become
+/// do not name this account.
+pub async fn issue_tokens(
+    client: &GrpcClient,
+    blinded: &[Vec<u8>],
+) -> Result<crate::tokens::Evaluated, GrpcError> {
+    use crate::proto::services::v1::{IssueTokensRequest, IssueTokensResponse};
+    let req = IssueTokensRequest {
+        blinded_points: blinded.iter().map(|p| p.clone().into()).collect(),
+    };
+    let bytes = client
+        .unary(paths::AUTH_ISSUE_TOKENS, &req.encode_to_vec())
+        .await?;
+    let resp = IssueTokensResponse::decode(bytes.as_slice())
+        .map_err(|e| GrpcError::transport(format!("IssueTokens decode: {e}")))?;
+    Ok(crate::tokens::Evaluated {
+        points: resp
+            .evaluated_points
+            .into_iter()
+            .map(|p| p.to_vec())
+            .collect(),
+        server_pubkey: resp.server_pubkey.to_vec(),
+        dleq_proof: resp.dleq_proof.to_vec(),
+        key_version: resp.issuer_key_version,
+    })
 }
 
 /// `MessagingService.GetIntakeState` — our account's intake generation, and whether it has tags

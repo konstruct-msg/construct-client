@@ -290,6 +290,8 @@ enum OrchestratorCommand {
     ServerDelegations {
         delegations: Vec<Vec<u8>>,
     },
+    /// A batch of Privacy Pass tokens came back from the issuer, or did not.
+    TokensIssued(Result<Vec<crate::tokens::Token>, crate::tokens::Outcome>),
     /// Send `content` to `peer` under `message_id`: kept here as ours, copied to our other
     /// devices, then sent to each of the peer's.
     Send {
@@ -414,8 +416,11 @@ fn spawn_sender(
             match outbound {
                 Outbound::Sealed { inner, local_id } => {
                     match crate::grpc::send_sealed_message(&anonymous, &inner).await {
-                        Ok(server_id) => {
-                            tracing::info!(%local_id, %server_id, "sealed message sent");
+                        Ok(crate::grpc::SealedSent {
+                            message_id: server_id,
+                            intake_verdict,
+                        }) => {
+                            tracing::info!(%local_id, %server_id, intake_verdict, "sealed message sent");
                             let _ = cmd_tx.send(OrchestratorCommand::Sent {
                                 server_id,
                                 local_id,
@@ -472,6 +477,10 @@ struct Task {
     anonymous: Option<GrpcClient>,
     /// Where attachments fetched on arrival go.
     media: Option<crate::media::MediaCache>,
+    /// Privacy Pass tokens, one spent with each sealed message (`tokens`).
+    wallet: crate::tokens::Wallet,
+    issuance: crate::tokens::Issuance,
+    spend_units: crate::tokens::SpendUnits,
 }
 
 impl Task {
@@ -490,6 +499,13 @@ impl Task {
     ) -> Self {
         orchestrator.set_trusted_server_keys(crate::trust::pinned_certificate_keys());
         let peers = PeerDevices::load(&storage);
+        let wallet = crate::tokens::Wallet::from_bytes(
+            &storage
+                .secure_load(crate::tokens::WALLET_KEY)
+                .ok()
+                .flatten()
+                .unwrap_or_default(),
+        );
         Self {
             orchestrator,
             storage,
@@ -509,7 +525,124 @@ impl Task {
             devices_checked: HashMap::new(),
             anonymous: None,
             media: None,
+            wallet,
+            issuance: crate::tokens::Issuance::default(),
+            spend_units: crate::tokens::SpendUnits::default(),
         }
+    }
+
+    /// Ask the issuer for a batch when the wallet wants one (`tokens::Issuance::should_issue`);
+    /// the answer comes back as [`OrchestratorCommand::TokensIssued`].
+    fn top_up_tokens(&mut self) {
+        if !self
+            .issuance
+            .should_issue(self.wallet.len(), std::time::SystemTime::now())
+        {
+            return;
+        }
+        self.issuance.in_flight = true;
+        let want = (crate::tokens::BANK - self.wallet.len()).min(crate::tokens::BATCH);
+        let grpc = self.grpc.clone();
+        let back = self.self_cmd.clone();
+        tokio::spawn(async move {
+            let result = crate::tokens::issue(&grpc, want).await;
+            let _ = back.send(OrchestratorCommand::TokensIssued(result));
+        });
+    }
+
+    fn tokens_issued(&mut self, result: Result<Vec<crate::tokens::Token>, crate::tokens::Outcome>) {
+        let outcome = match result {
+            Ok(tokens) => {
+                let n = tokens.len();
+                self.wallet.deposit(tokens);
+                self.save_wallet();
+                crate::tokens::Outcome::Issued(n)
+            }
+            Err(outcome) => outcome,
+        };
+        let cold = self.wallet.len() < crate::tokens::COLD;
+        self.issuance.ended(&outcome, std::time::SystemTime::now());
+        match &outcome {
+            crate::tokens::Outcome::Issued(n) => {
+                tracing::info!(issued = n, wallet = self.wallet.len(), "tokens issued");
+                // A cold wallet fills toward the bank at once, batch after batch, as iOS's cold
+                // start does; a warm one waits out the pacing.
+                if *n > 0 && (cold || self.wallet.len() < crate::tokens::BANK / 2) {
+                    self.issuance.pacing_until = None;
+                    self.top_up_tokens();
+                }
+            }
+            other => {
+                tracing::warn!(outcome = ?other, wallet = self.wallet.len(), "tokens not issued")
+            }
+        }
+    }
+
+    fn save_wallet(&self) {
+        if let Err(e) = self
+            .storage
+            .secure_save(crate::tokens::WALLET_KEY, &self.wallet.to_bytes())
+        {
+            tracing::warn!(error = %e, "token wallet not kept");
+        }
+    }
+
+    /// The server's key tokens are sealed to, fetched with the certificate when not held.
+    async fn token_key(&mut self) -> Option<Vec<u8>> {
+        let held = self.certificate.as_ref().map(|c| c.token_key.clone());
+        match held {
+            Some(key) if !key.is_empty() => Some(key),
+            Some(_) => None,
+            None => {
+                let _ = self.certificate().await;
+                self.certificate
+                    .as_ref()
+                    .map(|c| c.token_key.clone())
+                    .filter(|k| !k.is_empty())
+            }
+        }
+    }
+
+    /// Pay for `inner`, envelope of message `message_id` to `account`: the message's spend id,
+    /// and a token sealed to the server unless another envelope of it already carries one.
+    /// Without a token (an empty wallet, no server key) it goes as it is — the certificate seal
+    /// still hides who sent it.
+    async fn pay(&mut self, inner: &mut SealedInner, account: &str, message_id: &str) {
+        let (spend_id, paid) = self.spend_units.unit(account, message_id);
+        inner.token_spend_id = spend_id.into();
+        if paid {
+            return;
+        }
+        let sealed = match self.token_key().await {
+            Some(key) => match self.wallet.take() {
+                Some(token) => match construct_core::crypto::privacy_pass::pp_seal_token_bytes(
+                    token.token.to_vec(),
+                    key,
+                ) {
+                    Ok(sealed) => Some((token, sealed)),
+                    Err(e) => {
+                        tracing::warn!(error = %e, "token not sealed");
+                        None
+                    }
+                },
+                None => None,
+            },
+            None => None,
+        };
+        match sealed {
+            Some((token, sealed)) => {
+                inner.token_nonce = token.nonce.to_vec().into();
+                inner.token_bytes = sealed.into();
+                self.spend_units.paid(account, message_id);
+                self.save_wallet();
+                tracing::debug!(wallet = self.wallet.len(), "sealed send with a token");
+            }
+            None => tracing::info!(
+                wallet = self.wallet.len(),
+                "sealed send without a token (empty wallet or no server key)"
+            ),
+        }
+        self.top_up_tokens();
     }
 
     /// The files a message just placed brought, fetched now as the settings allow: the server's
@@ -545,6 +678,8 @@ impl Task {
             tracing::error!(error = %e, "prekey publish failed");
             self.ui_error(format!("[PREKEYS] {e}"));
         }
+        // Tokens before the first message, not with it: a cold wallet fills at launch.
+        self.top_up_tokens();
         // The first tick is now: rotation and top-up are checked at launch too.
         let mut maintenance = tokio::time::interval(crate::prekeys::MAINTENANCE_INTERVAL);
         maintenance.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -556,6 +691,8 @@ impl Task {
             tokio::select! {
                 _ = intake_recheck.tick() => self.publish_intake().await,
                 _ = maintenance.tick() => {
+                    // A wallet below the bank, or past an issuer back-off, asks again.
+                    self.top_up_tokens();
                     if let Err(e) = crate::prekeys::maintain(
                         &mut self.orchestrator,
                         &self.storage,
@@ -700,6 +837,7 @@ impl Task {
                 evidence,
                 keys,
             } => self.vouch(device_id, &evidence, &keys),
+            OrchestratorCommand::TokensIssued(result) => self.tokens_issued(result),
             OrchestratorCommand::Sent {
                 server_id,
                 local_id,
@@ -1250,7 +1388,8 @@ impl Task {
                 (body, ContentType::Unspecified)
             }
         };
-        let inner = sealing::sealed_inner(&account, device, body, content_type);
+        let mut inner = sealing::sealed_inner(&account, device, body, content_type);
+        self.pay(&mut inner, &account, &local_id).await;
         self.sealed_tx
             .send(Outbound::Sealed {
                 inner: Box::new(inner),
