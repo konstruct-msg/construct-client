@@ -107,6 +107,59 @@ pub(crate) fn content(
     .encode_to_vec()
 }
 
+/// A voice note recorded here: AAC in MP4, mono, as iOS and Android record one
+/// (`AudioRecorderService`, `VoiceRecorder`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Voice {
+    pub bytes: Vec<u8>,
+    pub duration_ms: u32,
+    /// Loudness over the length, 0..=255 a bar; iOS and Android send 100.
+    pub waveform: Vec<u8>,
+}
+
+/// The type iOS names a voice note by (`MediaManager.uploadAudio`).
+pub const VOICE_MIME: &str = "audio/m4a";
+
+/// The longest voice note, as iOS and Android stop recording at five minutes.
+pub const MAX_VOICE_MS: u32 = 300_000;
+
+/// Whether `voice` is one a receiver takes as a voice note: an MP4 file, not empty, not longer
+/// than the others record.
+pub fn check_voice(voice: &Voice) -> Result<(), &'static str> {
+    if voice.bytes.get(4..8) != Some(b"ftyp") {
+        return Err("not an MP4 recording");
+    }
+    if voice.duration_ms == 0 || voice.duration_ms > MAX_VOICE_MS + 1_000 {
+        return Err("too short or too long");
+    }
+    Ok(())
+}
+
+/// The `MessageContent` of `voice`, sealed and uploaded, as iOS sends one
+/// (`MediaWireCodec.voiceMessageContent`): `codec` carries `mime|mediaId|size`, the voice proto
+/// having no field for the id.
+pub(crate) fn voice_content(
+    voice: &Voice,
+    uploaded: &crate::grpc::Uploaded,
+    sealed: &construct_core::media::SealedMedia,
+) -> Vec<u8> {
+    use crate::proto::messaging::v1::{MessageContent, VoiceMessage, message_content};
+    use prost::Message;
+    MessageContent {
+        content: Some(message_content::Content::Voice(VoiceMessage {
+            file_url: uploaded.download_url.clone(),
+            encryption_key: sealed.key.clone().into(),
+            file_hash: sealed.sha256.clone().into(),
+            duration_ms: voice.duration_ms,
+            waveform: voice.waveform.iter().map(|&v| v.into()).collect(),
+            codec: format!("{VOICE_MIME}|{}|{}", uploaded.media_id, voice.bytes.len()),
+            ..Default::default()
+        })),
+        ..Default::default()
+    }
+    .encode_to_vec()
+}
+
 /// A picture with its metadata gone, and its size as shown.
 #[derive(Debug, PartialEq, Eq)]
 struct Photo {
@@ -463,6 +516,76 @@ mod tests {
         assert_eq!(
             construct_core::media::open_media(&files[0].key, &sealed.blob).unwrap(),
             file.bytes
+        );
+    }
+
+    /// What iOS and Android read back from a voice note sent here: the file, its key, length
+    /// and waveform, under the id `codec` carries.
+    #[test]
+    fn a_sent_voice_note_reads_back_as_a_voice_note() {
+        let voice = Voice {
+            bytes: b"....ftypM4A voice".to_vec(),
+            duration_ms: 4200,
+            waveform: vec![0, 128, 255],
+        };
+        let sealed = construct_core::media::seal_media(&voice.bytes).unwrap();
+        let uploaded = crate::grpc::Uploaded {
+            media_id: "v-1".into(),
+            download_url: "https://media.example/v-1".into(),
+        };
+        let payload = voice_content(&voice, &uploaded, &sealed);
+        // The wire as iOS writes it (`MediaWireCodec.voiceMessageContent`).
+        use prost::Message;
+        let wire = crate::proto::messaging::v1::MessageContent::decode(&payload[..]).unwrap();
+        let Some(crate::proto::messaging::v1::message_content::Content::Voice(wire)) = wire.content
+        else {
+            panic!("not a voice message");
+        };
+        assert_eq!(wire.codec, format!("audio/m4a|v-1|{}", voice.bytes.len()));
+        assert_eq!(wire.file_hash.as_ref(), sealed.sha256.as_slice());
+        assert_eq!(wire.waveform, [0, 128, 255]);
+        assert_eq!(
+            crate::content::parse(&payload),
+            Some(crate::content::Content::Message {
+                text: String::new(),
+                quote: None,
+                attachment: Some(Attachment::Voice),
+            })
+        );
+        let files = crate::content::media_files(&payload);
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].media_id, "v-1");
+        assert_eq!(files[0].key.as_slice(), sealed.key.as_slice());
+        let info = &files[0].info;
+        assert_eq!(info.mime, "audio/m4a");
+        assert_eq!(info.size, voice.bytes.len() as u64);
+        assert_eq!(info.duration_ms, 4200);
+        assert_eq!(info.waveform, [0, 128, 255]);
+        assert_eq!(
+            construct_core::media::open_media(&files[0].key, &sealed.blob).unwrap(),
+            voice.bytes
+        );
+    }
+
+    #[test]
+    fn only_an_mp4_of_a_voice_note_length_goes() {
+        let voice = |bytes: &[u8], duration_ms| Voice {
+            bytes: bytes.to_vec(),
+            duration_ms,
+            waveform: Vec::new(),
+        };
+        assert!(check_voice(&voice(b"\0\0\0\x18ftypM4A ", 1_000)).is_ok());
+        assert!(
+            check_voice(&voice(b"OggS\0\0\0\0", 1_000)).is_err(),
+            "not MP4"
+        );
+        assert!(
+            check_voice(&voice(b"\0\0\0\x18ftypM4A ", 0)).is_err(),
+            "empty"
+        );
+        assert!(
+            check_voice(&voice(b"\0\0\0\x18ftypM4A ", MAX_VOICE_MS + 2_000)).is_err(),
+            "longer than five minutes"
         );
     }
 

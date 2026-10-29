@@ -132,6 +132,39 @@ impl Client {
         });
     }
 
+    /// Send a voice note: sealed by the core, uploaded, then sent like any message. Runs aside,
+    /// as [`Self::send_file`] does.
+    pub(super) fn send_voice(&self, contact_id: String, voice: crate::outgoing::Voice) {
+        let Some(orch) = self.orch_handle.clone() else {
+            return;
+        };
+        let grpc = self.grpc.clone();
+        let events = self.events.clone();
+        tokio::spawn(async move {
+            let fail = |reason: String| {
+                tracing::warn!("voice note not sent: {reason}");
+                let _ = events.send(ClientEvent::Notice(format!(
+                    "Voice note not sent: {reason}"
+                )));
+            };
+            if let Err(reason) = crate::outgoing::check_voice(&voice) {
+                return fail(reason.into());
+            }
+            let sealed = match construct_core::media::seal_media(&voice.bytes) {
+                Ok(sealed) => sealed,
+                Err(e) => return fail(e.to_string()),
+            };
+            let uploaded =
+                match crate::grpc::upload_media(&grpc, &sealed.blob, &sealed.sha256).await {
+                    Ok(uploaded) => uploaded,
+                    Err(e) => return fail(e.to_string()),
+                };
+            tracing::info!(media_id = %uploaded.media_id, ms = voice.duration_ms, "voice note uploaded");
+            let payload = crate::outgoing::voice_content(&voice, &uploaded, &sealed);
+            orch.send_payload(contact_id, Uuid::new_v4().to_string(), payload);
+        });
+    }
+
     /// Fetch and open file `index` of message `message_id`; the result comes as
     /// [`ClientEvent::Media`]. Runs aside, so a large download holds up nothing else.
     pub(super) fn load_media(&self, message_id: String, index: usize) {

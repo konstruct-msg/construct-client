@@ -86,6 +86,11 @@ pub enum ClientCommand {
         bytes: Vec<u8>,
         caption: String,
     },
+    /// Send a voice note recorded here (AAC in MP4, as iOS and Android record one).
+    SendVoice {
+        contact_id: String,
+        voice: crate::outgoing::Voice,
+    },
     /// Send `text` to `contact_id` as an answer to their message or ours, `to`.
     Reply {
         contact_id: String,
@@ -567,6 +572,7 @@ impl Client {
                 bytes,
                 caption,
             } => self.send_file(contact_id, name, bytes, caption),
+            ClientCommand::SendVoice { contact_id, voice } => self.send_voice(contact_id, voice),
             ClientCommand::Reply {
                 contact_id,
                 text,

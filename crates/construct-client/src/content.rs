@@ -249,6 +249,9 @@ pub struct MediaInfo {
     pub width: u32,
     pub height: u32,
     pub duration_ms: u32,
+    /// A voice note's loudness over its length, 0..=255 a bar (iOS and Android send 100).
+    #[serde(default)]
+    pub waveform: Vec<u8>,
 }
 
 /// The sticker a `MessageContent` names, when it names a valid one.
@@ -288,6 +291,9 @@ impl std::fmt::Debug for MediaFile {
     }
 }
 
+/// Bars of a voice note's waveform kept; iOS and Android send 100.
+const MAX_WAVEFORM: usize = 256;
+
 /// Longest server media id taken; it names a file in the cache, so only `[A-Za-z0-9_-]`.
 const MAX_MEDIA_ID_LEN: usize = 128;
 
@@ -313,6 +319,7 @@ pub fn media_files(payload: &[u8]) -> Vec<MediaFile> {
                 width: dimensions.width,
                 height: dimensions.height,
                 duration_ms: m.duration_ms.unwrap_or(0),
+                waveform: Vec::new(),
             },
         )
     };
@@ -336,6 +343,12 @@ pub fn media_files(payload: &[u8]) -> Vec<MediaFile> {
                     mime: mime.to_owned(),
                     size,
                     duration_ms: voice.duration_ms,
+                    waveform: voice
+                        .waveform
+                        .iter()
+                        .take(MAX_WAVEFORM)
+                        .map(|&v| v.min(255) as u8)
+                        .collect(),
                     ..Default::default()
                 },
             )
@@ -582,6 +595,23 @@ mod tests {
         assert_eq!(files[0].info.size, 5000);
         assert_eq!(files[0].info.duration_ms, 4200);
         assert_eq!(files[0].info.kind, Some(Attachment::Voice));
+    }
+
+    /// A sender's waveform is shown as bars, 0..=255 each, at most a few hundred of them.
+    #[test]
+    fn a_voice_waveform_is_kept_within_bounds() {
+        use crate::proto::messaging::v1::VoiceMessage;
+        let mut waveform = vec![0, 255, 256, u32::MAX];
+        waveform.resize(1000, 7);
+        let payload = bytes(message_content::Content::Voice(VoiceMessage {
+            encryption_key: vec![1u8; 32].into(),
+            codec: "audio/m4a|v-1|10".into(),
+            waveform,
+            ..Default::default()
+        }));
+        let info = &media_files(&payload)[0].info;
+        assert_eq!(info.waveform[..4], [0, 255, 255, 255]);
+        assert_eq!(info.waveform.len(), MAX_WAVEFORM);
     }
 
     #[test]
