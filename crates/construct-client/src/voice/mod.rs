@@ -7,6 +7,7 @@
 //! −50…0 dBFS as 0…1, averaged down to 100 bars — over the whole recording (iOS keeps the last
 //! 400 levels only, so its long notes show their last 20 seconds).
 
+mod m4a;
 mod recorder;
 
 pub use recorder::Recorder;
@@ -20,8 +21,7 @@ const BARS: usize = 100;
 /// Rates the file is written at as captured; anything else is resampled to 44.1 kHz.
 const NATIVE_RATES: [u32; 2] = [44_100, 48_000];
 const BIT_RATE: u32 = 64_000;
-/// Samples per AAC frame.
-const FRAME: usize = 1024;
+const FRAME: usize = m4a::FRAME as usize;
 
 /// A level 0..=1 for `samples` (−1..1): their power in dBFS, −50 dBFS and below as 0.
 pub fn level(samples: &[f32]) -> f32 {
@@ -120,61 +120,7 @@ fn m4a(pcm: &[f32], rate: u32) -> Result<Vec<u8>, String> {
             frames.push(out[..info.output_size].to_vec());
         }
     }
-    mux(&frames, rate)
-}
-
-fn mux(frames: &[Vec<u8>], rate: u32) -> Result<Vec<u8>, String> {
-    use mp4::{
-        AacConfig, AudioObjectType, ChannelConfig, MediaConfig, Mp4Config, Mp4Sample, Mp4Writer,
-        SampleFreqIndex, TrackConfig, TrackType,
-    };
-    let err = |e: mp4::Error| format!("M4A: {e}");
-    let brand = |b: &str| b.parse().map_err(err);
-    let mut file = std::io::Cursor::new(Vec::new());
-    let mut writer = Mp4Writer::write_start(
-        &mut file,
-        &Mp4Config {
-            major_brand: brand("M4A ")?,
-            minor_version: 512,
-            compatible_brands: vec![brand("M4A ")?, brand("isom")?, brand("mp42")?],
-            timescale: 1000,
-        },
-    )
-    .map_err(err)?;
-    writer
-        .add_track(&TrackConfig {
-            track_type: TrackType::Audio,
-            timescale: rate,
-            language: "und".into(),
-            media_conf: MediaConfig::AacConfig(AacConfig {
-                bitrate: BIT_RATE,
-                profile: AudioObjectType::AacLowComplexity,
-                // `encode` writes at one of `NATIVE_RATES` only.
-                freq_index: if rate == 48_000 {
-                    SampleFreqIndex::Freq48000
-                } else {
-                    SampleFreqIndex::Freq44100
-                },
-                chan_conf: ChannelConfig::Mono,
-            }),
-        })
-        .map_err(err)?;
-    for (i, frame) in frames.iter().enumerate() {
-        writer
-            .write_sample(
-                1,
-                &Mp4Sample {
-                    start_time: (i * FRAME) as u64,
-                    duration: FRAME as u32,
-                    rendering_offset: 0,
-                    is_sync: true,
-                    bytes: bytes::Bytes::copy_from_slice(frame),
-                },
-            )
-            .map_err(err)?;
-    }
-    writer.write_end().map_err(err)?;
-    Ok(file.into_inner())
+    Ok(m4a::write(&frames, rate, BIT_RATE))
 }
 
 #[cfg(test)]

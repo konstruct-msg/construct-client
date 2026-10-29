@@ -31,6 +31,59 @@ fn a_recording_becomes_an_m4a_voice_note() {
     assert!((12_000..24_000).contains(&size), "{size} bytes");
 }
 
+/// An independent decoder reads the file back as the sound it was: Symphonia, as the desktop
+/// plays notes with it, and a stricter parser than Apple's.
+#[test]
+fn a_recording_decodes_back_to_its_sound() {
+    use symphonia::core::codecs::audio::AudioDecoderOptions;
+    use symphonia::core::formats::probe::Hint;
+    use symphonia::core::formats::{FormatOptions, TrackType};
+    use symphonia::core::io::MediaSourceStream;
+
+    let voice = encode(&tone(1.0, 44_100, 0.5), 44_100).unwrap();
+    let source = MediaSourceStream::new(
+        Box::new(std::io::Cursor::new(voice.bytes)),
+        Default::default(),
+    );
+    let mut format = symphonia::default::get_probe()
+        .probe(
+            &Hint::new(),
+            source,
+            FormatOptions::default(),
+            Default::default(),
+        )
+        .expect("the file parses");
+    let track = format.default_track(TrackType::Audio).unwrap();
+    let id = track.id;
+    let mut decoder = symphonia::default::get_codecs()
+        .make_audio_decoder(
+            track.codec_params.as_ref().unwrap().audio().unwrap(),
+            &AudioDecoderOptions::default(),
+        )
+        .unwrap();
+    let (mut samples, mut loudest, mut rate) = (0, 0f32, 0);
+    let mut buf = Vec::new();
+    while let Ok(Some(packet)) = format.next_packet() {
+        if packet.track_id != id {
+            continue;
+        }
+        let decoded = decoder.decode(&packet).expect("every frame decodes");
+        rate = decoded.spec().rate();
+        assert_eq!(decoded.spec().channels().count(), 1);
+        buf.resize(decoded.samples_interleaved(), 0f32);
+        decoded.copy_to_slice_interleaved(&mut buf);
+        samples += buf.len();
+        loudest = buf.iter().fold(loudest, |m, s| m.max(s.abs()));
+    }
+    assert_eq!(rate, 44_100);
+    let secs = samples as f32 / 44_100.0;
+    assert!((1.0..1.2).contains(&secs), "{secs} s");
+    assert!(
+        (0.4..0.6).contains(&loudest),
+        "the tone at half scale: {loudest}"
+    );
+}
+
 #[test]
 fn an_unusual_rate_is_resampled_to_44_1_khz() {
     let voice = encode(&tone(1.0, 16_000, 0.5), 16_000).unwrap();
