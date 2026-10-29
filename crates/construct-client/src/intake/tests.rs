@@ -99,3 +99,86 @@ fn a_card_from_our_device_is_our_key() {
         crate::own_copy::Copy::IntakeKey(key(2, 8))
     );
 }
+
+/// A contact's key is theirs by account, and a lower or equal generation does not replace it.
+#[test]
+fn a_contacts_key_is_kept_by_account_and_only_moves_forward() {
+    let local = crate::local_store::LocalStore::open_in_memory().unwrap();
+    let store = Store(&local);
+    assert_eq!(store.peer("bob"), None);
+    assert!(store.offer_peer("Bob", &key(2, 2)));
+    assert_eq!(
+        store.peer("bob"),
+        Some(key(2, 2)),
+        "filed by the account, any case"
+    );
+    assert!(!store.offer_peer("bob", &key(1, 1)), "a late card");
+    assert!(!store.offer_peer("bob", &key(2, 3)), "the same generation");
+    assert_eq!(store.peer("bob"), Some(key(2, 2)));
+    assert!(store.offer_peer("bob", &key(3, 3)));
+    assert_eq!(store.peer("bob"), Some(key(3, 3)));
+    let short = IntakeKeyState {
+        generation: 9,
+        key: vec![1; 31],
+    };
+    assert!(!store.offer_peer("bob", &short), "a malformed key");
+    assert_eq!(store.peer("bob"), Some(key(3, 3)));
+    assert_eq!(store.peer("carol"), None);
+}
+
+/// A refused key rests for the epoch it was refused in, for that contact only.
+#[test]
+fn a_refused_key_rests_until_the_epoch_rolls() {
+    let mut suspended = Suspended::default();
+    suspended.suspend("Bob", 100);
+    assert!(suspended.is_suspended("bob", 100));
+    assert!(!suspended.is_suspended("bob", 101));
+    assert!(!suspended.is_suspended("carol", 100));
+    suspended.suspend("carol", 101);
+    assert!(
+        !suspended.is_suspended("bob", 100),
+        "past epochs are dropped"
+    );
+    assert!(suspended.is_suspended("carol", 101));
+}
+
+#[test]
+fn only_not_accepted_suspends() {
+    use crate::proto::services::v1::IntakeVerdict;
+    assert!(suspends(IntakeVerdict::NotAccepted as i32));
+    for v in [
+        IntakeVerdict::Unspecified,
+        IntakeVerdict::None,
+        IntakeVerdict::Accepted,
+        IntakeVerdict::Unchecked,
+    ] {
+        assert!(!suspends(v as i32), "{v:?}");
+    }
+}
+
+/// What the server opens with its token key is the tag the recipient published for today.
+#[test]
+fn the_server_opens_the_tag_the_contact_published() {
+    use chacha20poly1305::aead::{Aead, KeyInit};
+    use x25519_dalek::{PublicKey, StaticSecret};
+    let server = StaticSecret::from([7u8; 32]);
+    let server_pub = PublicKey::from(&server).as_bytes().to_vec();
+    let theirs = key(4, 9);
+    let sealed = sealed_tag(&theirs, "bob", 100, server_pub).unwrap();
+
+    let eph = PublicKey::from(<[u8; 32]>::try_from(&sealed[..32]).unwrap());
+    let shared = server.diffie_hellman(&eph);
+    let mut k = [0u8; 32];
+    hkdf::Hkdf::<sha2::Sha256>::new(None, shared.as_bytes())
+        .expand(b"construct-token-seal-v1", &mut k)
+        .unwrap();
+    let opened = chacha20poly1305::ChaCha20Poly1305::new((&k).into())
+        .decrypt(sealed[32..44].into(), &sealed[44..])
+        .unwrap();
+    assert_eq!(
+        opened,
+        window(&theirs, "bob", 100)[0].1,
+        "the tag of their window for this epoch"
+    );
+    assert_eq!(sealed_tag(&theirs, "bob", 100, vec![1; 31]), None);
+}

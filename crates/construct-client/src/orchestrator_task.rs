@@ -318,11 +318,27 @@ enum OrchestratorCommand {
         evidence: crate::device_certs::Evidence,
         keys: crate::device_certs::SubjectKeys,
     },
-    /// The sealed sender worker sent `local_id`; the server calls it `server_id`.
+    /// What became of the sealed envelope of `local_id` to `device`; `vouched` when it presented
+    /// the recipient's intake tag instead of a token.
+    SealedSettled {
+        device: String,
+        local_id: String,
+        vouched: bool,
+        outcome: SealedOutcome,
+    },
+}
+
+#[derive(Debug)]
+enum SealedOutcome {
+    /// Accepted; the server calls it `server_id`, and says of the tag it carried `intake_verdict`.
     Sent {
         server_id: String,
-        local_id: String,
+        intake_verdict: i32,
     },
+    Failed,
+    /// Refused on Privacy Pass grounds although it presented a tag: proof the tag was not
+    /// honoured, since an honoured one is never asked for a token. Sent again, paying.
+    CredentialRefused(Box<SealedInner>),
 }
 
 /// One send, queued for the worker that sends them in order.
@@ -331,6 +347,8 @@ enum Outbound {
     Sealed {
         inner: Box<SealedInner>,
         local_id: String,
+        device: String,
+        vouched: bool,
     },
     /// A copy to one of our own devices: identified, on the authenticated connection.
     OwnCopy { envelope: Box<Envelope> },
@@ -414,25 +432,41 @@ fn spawn_sender(
     tokio::spawn(async move {
         while let Some(outbound) = rx.recv().await {
             match outbound {
-                Outbound::Sealed { inner, local_id } => {
-                    match crate::grpc::send_sealed_message(&anonymous, &inner).await {
+                Outbound::Sealed {
+                    inner,
+                    local_id,
+                    device,
+                    vouched,
+                } => {
+                    let outcome = match crate::grpc::send_sealed_message(&anonymous, &inner).await {
                         Ok(crate::grpc::SealedSent {
                             message_id: server_id,
                             intake_verdict,
                         }) => {
-                            tracing::info!(%local_id, %server_id, intake_verdict, "sealed message sent");
-                            let _ = cmd_tx.send(OrchestratorCommand::Sent {
+                            tracing::info!(%local_id, %server_id, vouched, intake_verdict, "sealed message sent");
+                            SealedOutcome::Sent {
                                 server_id,
-                                local_id,
-                            });
+                                intake_verdict,
+                            }
+                        }
+                        Err(e) if vouched && is_privacy_pass_refusal(&e) => {
+                            tracing::info!(%local_id, error = %e, "intake tag not honoured — sending again with a token");
+                            SealedOutcome::CredentialRefused(inner)
                         }
                         Err(e) => {
                             tracing::warn!(%local_id, error = %e, "sealed send failed");
                             let _ = internal_tx.send(crate::client::ClientEvent::Bridge(
                                 BridgeEvent::Error(format!("[SEND_FAILED] {e}")),
                             ));
+                            SealedOutcome::Failed
                         }
-                    }
+                    };
+                    let _ = cmd_tx.send(OrchestratorCommand::SealedSettled {
+                        device,
+                        local_id,
+                        vouched,
+                        outcome,
+                    });
                 }
                 // Best effort, as on iOS: a copy that does not arrive costs a bubble on the other
                 // device, not the message.
@@ -447,6 +481,12 @@ fn spawn_sender(
         }
     });
     tx
+}
+
+/// The server's Privacy Pass enforcement refusing an envelope: FAILED_PRECONDITION
+/// `privacy_pass:{label}` (iOS `StealthSendRecovery`).
+fn is_privacy_pass_refusal(e: &crate::grpc::GrpcError) -> bool {
+    matches!(e, crate::grpc::GrpcError::Status { code: 9, message } if message.contains("privacy_pass:"))
 }
 
 // ── The task ──────────────────────────────────────────────────────────────────
@@ -481,6 +521,11 @@ struct Task {
     wallet: crate::tokens::Wallet,
     issuance: crate::tokens::Issuance,
     spend_units: crate::tokens::SpendUnits,
+    /// Contacts whose intake key the server did not accept this epoch.
+    intake_suspended: crate::intake::Suspended,
+    /// Our card on its way to a contact's device: (message id, device), marked as handed over
+    /// when the server takes it.
+    cards_in_flight: HashSet<(String, String)>,
 }
 
 impl Task {
@@ -528,6 +573,8 @@ impl Task {
             wallet,
             issuance: crate::tokens::Issuance::default(),
             spend_units: crate::tokens::SpendUnits::default(),
+            intake_suspended: crate::intake::Suspended::default(),
+            cards_in_flight: HashSet::new(),
         }
     }
 
@@ -838,13 +885,14 @@ impl Task {
                 keys,
             } => self.vouch(device_id, &evidence, &keys),
             OrchestratorCommand::TokensIssued(result) => self.tokens_issued(result),
-            OrchestratorCommand::Sent {
-                server_id,
+            OrchestratorCommand::SealedSettled {
+                device,
                 local_id,
+                vouched,
+                outcome,
             } => {
-                if let Err(e) = self.storage.record_server_message_id(&server_id, &local_id) {
-                    tracing::warn!(%server_id, error = %e, "failed to record server message id");
-                }
+                self.sealed_settled(device, local_id, vouched, outcome)
+                    .await
             }
         }
     }
@@ -1389,13 +1437,101 @@ impl Task {
             }
         };
         let mut inner = sealing::sealed_inner(&account, device, body, content_type);
-        self.pay(&mut inner, &account, &local_id).await;
+        // An envelope the recipient vouched for owes nothing; every other one pays.
+        let vouched = self.present_tag(&mut inner, &account).await;
+        if !vouched {
+            self.pay(&mut inner, &account, &local_id).await;
+        }
         self.sealed_tx
             .send(Outbound::Sealed {
                 inner: Box::new(inner),
                 local_id,
+                device: device.to_string(),
+                vouched,
             })
             .map_err(|_| "sealed sender worker stopped".to_string())
+    }
+
+    /// Attach `account`'s intake tag for today, sealed to the server, when we hold their key and
+    /// the server has not refused it today. Whether it was attached; without it the envelope pays,
+    /// as every envelope did before cards.
+    async fn present_tag(&mut self, inner: &mut SealedInner, account: &str) -> bool {
+        let epoch = crate::intake::epoch_now();
+        if self.intake_suspended.is_suspended(account, epoch) {
+            return false;
+        }
+        let Some(key) = crate::intake::Store(&self.storage).peer(account) else {
+            return false;
+        };
+        let Some(server_key) = self.token_key().await else {
+            return false;
+        };
+        match crate::intake::sealed_tag(&key, account, epoch, server_key) {
+            Some(sealed) => {
+                inner.intake_tag_sealed = sealed.into();
+                true
+            }
+            None => {
+                tracing::warn!("intake tag not derived or sealed — the envelope pays");
+                false
+            }
+        }
+    }
+
+    /// The sender worker's word on one sealed envelope.
+    async fn sealed_settled(
+        &mut self,
+        device: String,
+        local_id: String,
+        vouched: bool,
+        outcome: SealedOutcome,
+    ) {
+        let card = self
+            .cards_in_flight
+            .remove(&(local_id.clone(), device.clone()));
+        let account = self.address_of(&device).map(|(account, _)| account);
+        match outcome {
+            SealedOutcome::Sent {
+                server_id,
+                intake_verdict,
+            } => {
+                if let Err(e) = self.storage.record_server_message_id(&server_id, &local_id) {
+                    tracing::warn!(%server_id, error = %e, "failed to record server message id");
+                }
+                if card {
+                    crate::intake::Store(&self.storage).mark_sent(std::slice::from_ref(&device));
+                }
+                if vouched
+                    && crate::intake::suspends(intake_verdict)
+                    && let Some(account) = account
+                {
+                    tracing::info!(
+                        "intake tag not accepted — paying tokens to this contact until the epoch rolls"
+                    );
+                    self.intake_suspended
+                        .suspend(&account, crate::intake::epoch_now());
+                }
+            }
+            SealedOutcome::Failed => {}
+            // Once: the envelope sent again carries no tag, so it cannot come back here.
+            SealedOutcome::CredentialRefused(mut inner) => {
+                let Some(account) = account else { return };
+                self.intake_suspended
+                    .suspend(&account, crate::intake::epoch_now());
+                inner.intake_tag_sealed = Default::default();
+                self.pay(&mut inner, &account, &local_id).await;
+                if card {
+                    self.cards_in_flight
+                        .insert((local_id.clone(), device.clone()));
+                }
+                let _ = self.sealed_tx.send(Outbound::Sealed {
+                    inner,
+                    local_id,
+                    device,
+                    vouched: false,
+                });
+            }
+        }
     }
 
     /// A delivery receipt (ct 14) for `message_id` back to the device that wrote it. Queued as
@@ -1638,7 +1774,15 @@ impl Task {
             plaintext: framed,
             content_type: 0,
         };
+        let account = match &event {
+            IncomingEvent::OutgoingMessage { contact_id, .. } => contact_id.clone(),
+            _ => unreachable!(),
+        };
         for event in self.prepare_outgoing(event).await {
+            self.process(event).await;
+        }
+        // We wrote to them: our card to their devices that lack it.
+        for event in self.card_for(&account) {
             self.process(event).await;
         }
     }
@@ -1826,6 +1970,73 @@ impl Task {
                 generation = own.generation,
                 "intake key handed to our devices"
             );
+        }
+    }
+
+    /// Our card for each device of `account` we hold a session with and have not handed our
+    /// current key, once (iOS `sendContactCard`): when we first hear from it and when we first
+    /// write to it. Never swept across the contact list — each card is a sealed envelope, for
+    /// contacts the person may never write to again. Nothing while our key is not settled.
+    fn card_for(&mut self, account: &str) -> Vec<IncomingEvent> {
+        if account == self.identity.user_id {
+            return Vec::new();
+        }
+        let store = crate::intake::Store(&self.storage);
+        let own = match store.own() {
+            crate::intake::Held::Key(key) if key.generation > 0 => key,
+            _ => return Vec::new(),
+        };
+        let sent = store.sent_to();
+        let owed: Vec<String> = self
+            .peers
+            .devices_of(account)
+            .into_iter()
+            .filter(|d| {
+                *d != self.identity.device_id
+                    && self.orchestrator.has_active_session(d)
+                    && !sent.contains(d)
+                    && !self.cards_in_flight.iter().any(|(_, sent_to)| sent_to == d)
+            })
+            .collect();
+        if owed.is_empty() {
+            return Vec::new();
+        }
+        let id = uuid::Uuid::new_v4().to_string();
+        let frame = crate::knst::frame_whole(
+            &crate::intake::own_card(&own),
+            crate::knst::CONTENT_CONTACT_CARD,
+            &id,
+        );
+        tracing::info!(
+            devices = owed.len(),
+            generation = own.generation,
+            "our card to a contact"
+        );
+        owed.into_iter()
+            .map(|device| {
+                self.cards_in_flight.insert((id.clone(), device.clone()));
+                IncomingEvent::OutgoingMessage {
+                    contact_id: device,
+                    message_id: id.clone(),
+                    plaintext: frame.clone(),
+                    content_type: 0,
+                }
+            })
+            .collect()
+    }
+
+    /// A contact's card: the key their account accepts, filed by account — the tag is derived
+    /// over their account id. Our own account's card comes only inside SENDER_SYNC from one of
+    /// our devices (`handle_own_copy`); one arriving here under our id is filed nowhere.
+    fn card_received(&mut self, account: &str, body: &[u8]) {
+        if account == self.identity.user_id {
+            return tracing::warn!("our own card outside SENDER_SYNC — dropped");
+        }
+        let Some(key) = crate::intake::card_key(body) else {
+            return tracing::warn!("contact card without a key");
+        };
+        if crate::intake::Store(&self.storage).offer_peer(account, &key) {
+            tracing::info!(generation = key.generation, "contact's intake key kept");
         }
     }
 
@@ -2057,6 +2268,8 @@ impl Task {
                         place_inbound(&self.storage, from, &id, content, &payload, now_ms())
                     {
                         self.cursor.commit(&self.storage, &message_id);
+                        // We heard from them: our card to their devices that lack it.
+                        follow_ups.extend(self.card_for(&account));
                         self.fetch_on_arrival(event.as_ref(), &payload);
                         if let Some(event) = event {
                             let _ = self
@@ -2082,6 +2295,9 @@ impl Task {
                 } else if content_type == crate::knst::CONTENT_PROFILE {
                     let account = self.account_of(&contact_id);
                     self.profile_received(&account, &body);
+                } else if content_type == crate::knst::CONTENT_CONTACT_CARD {
+                    let account = self.account_of(&contact_id);
+                    self.card_received(&account, &body);
                 } else {
                     // Heartbeat, card, profile, read markers, retired ping/ready: never shown.
                     tracing::debug!(content_type, "control frame — not handled by the TUI");
@@ -3012,6 +3228,11 @@ mod tests {
     const OWN_ACCOUNT: &str = "753f79af-ede4-432c-9fcd-41deb5a35f0e";
 
     fn test_task() -> Task {
+        test_task_sending().0
+    }
+
+    /// A task, and what it queues for the sealed sender worker.
+    pub(super) fn test_task_sending() -> (Task, mpsc::UnboundedReceiver<Outbound>) {
         let client = ClassicClient::<ClassicSuiteProvider>::new()
             .expect("test ClassicClient should initialize");
         let orchestrator = Orchestrator::new(client, "device-a".to_string());
@@ -3019,9 +3240,9 @@ mod tests {
         let cursor = CursorTracker::load(&storage);
         let (internal_tx, _internal_rx) = mpsc::unbounded_channel();
         let (self_tx, _self_rx) = mpsc::unbounded_channel();
-        let (sealed_tx, _sealed_rx) = mpsc::unbounded_channel();
+        let (sealed_tx, sealed_rx) = mpsc::unbounded_channel();
         let (self_cmd, _self_cmd_rx) = mpsc::unbounded_channel();
-        Task::new(
+        let task = Task::new(
             orchestrator,
             storage,
             internal_tx,
@@ -3038,6 +3259,222 @@ mod tests {
             },
             self_tx,
             self_cmd,
+        );
+        (task, sealed_rx)
+    }
+}
+
+#[cfg(test)]
+mod intake_tests {
+    use super::*;
+    use construct_core::intake::IntakeKeyState;
+
+    const BOB: &str = "2f1d6c1e-6c39-4f8e-9a51-0d7d3c7a9b10";
+
+    fn their_key(generation: u32) -> IntakeKeyState {
+        IntakeKeyState {
+            generation,
+            key: vec![generation as u8; 32],
+        }
+    }
+
+    /// A task that knows one device of Bob's and holds the server's token key.
+    fn task_with_bob() -> (Task, mpsc::UnboundedReceiver<Outbound>, String) {
+        let (mut task, rx) = tests::test_task_sending();
+        let identity = vec![5u8; 32];
+        let device = construct_core::device_id::derive_device_id(&identity);
+        assert!(task.peers.record(&task.storage, BOB, &device, &identity));
+        task.certificate = Some(crate::grpc::SenderCertificate {
+            bytes: Vec::new(),
+            expires_at: i64::MAX,
+            token_key: x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from([7; 32]))
+                .as_bytes()
+                .to_vec(),
+        });
+        (task, rx, device)
+    }
+
+    fn not_accepted() -> i32 {
+        crate::proto::services::v1::IntakeVerdict::NotAccepted as i32
+    }
+
+    #[tokio::test]
+    async fn an_envelope_presents_the_tag_of_a_key_we_hold_and_not_one_refused_today() {
+        let (mut task, _rx, _) = task_with_bob();
+        let mut inner = SealedInner::default();
+        assert!(
+            !task.present_tag(&mut inner, BOB).await,
+            "no card from them yet"
+        );
+        assert!(inner.intake_tag_sealed.is_empty());
+
+        crate::intake::Store(&task.storage).offer_peer(BOB, &their_key(2));
+        assert!(task.present_tag(&mut inner, BOB).await);
+        assert!(!inner.intake_tag_sealed.is_empty());
+
+        task.intake_suspended
+            .suspend(BOB, crate::intake::epoch_now());
+        let mut inner = SealedInner::default();
+        assert!(
+            !task.present_tag(&mut inner, BOB).await,
+            "refused today: it pays"
+        );
+        assert!(inner.intake_tag_sealed.is_empty());
+    }
+
+    #[tokio::test]
+    async fn not_accepted_on_a_tag_we_presented_rests_their_key_for_the_day() {
+        let epoch = crate::intake::epoch_now();
+        for (vouched, verdict, rests) in [
+            (true, not_accepted(), true),
+            (false, not_accepted(), false),
+            (
+                true,
+                crate::proto::services::v1::IntakeVerdict::Unchecked as i32,
+                false,
+            ),
+        ] {
+            let (mut task, _rx, device) = task_with_bob();
+            task.sealed_settled(
+                device,
+                "m1".into(),
+                vouched,
+                SealedOutcome::Sent {
+                    server_id: "s1".into(),
+                    intake_verdict: verdict,
+                },
+            )
+            .await;
+            assert_eq!(
+                task.intake_suspended.is_suspended(BOB, epoch),
+                rests,
+                "vouched {vouched}, verdict {verdict}"
+            );
+        }
+    }
+
+    /// A device counts as handed our card when the server took the envelope, not before.
+    #[tokio::test]
+    async fn a_card_is_handed_over_when_the_server_takes_it() {
+        let (mut task, _rx, device) = task_with_bob();
+        task.cards_in_flight
+            .insert(("card-1".into(), device.clone()));
+        task.sealed_settled(
+            device.clone(),
+            "card-1".into(),
+            false,
+            SealedOutcome::Failed,
         )
+        .await;
+        assert!(task.cards_in_flight.is_empty());
+        assert!(crate::intake::Store(&task.storage).sent_to().is_empty());
+
+        task.cards_in_flight
+            .insert(("card-2".into(), device.clone()));
+        task.sealed_settled(
+            device.clone(),
+            "other".into(),
+            false,
+            SealedOutcome::Sent {
+                server_id: "s0".into(),
+                intake_verdict: 0,
+            },
+        )
+        .await;
+        assert!(
+            crate::intake::Store(&task.storage).sent_to().is_empty(),
+            "another message to that device"
+        );
+        task.sealed_settled(
+            device.clone(),
+            "card-2".into(),
+            false,
+            SealedOutcome::Sent {
+                server_id: "s1".into(),
+                intake_verdict: 0,
+            },
+        )
+        .await;
+        assert_eq!(crate::intake::Store(&task.storage).sent_to(), [device]);
+        assert!(task.cards_in_flight.is_empty());
+    }
+
+    /// A Privacy Pass refusal of a vouched envelope: sent again once, without the tag, and the
+    /// key rests for the day.
+    #[tokio::test]
+    async fn a_refused_tag_is_sent_again_without_it() {
+        let (mut task, mut rx, device) = task_with_bob();
+        let inner = SealedInner {
+            intake_tag_sealed: vec![1; 76].into(),
+            ..Default::default()
+        };
+        task.cards_in_flight
+            .insert(("card-1".into(), device.clone()));
+        task.sealed_settled(
+            device.clone(),
+            "card-1".into(),
+            true,
+            SealedOutcome::CredentialRefused(Box::new(inner)),
+        )
+        .await;
+        assert!(
+            task.intake_suspended
+                .is_suspended(BOB, crate::intake::epoch_now())
+        );
+        let Ok(Outbound::Sealed {
+            inner,
+            local_id,
+            device: to,
+            vouched,
+        }) = rx.try_recv()
+        else {
+            panic!("not sent again");
+        };
+        assert!(inner.intake_tag_sealed.is_empty());
+        assert!(!inner.token_spend_id.is_empty(), "it pays");
+        assert!(!vouched, "so a second refusal is an ordinary failure");
+        assert_eq!(
+            (local_id.as_str(), to.as_str()),
+            ("card-1", device.as_str())
+        );
+        assert!(
+            task.cards_in_flight.contains(&("card-1".into(), device)),
+            "still a card on its way"
+        );
+    }
+
+    #[test]
+    fn a_privacy_pass_refusal_is_told_from_other_failures() {
+        use crate::grpc::GrpcError;
+        assert!(is_privacy_pass_refusal(&GrpcError::status(
+            9,
+            "SendSealedMessage refused: privacy_pass:missing"
+        )));
+        assert!(!is_privacy_pass_refusal(&GrpcError::status(
+            9,
+            "rate limited"
+        )));
+        assert!(!is_privacy_pass_refusal(&GrpcError::status(
+            8,
+            "privacy_pass:missing"
+        )));
+        assert!(!is_privacy_pass_refusal(&GrpcError::transport(
+            "privacy_pass:missing"
+        )));
+    }
+
+    /// A contact's card is kept by their account; one under our own id outside SENDER_SYNC is not.
+    #[test]
+    fn a_contacts_card_is_kept_and_our_own_is_not() {
+        let (mut task, _rx, _) = task_with_bob();
+        let card = crate::intake::own_card(&their_key(3));
+        task.card_received(BOB, &card);
+        assert_eq!(
+            crate::intake::Store(&task.storage).peer(BOB),
+            Some(their_key(3))
+        );
+        let own = task.identity.user_id.clone();
+        task.card_received(&own, &card);
+        assert_eq!(crate::intake::Store(&task.storage).peer(&own), None);
     }
 }
