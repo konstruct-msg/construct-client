@@ -2,9 +2,15 @@
 //! the mode is on (decisions/desktop-veil.md).
 //!
 //! - **Off**: every connection goes straight to the server.
+//! - **Auto** (the default, as on iOS): direct, until direct fails the way a block fails; then
+//!   through a front, and back to direct when a direct call answers.
 //! - **On**: every connection goes through a front, and none goes anywhere else
 //!   (decisions/veil-on-never-goes-direct.md): with no front up, requests fail instead of
 //!   leaving the tunnel.
+//!
+//! When to go through a front and when to come back is `veil::transport_route` — the reducer
+//! iOS and Android run on the same vectors — driven by what calls and the message stream report
+//! (`grpc::route::report`); the router here carries out what it decides.
 //!
 //! Fronts come signed (`veil::trust`): issued to this device with its capability while it is
 //! signed in — in any mode, so they are there before the mode is turned on — or from a
@@ -22,6 +28,9 @@ use std::time::Duration;
 use super::{Client, ClientEvent};
 use crate::grpc::route::{self, Route};
 use crate::local_store::LocalStore;
+use crate::veil::transport_route::{
+    Config, Effect, Event, Mode, State, StreamMethod, Target, initial, reduce,
+};
 use crate::veil::trust::{self, Front};
 use crate::veil::tunnel::Tunnel;
 
@@ -29,12 +38,6 @@ const KEY_MODE: &str = "veil.mode";
 const KEY_SK: &str = "veil.sk";
 const KEY_FRONTS: &str = "veil.fronts";
 
-/// After every front failed, before trying them again (iOS `veil_cooldown_ms`).
-const COOLDOWN: Duration = Duration::from_secs(30);
-/// How often a live tunnel is looked at.
-const WATCH: Duration = Duration::from_secs(10);
-/// Failed connections into the tunnel before its front is given up for the next one.
-const FRONT_FAILURES: u64 = 3;
 /// A capability is renewed when it has less than this left (iOS: 14 days).
 const RENEW_BEFORE: i64 = 14 * 24 * 3600;
 const ISSUE_RETRY: Duration = Duration::from_secs(60);
@@ -44,12 +47,14 @@ const ISSUE_RECHECK: Duration = Duration::from_secs(3600);
 #[serde(rename_all = "camelCase")]
 pub enum VeilMode {
     Off,
+    Auto,
     On,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "camelCase", tag = "kind")]
 pub enum VeilState {
+    /// Not through a front: VEIL off, or Auto on the direct path.
     Off,
     Connecting,
     /// Connected through this front (its host only).
@@ -115,10 +120,20 @@ fn now() -> i64 {
         .map_or(0, |d| d.as_secs() as i64)
 }
 
+/// The mode as kept: 0 off, 1 on, 2 auto; nothing kept is Auto, iOS's default.
 fn mode(store: &LocalStore) -> VeilMode {
     match store.secure_load(KEY_MODE) {
+        Ok(Some(v)) if v == [0] => VeilMode::Off,
         Ok(Some(v)) if v == [1] => VeilMode::On,
-        _ => VeilMode::Off,
+        _ => VeilMode::Auto,
+    }
+}
+
+fn mode_byte(mode: VeilMode) -> u8 {
+    match mode {
+        VeilMode::Off => 0,
+        VeilMode::On => 1,
+        VeilMode::Auto => 2,
     }
 }
 
@@ -262,32 +277,33 @@ impl Client {
         });
         let tunnel_loop = match mode {
             VeilMode::Off => {
+                route::set_sink(None);
                 route::set_route(Route::Direct);
+                let tunnel = self.veil_tunnel.clone();
+                tokio::spawn(async move {
+                    if let Some(t) = tunnel.lock().await.as_ref() {
+                        t.stop().await;
+                    }
+                });
                 None
             }
-            VeilMode::On => {
-                // Closed before the first front is up: nothing leaves outside the tunnel.
-                route::set_route(Route::Closed);
-                let scores = self.data.as_ref().map(|d| d.veil_scores_path());
-                let tunnel = self.veil_tunnel.clone();
-                match veil_sk(&store) {
-                    Ok(sk) => Some(
-                        tokio::spawn(keep_tunnel(
-                            Arc::new(Mutex::new(Fronts::Store(store.clone()))),
-                            sk,
-                            tunnel,
-                            scores,
-                            status.clone(),
-                        ))
-                        .abort_handle(),
-                    ),
-                    Err(e) => {
-                        tracing::warn!("{e}");
-                        status.update(|s| s.state = VeilState::NoFront);
-                        None
-                    }
+            VeilMode::Auto | VeilMode::On => match veil_sk(&store) {
+                Ok(sk) => Some(self.spawn_router(
+                    mode,
+                    Arc::new(Mutex::new(Fronts::Store(store.clone()))),
+                    sk,
+                    status.clone(),
+                )),
+                Err(e) => {
+                    tracing::warn!("{e}");
+                    route::set_route(if mode == VeilMode::On {
+                        Route::Closed
+                    } else {
+                        Route::Direct
+                    });
+                    None
                 }
-            }
+            },
         };
         self.drop_connections();
         let signed_in = self.orch_handle.is_some();
@@ -325,6 +341,7 @@ impl Client {
     /// The account is closed: back to direct, the tunnel down.
     pub(super) fn stop_veil(&mut self) {
         self.veil = None;
+        route::set_sink(None);
         route::set_route(Route::Direct);
         self.drop_connections();
         let tunnel = self.veil_tunnel.clone();
@@ -368,8 +385,7 @@ impl Client {
             }
             return;
         };
-        let byte = u8::from(mode == VeilMode::On);
-        if let Err(e) = store.secure_save(KEY_MODE, &[byte]) {
+        if let Err(e) = store.secure_save(KEY_MODE, &[mode_byte(mode)]) {
             return self.emit(ClientEvent::Notice(format!("Not changed: {e}")));
         }
         tracing::info!(?mode, "VEIL mode set");
@@ -388,7 +404,7 @@ impl Client {
                 tracing::info!(front = %host(&front.relay), "VEIL front added from a link");
                 let held = merge(&store, vec![front]).len();
                 self.veil_status().update(|s| s.fronts = held);
-                if mode(&store) == VeilMode::On {
+                if mode(&store) != VeilMode::Off {
                     self.start_veil();
                 }
             }
@@ -426,14 +442,7 @@ impl Client {
         // A bearer capability needs no key of ours; the device key is made with the account.
         let sk = zeroize::Zeroizing::new(rand::random::<[u8; 32]>());
         let source = Arc::new(Mutex::new(Fronts::Armed(front)));
-        let task = tokio::spawn(keep_tunnel(
-            source.clone(),
-            sk,
-            self.veil_tunnel.clone(),
-            None,
-            status,
-        ))
-        .abort_handle();
+        let task = self.spawn_router(VeilMode::On, source.clone(), sk, status);
         self.veil = Some(VeilRuntime {
             tunnel_loop: Some(task),
             provisioner: None,
@@ -448,7 +457,7 @@ impl Client {
             return;
         };
         let held = merge(&store, vec![front]).len();
-        if let Err(e) = store.secure_save(KEY_MODE, &[1]) {
+        if let Err(e) = store.secure_save(KEY_MODE, &[mode_byte(VeilMode::On)]) {
             tracing::warn!("VEIL mode not kept: {e}");
         }
         if let Err(e) = veil_sk(&store) {
@@ -468,65 +477,305 @@ impl Client {
     }
 }
 
-/// While the mode is on: a session to the newest live front, the route pointed at it, and the
-/// next front when it dies or stops carrying connections. With none answering, the route stays
-/// closed and the fronts are tried again after a pause.
-async fn keep_tunnel(
-    fronts: FrontSource,
+impl Client {
+    /// The router for `mode` (Auto or On), its fronts from `source`; its task's handle.
+    fn spawn_router(
+        &self,
+        mode: VeilMode,
+        source: FrontSource,
+        sk: zeroize::Zeroizing<[u8; 32]>,
+        status: Status,
+    ) -> tokio::task::AbortHandle {
+        let (sink, reports) = tokio::sync::mpsc::unbounded_channel();
+        route::set_sink(Some(sink));
+        let (tx, inputs) = tokio::sync::mpsc::unbounded_channel();
+        let router = Router {
+            mode: match mode {
+                VeilMode::On => Mode::On,
+                _ => Mode::Auto,
+            },
+            state: State::Direct { fails: 0 },
+            source,
+            sk,
+            holder: self.veil_tunnel.clone(),
+            scores: self.data.as_ref().map(|d| d.veil_scores_path()),
+            status,
+            clients: (self.grpc.clone(), self.anonymous.clone()),
+            demoted: Default::default(),
+            starting: false,
+            tx,
+        };
+        tokio::spawn(router.run(inputs, reports)).abort_handle()
+    }
+}
+
+/// What the router hears: a call or the stream (and whether it went through the tunnel), or the
+/// answer to something it set going.
+enum Input {
+    Report((route::Report, bool)),
+    Started { relay: String, port: u16 },
+    StartFailed(String),
+    CooldownElapsed,
+}
+
+/// Carries out what `veil::transport_route` decides: starts and stops the tunnel, points the
+/// route, drops connections, keeps score of fronts that failed.
+struct Router {
+    mode: Mode,
+    state: State,
+    source: FrontSource,
     sk: zeroize::Zeroizing<[u8; 32]>,
     holder: Arc<tokio::sync::Mutex<Option<Arc<Tunnel>>>>,
     scores: Option<std::path::PathBuf>,
     status: Status,
-) {
-    let tunnel = {
-        let mut held = holder.lock().await;
-        if held.is_none() {
-            match Tunnel::new(scores.as_deref()).await {
-                Ok(t) => *held = Some(Arc::new(t)),
-                Err(e) => {
-                    tracing::warn!("VEIL not started: {e}");
-                    return status.update(|s| s.state = VeilState::NoFront);
+    clients: (crate::grpc::GrpcClient, crate::grpc::GrpcClient),
+    /// Rotations each front caused: fewer first when a start picks one.
+    demoted: std::collections::HashMap<String, u32>,
+    starting: bool,
+    tx: tokio::sync::mpsc::UnboundedSender<Input>,
+}
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as i64)
+}
+
+impl Router {
+    async fn run(
+        mut self,
+        mut inputs: tokio::sync::mpsc::UnboundedReceiver<Input>,
+        mut reports: tokio::sync::mpsc::UnboundedReceiver<(route::Report, bool)>,
+    ) {
+        self.state = initial(self.mode, false, true);
+        // Starting direct (Auto): a session a router before this one left up goes now.
+        if self.state != State::VeilProbing
+            && let Some(t) = self.holder.lock().await.as_ref()
+        {
+            t.stop().await;
+        }
+        route::set_route(if self.mode == Mode::On {
+            Route::Closed
+        } else {
+            Route::Direct
+        });
+        self.show();
+        if self.state == State::VeilProbing {
+            self.apply(vec![Effect::RequestProxyStart]).await;
+        }
+        loop {
+            let input = tokio::select! {
+                Some(input) = inputs.recv() => input,
+                Some(report) = reports.recv() => Input::Report(report),
+                else => break,
+            };
+            let Some(event) = self.event(input) else {
+                continue;
+            };
+            let out = reduce(&self.state, &event, self.mode, Config::default(), now_ms());
+            if out.state != self.state {
+                tracing::info!(state = ?Brief(&out.state), "VEIL route");
+            }
+            self.state = out.state;
+            self.apply(out.effects).await;
+            self.show();
+        }
+    }
+
+    fn event(&mut self, input: Input) -> Option<Event> {
+        let via = |veil: bool, state: &State| match (veil, state) {
+            (true, State::VeilActive { relay, port, .. }) => Target::Veil {
+                port: *port,
+                relay: relay.clone(),
+            },
+            (true, _) => Target::Veil {
+                port: 0,
+                relay: String::new(),
+            },
+            (false, _) => Target::Direct,
+        };
+        Some(match input {
+            Input::Report((r, veil)) => {
+                let via = via(veil, &self.state);
+                match r {
+                    route::Report::RpcSucceeded { lane, latency_ms } => Event::RpcSucceeded {
+                        via,
+                        latency_ms,
+                        lane,
+                    },
+                    route::Report::RpcFailed { lane, failure } => Event::RpcFailed {
+                        failure,
+                        via,
+                        // A desktop has no background: every call is one the person waits on.
+                        foreground: true,
+                        lane,
+                    },
+                    route::Report::StreamOpened => Event::StreamOpened {
+                        method: if veil {
+                            StreamMethod::Veil
+                        } else {
+                            StreamMethod::H2
+                        },
+                        via,
+                    },
+                    route::Report::StreamFailed { failure } => Event::StreamFailed {
+                        method: if veil {
+                            StreamMethod::Veil
+                        } else {
+                            StreamMethod::H2
+                        },
+                        failure,
+                        via,
+                    },
+                }
+            }
+            Input::Started { relay, port } => {
+                self.starting = false;
+                Event::ProxyStarted {
+                    relay,
+                    port,
+                    restarted: false,
+                }
+            }
+            Input::StartFailed(reason) => {
+                self.starting = false;
+                Event::ProxyStartFailed {
+                    relay: None,
+                    reason,
+                }
+            }
+            Input::CooldownElapsed => Event::CooldownElapsed,
+        })
+    }
+
+    async fn apply(&mut self, effects: Vec<Effect>) {
+        for effect in effects {
+            match effect {
+                Effect::InvalidateGrpcClient => {
+                    let (a, b) = self.clients.clone();
+                    tokio::spawn(async move {
+                        a.invalidate().await;
+                        b.invalidate().await;
+                    });
+                }
+                Effect::SetVeilPort(Some(port)) => route::set_route(Route::Veil { port }),
+                // Away from the tunnel: direct under Auto, nowhere under On.
+                Effect::SetVeilPort(None) => route::set_route(if self.mode == Mode::On {
+                    Route::Closed
+                } else {
+                    Route::Direct
+                }),
+                // Inline, so a start that follows (a rotation) is not overtaken by it.
+                Effect::RequestProxyStop => {
+                    if let Some(t) = self.holder.lock().await.as_ref() {
+                        t.stop().await;
+                    }
+                }
+                Effect::RequestProxyStart => self.start(),
+                Effect::DemoteRelay(relay) => {
+                    tracing::info!(front = %host(&relay), "VEIL front demoted");
+                    *self.demoted.entry(relay).or_default() += 1;
+                }
+                Effect::ScheduleCooldownEnd(at_ms) => {
+                    let tx = self.tx.clone();
+                    let wait = Duration::from_millis((at_ms - now_ms()).max(0) as u64);
+                    tokio::spawn(async move {
+                        tokio::time::sleep(wait).await;
+                        let _ = tx.send(Input::CooldownElapsed);
+                    });
                 }
             }
         }
-        held.clone().expect("set above")
-    };
-    loop {
-        let candidates = fronts.lock().unwrap_or_else(|e| e.into_inner()).usable();
-        status.update(|s| s.fronts = candidates.len());
-        for front in &candidates {
-            status.update(|s| s.state = VeilState::Connecting);
-            match tunnel.start(front, &sk).await {
-                Ok(port) => {
-                    route::set_route(Route::Veil { port });
-                    tracing::info!(front = %host(&front.relay), port, "VEIL tunnel up");
-                    status.update(|s| {
-                        s.state = VeilState::Up {
-                            front: host(&front.relay),
-                        }
-                    });
-                    loop {
-                        tokio::time::sleep(WATCH).await;
-                        if !tunnel.is_alive().await {
-                            tracing::warn!(front = %host(&front.relay), "VEIL tunnel ended");
-                            break;
-                        }
-                        if route::tunnel_failures() >= FRONT_FAILURES {
-                            tracing::warn!(front = %host(&front.relay), "VEIL front not carrying connections");
-                            break;
+    }
+
+    /// Try the live fronts, the least demoted first, newest first among equals; the first that
+    /// answers is the tunnel.
+    fn start(&mut self) {
+        if self.starting {
+            return;
+        }
+        self.starting = true;
+        let mut fronts = self
+            .source
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .usable();
+        fronts.sort_by_key(|f| self.demoted.get(&f.relay).copied().unwrap_or(0));
+        let (holder, scores, sk, tx) = (
+            self.holder.clone(),
+            self.scores.clone(),
+            self.sk.clone(),
+            self.tx.clone(),
+        );
+        tokio::spawn(async move {
+            let tunnel = {
+                let mut held = holder.lock().await;
+                if held.is_none() {
+                    match Tunnel::new(scores.as_deref()).await {
+                        Ok(t) => *held = Some(Arc::new(t)),
+                        Err(e) => {
+                            let _ = tx.send(Input::StartFailed(e));
+                            return;
                         }
                     }
-                    route::set_route(Route::Closed);
                 }
-                Err(e) => {
-                    tracing::warn!(front = %host(&front.relay), "VEIL front did not answer: {e}")
+                held.clone().expect("set above")
+            };
+            if fronts.is_empty() {
+                let _ = tx.send(Input::StartFailed("no front".into()));
+                return;
+            }
+            for front in &fronts {
+                match tunnel.start(front, &sk).await {
+                    Ok(port) => {
+                        tracing::info!(front = %host(&front.relay), port, "VEIL tunnel up");
+                        let _ = tx.send(Input::Started {
+                            relay: front.relay.clone(),
+                            port,
+                        });
+                        return;
+                    }
+                    Err(e) => {
+                        tracing::warn!(front = %host(&front.relay), "VEIL front did not answer: {e}")
+                    }
                 }
             }
+            let _ = tx.send(Input::StartFailed("no front answered".into()));
+        });
+    }
+
+    /// The state, as the settings show it.
+    fn show(&self) {
+        let held = self
+            .source
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .usable()
+            .len();
+        let state = match &self.state {
+            State::Offline | State::Direct { .. } => VeilState::Off,
+            State::VeilProbing => VeilState::Connecting,
+            State::VeilActive { relay, .. } => VeilState::Up { front: host(relay) },
+            State::VeilCooldown { .. } => VeilState::NoFront,
+        };
+        self.status.update(|s| {
+            s.state = state;
+            s.fronts = held;
+        });
+    }
+}
+
+/// A state for the log: the front by its label, not its name.
+struct Brief<'a>(&'a State);
+
+impl std::fmt::Debug for Brief<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.0 {
+            State::VeilActive { relay, port, .. } => {
+                write!(f, "VeilActive({}, {port})", host(relay))
+            }
+            other => write!(f, "{other:?}"),
         }
-        tunnel.stop().await;
-        route::set_route(Route::Closed);
-        status.update(|s| s.state = VeilState::NoFront);
-        tokio::time::sleep(COOLDOWN).await;
     }
 }
 
