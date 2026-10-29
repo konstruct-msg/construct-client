@@ -36,6 +36,8 @@ pub mod stickers;
 mod streaming;
 mod trust;
 pub mod veil;
+#[cfg(feature = "voice")]
+pub mod voice;
 
 mod client;
 pub use client::*;

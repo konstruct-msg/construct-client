@@ -10,6 +10,9 @@ repository = "https://github.com/konstruct-msg/construct-tui"
 [features]
 default = ["post-quantum"]
 post-quantum = ["construct-core/post-quantum"]
+# Recording voice notes (`voice`): the microphone and Fraunhofer's AAC encoder (C++, built here).
+# Off unless a shell records.
+voice = ["dep:cpal", "dep:fdk-aac"]
 
 # No front-end dependency belongs here — no ratatui, no crossterm, no windowing toolkit.
 # `tests::the_client_crate_depends_on_no_front_end` reads this file and fails on one.
@@ -29,6 +32,8 @@ rustls = { version = "0.23", features = ["ring"] }
 rustls-native-certs = "0.7"
 webpki-roots = "0.26"
 bytes = "1"
+cpal = { version = "0.18", optional = true }
+fdk-aac = { version = "0.8", optional = true }
 http = "1"
 prost = "0.13"
 
@@ -86,4 +91,7 @@ prost-build = "0.13"
 
 [dev-dependencies]
 rcgen = "0.13"
+# Voice notes read back by independent parsers: an MP4 reader and a decoder.
+mp4 = "0.14"
+symphonia = { version = "0.6", default-features = false, features = ["aac", "isomp4"] }
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
