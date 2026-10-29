@@ -53,8 +53,8 @@ pub use keys::{
 };
 pub use media::{Uploaded, download_media, upload_media};
 pub use sealed::{
-    SenderCertificate, get_sender_certificate, get_server_trust_delegations, send_own_device_copy,
-    send_sealed_message,
+    SealedSent, SenderCertificate, get_sender_certificate, get_server_trust_delegations,
+    issue_tokens, send_own_device_copy, send_sealed_message,
 };
 pub use stickers::{sticker_manifest, sticker_pack_blobs, sticker_packs};
 pub use stream::open_message_stream;

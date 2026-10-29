@@ -34,6 +34,7 @@ pub mod recovery;
 mod sealing;
 pub mod stickers;
 mod streaming;
+pub mod tokens;
 mod trust;
 pub mod veil;
 #[cfg(feature = "voice")]
