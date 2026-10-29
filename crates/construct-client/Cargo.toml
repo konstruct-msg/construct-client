@@ -90,6 +90,8 @@ construct-store = { path = "../../../construct-core/store", features = ["vendore
 prost-build = "0.13"
 
 [dev-dependencies]
+# Opens a sealed intake tag as the server does (`privacy_pass::open_sealed_token_bytes`).
+chacha20poly1305 = "0.10"
 rcgen = "0.13"
 # Voice notes read back by independent parsers: an MP4 reader and a decoder.
 mp4 = "0.14"
