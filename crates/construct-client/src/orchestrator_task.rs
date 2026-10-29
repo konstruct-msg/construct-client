@@ -683,8 +683,13 @@ impl Task {
         // The first tick is now: rotation and top-up are checked at launch too.
         let mut maintenance = tokio::time::interval(crate::prekeys::MAINTENANCE_INTERVAL);
         maintenance.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // The first tick is now: the tag window is checked at launch, then hourly — a process
+        // that runs for weeks keeps it full (the RPC goes once a day).
+        let mut intake_recheck = tokio::time::interval(crate::intake::RECHECK);
+        intake_recheck.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tokio::select! {
+                _ = intake_recheck.tick() => self.publish_intake().await,
                 _ = maintenance.tick() => {
                     // A wallet below the bank, or past an issuer back-off, asks again.
                     self.top_up_tokens();
@@ -705,6 +710,10 @@ impl Task {
                 }
                 maybe_event = rx.recv() => {
                     let Some(event) = maybe_event else { break };
+                    // Every connection of the stream: our tag window, if today's is not out.
+                    if matches!(event, IncomingEvent::NetworkReconnected) {
+                        self.publish_intake().await;
+                    }
                     for event in self.prepare_outgoing(event).await {
                         self.process(event).await;
                     }
@@ -1643,30 +1652,47 @@ impl Task {
         let Some(plaintext) = crate::own_copy::copy(partner, message_id, content) else {
             return;
         };
+        self.send_to_siblings(&siblings, message_id, &plaintext)
+            .await;
+    }
+
+    /// `plaintext` (a whole KNST frame) to each of `siblings`, our devices with a session, as an
+    /// own-device copy under `message_id`. The devices it was written for.
+    async fn send_to_siblings(
+        &mut self,
+        siblings: &[String],
+        message_id: &str,
+        plaintext: &[u8],
+    ) -> Vec<String> {
+        let mut written = Vec::new();
         let certificate = match self.certificate().await {
             Ok(cert) => cert,
-            Err(e) => return tracing::warn!(error = %e, "own-device copies not sent"),
+            Err(e) => {
+                tracing::warn!(error = %e, "own-device copies not sent");
+                return written;
+            }
         };
         let Ok(certificate) =
             crate::proto::core::v1::SenderCertificate::decode(certificate.as_slice())
         else {
-            return tracing::warn!("own sender certificate does not parse");
+            tracing::warn!("own sender certificate does not parse");
+            return written;
         };
         for device in siblings {
-            let Some(identity_key) = self.peers.identity_of(&device).map(<[u8]>::to_vec) else {
+            let Some(identity_key) = self.peers.identity_of(device).map(<[u8]>::to_vec) else {
                 continue;
             };
-            let wire = match self.orchestrator.encrypt_bytes_for(&device, &plaintext) {
+            let wire = match self.orchestrator.encrypt_bytes_for(device, plaintext) {
                 Ok(wire) => wire,
                 Err(e) => {
                     tracing::warn!(%device, error = %e, "own-device copy not written");
                     continue;
                 }
             };
-            self.persist_session(&device);
+            self.persist_session(device);
             let tag = match construct_core::crypto::device_copy_tag::device_copy_tag(
                 message_id,
-                &device,
+                device,
                 &self.identity.identity_secret,
                 &identity_key,
             ) {
@@ -1682,13 +1708,150 @@ impl Task {
             };
             let envelope = own_copy_envelope(
                 &self.identity.user_id,
-                &device,
+                device,
                 crate::own_copy::copy_id(message_id, &tag),
                 copy.encode_to_vec(),
             );
             let _ = self.sealed_tx.send(Outbound::OwnCopy {
                 envelope: Box::new(envelope),
             });
+            written.push(device.clone());
+        }
+        written
+    }
+
+    // ── The account's intake key (`intake`) ───────────────────────────────────
+
+    /// Publish the tags of our account's key for the week from today, once a day; then hand the
+    /// key to our devices that do not have it. A publish that does not land costs our contacts
+    /// tokens, not delivery: they pay, as before.
+    async fn publish_intake(&mut self) {
+        let epoch = crate::intake::epoch_now();
+        if !crate::intake::should_publish(
+            crate::intake::Store(&self.storage).published_epoch(),
+            epoch,
+        ) {
+            return;
+        }
+        let Some(own) = self.own_intake_key().await else {
+            return;
+        };
+        let tags = crate::intake::window(&own, &self.identity.user_id, epoch);
+        match crate::grpc::publish_intake_tags(&self.grpc, &tags, own.generation).await {
+            Ok((_, current)) if current > own.generation => tracing::info!(
+                generation = own.generation,
+                current,
+                "intake publish refused: the account moved on, its key is due from our devices"
+            ),
+            Ok((accepted, _)) => {
+                // Marked only now: a failed publish is tried again at the next connection.
+                crate::intake::Store(&self.storage).set_published_epoch(epoch);
+                tracing::info!(
+                    accepted,
+                    generation = own.generation,
+                    epoch,
+                    "intake tags published"
+                );
+                self.offer_own_intake_key(&own).await;
+            }
+            Err(e) => tracing::info!(error = %e, "intake tags not published"),
+        }
+    }
+
+    /// Our account's key, settled with the server when this device holds none of a generation:
+    /// promoted, made, or none while it is due from one of our devices.
+    async fn own_intake_key(&mut self) -> Option<construct_core::intake::IntakeKeyState> {
+        use crate::intake::{Held, Next};
+        let store = crate::intake::Store(&self.storage);
+        let held = match store.own() {
+            // It may be there: nothing is made over a key we cannot see.
+            Held::Unreadable => return None,
+            Held::Key(key) if key.generation > 0 => return Some(key),
+            Held::Key(key) => Some(key),
+            Held::Absent => None,
+        };
+        let (generation, live) = match crate::grpc::get_intake_state(&self.grpc).await {
+            Ok(state) => state,
+            Err(e) => {
+                tracing::info!(error = %e, "intake state unavailable — asked at the next publish");
+                return None;
+            }
+        };
+        let store = crate::intake::Store(&self.storage);
+        match crate::intake::next(held.as_ref(), generation, live) {
+            Next::Use(key) => Some(key),
+            Next::Promote(key) => {
+                tracing::info!("intake key: this device's key becomes generation 1");
+                store.adopt(&key).then_some(key)
+            }
+            Next::Mint { above } => {
+                let key = construct_core::intake::intake_mint(above).ok()?;
+                tracing::info!(generation = key.generation, "intake key made");
+                store.adopt(&key).then_some(key)
+            }
+            Next::Wait => {
+                tracing::info!(
+                    generation,
+                    "intake key of the account is due from our own devices — not publishing"
+                );
+                None
+            }
+        }
+    }
+
+    /// Our key, as a contact card in SENDER_SYNC, to our devices not handed it since it changed.
+    async fn offer_own_intake_key(&mut self, own: &construct_core::intake::IntakeKeyState) {
+        let store = crate::intake::Store(&self.storage);
+        let sent = store.sent_to();
+        let owed: Vec<String> = self
+            .own_siblings()
+            .await
+            .into_iter()
+            .filter(|d| !sent.contains(d))
+            .collect();
+        if owed.is_empty() {
+            return;
+        }
+        let id = uuid::Uuid::new_v4().to_string();
+        let frame = crate::knst::frame_whole(
+            &crate::intake::own_card(own),
+            crate::knst::CONTENT_CONTACT_CARD,
+            &id,
+        );
+        let written = self.send_to_siblings(&owed, &id, &frame).await;
+        if !written.is_empty() {
+            crate::intake::Store(&self.storage).mark_sent(&written);
+            tracing::info!(
+                devices = written.len(),
+                generation = own.generation,
+                "intake key handed to our devices"
+            );
+        }
+    }
+
+    /// One of our devices handed us the account's key: kept when its generation is newer
+    /// (`intake_offer`), then published.
+    async fn own_intake_key_offered(&mut self, offered: construct_core::intake::IntakeKeyState) {
+        use construct_core::intake::{IntakeOffer, intake_offer};
+        let store = crate::intake::Store(&self.storage);
+        let held = match store.own() {
+            crate::intake::Held::Key(key) => Some(key),
+            crate::intake::Held::Absent => None,
+            // Adopting would overwrite a key we cannot see; the sibling sends again.
+            crate::intake::Held::Unreadable => return,
+        };
+        match intake_offer(held.as_ref(), &offered) {
+            Ok(IntakeOffer::Adopt) => {
+                if store.adopt(&offered) {
+                    tracing::info!(
+                        generation = offered.generation,
+                        "intake key taken from our own device"
+                    );
+                    self.publish_intake().await;
+                }
+            }
+            Ok(IntakeOffer::Keep) => {}
+            Err(e) => tracing::warn!(error = ?e, "our device sent a malformed intake key"),
         }
     }
 
@@ -1771,6 +1934,9 @@ impl Task {
                     Err(()) => tracing::warn!(%message_id, "copied message not kept"),
                 }
                 self.adopt_writer(&partner);
+            }
+            crate::own_copy::Copy::IntakeKey(offered) => {
+                self.own_intake_key_offered(offered).await;
             }
             crate::own_copy::Copy::ReadMarkers => {
                 tracing::debug!(%message_id, "read markers from another device — not applied yet");

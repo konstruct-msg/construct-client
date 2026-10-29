@@ -123,6 +123,55 @@ pub async fn issue_tokens(
     })
 }
 
+/// `MessagingService.GetIntakeState` — our account's intake generation, and whether it has tags
+/// for today. A server from before generations (UNIMPLEMENTED) is generation 0 without tags.
+pub async fn get_intake_state(client: &GrpcClient) -> Result<(u32, bool), GrpcError> {
+    use crate::proto::services::v1::{GetIntakeStateRequest, GetIntakeStateResponse};
+    let bytes = match client
+        .unary(
+            paths::MESSAGING_GET_INTAKE_STATE,
+            &GetIntakeStateRequest {}.encode_to_vec(),
+        )
+        .await
+    {
+        Ok(bytes) => bytes,
+        Err(GrpcError::Status { code: 12, .. }) => return Ok((0, false)),
+        Err(e) => return Err(e),
+    };
+    let resp = GetIntakeStateResponse::decode(bytes.as_slice())
+        .map_err(|e| GrpcError::transport(format!("GetIntakeState decode: {e}")))?;
+    Ok((resp.generation, resp.has_tags_for_current_epoch))
+}
+
+/// `MessagingService.PublishIntakeTags` — authenticated: the tags of our account's key of
+/// `generation`. Returns how many the server took and the account's generation there; one above
+/// ours means the publish was refused as stale.
+pub async fn publish_intake_tags(
+    client: &GrpcClient,
+    tags: &[(u64, Vec<u8>)],
+    generation: u32,
+) -> Result<(u32, u32), GrpcError> {
+    use crate::proto::services::v1::{
+        IntakeTagEntry, PublishIntakeTagsRequest, PublishIntakeTagsResponse,
+    };
+    let req = PublishIntakeTagsRequest {
+        tags: tags
+            .iter()
+            .map(|(epoch, tag)| IntakeTagEntry {
+                epoch: *epoch,
+                tag: tag.clone().into(),
+            })
+            .collect(),
+        generation,
+    };
+    let bytes = client
+        .unary(paths::MESSAGING_PUBLISH_INTAKE_TAGS, &req.encode_to_vec())
+        .await?;
+    let resp = PublishIntakeTagsResponse::decode(bytes.as_slice())
+        .map_err(|e| GrpcError::transport(format!("PublishIntakeTags decode: {e}")))?;
+    Ok((resp.accepted, resp.current_generation))
+}
+
 /// `ServerTrustService.GetServerTrust` — the delegations of the server's hybrid keys. Nothing
 /// here is trusted for arriving: the core keeps only those a root pinned in the build signed.
 pub async fn get_server_trust_delegations(

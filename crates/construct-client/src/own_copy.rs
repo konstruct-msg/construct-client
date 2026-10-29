@@ -63,6 +63,8 @@ pub enum Copy {
     },
     /// Read markers from another device (READ_SYNC); this client does not apply them yet.
     ReadMarkers,
+    /// Our account's intake key, handed over by another of our devices (a contact card).
+    IntakeKey(construct_core::intake::IntakeKeyState),
     /// Split into chunks, or a kind of content this client does not show.
     Unsupported(&'static str),
 }
@@ -74,6 +76,14 @@ pub fn read(plaintext: &[u8]) -> Copy {
     };
     if frame.content_type == crate::knst::CONTENT_READ_SYNC {
         return Copy::ReadMarkers;
+    }
+    // Opened by a session with one of our devices: a card here is our own account's key.
+    if frame.content_type == crate::knst::CONTENT_CONTACT_CARD {
+        let length = (frame.plaintext_length as usize).min(frame.payload.len());
+        return crate::intake::card_key(&frame.payload[..length]).map_or(
+            Copy::Unsupported("a contact card without a key"),
+            Copy::IntakeKey,
+        );
     }
     if frame.content_type != crate::knst::CONTENT_SENDER_SYNC {
         return Copy::Unsupported("not a copy of a sent message");
