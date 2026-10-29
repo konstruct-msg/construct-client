@@ -35,6 +35,21 @@ pub(super) fn auth_failure(e: &anyhow::Error, reason: String) -> AuthMsg {
 /// `try_restore_session` found nothing on disk.
 const NO_SESSION: &str = "no_session";
 
+const AUTH_RETRY_FIRST: std::time::Duration = std::time::Duration::from_secs(2);
+const AUTH_RETRY_MAX: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// The path failed, not the server: nothing answered, or the connection broke.
+fn is_path_failure(e: &anyhow::Error) -> bool {
+    e.chain()
+        .filter_map(|c| c.downcast_ref::<crate::grpc::GrpcError>())
+        .any(|g| {
+            matches!(
+                g,
+                crate::grpc::GrpcError::Transport(_) | crate::grpc::GrpcError::Tls(_)
+            )
+        })
+}
+
 #[derive(Debug)]
 pub(crate) struct AuthSuccess {
     pub(super) user_id: String,
@@ -200,11 +215,35 @@ impl Client {
     }
 
     /// Authenticate a session already decrypted in memory.
+    /// Sign in with the session on disk. A failure of the path — no network, a blocked server,
+    /// VEIL waiting for a front — is tried again, more slowly each time, instead of being reported
+    /// as a failed sign-in: that showed the first screen ("create an account") to someone who has
+    /// one and was only offline, and under Auto it gave the route a single failure, never the
+    /// second that moves it onto a front. The server refusing is reported at once.
     fn authenticate_saved(&self, session: Session) {
         let inbox = self.inbox.clone();
         let grpc = self.grpc.clone();
+        let events = self.events.clone();
         tokio::spawn(async move {
-            let msg = match crate::auth::authenticate_saved_session(session, &grpc).await {
+            let mut wait = AUTH_RETRY_FIRST;
+            let mut told = false;
+            let attempt = loop {
+                match crate::auth::authenticate_saved_session(session.clone(), &grpc).await {
+                    Err(e) if is_path_failure(&e) => {
+                        tracing::warn!("sign-in: no connection, trying again in {wait:?}: {e:#}");
+                        if !told {
+                            told = true;
+                            let _ = events.send(ClientEvent::Notice(
+                                "No connection to the server — trying again".into(),
+                            ));
+                        }
+                        tokio::time::sleep(wait).await;
+                        wait = (wait * 2).min(AUTH_RETRY_MAX);
+                    }
+                    other => break other,
+                }
+            };
+            let msg = match attempt {
                 Ok(result) => {
                     let full = result
                         .session

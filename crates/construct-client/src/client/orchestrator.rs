@@ -112,7 +112,7 @@ impl Client {
 
         // Sealed sends and the server's trust material go on a connection that never carries
         // the token.
-        let anonymous = crate::grpc::GrpcClient::new(&self.server_url);
+        let anonymous = crate::grpc::GrpcClient::new_anonymous(&self.server_url);
         let avatars = anonymous.clone();
         let media = crate::media::MediaCache::new(self.data_dir()?.media_dir());
         {

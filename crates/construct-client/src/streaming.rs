@@ -166,6 +166,7 @@ async fn run_worker(
             client.invalidate_h3().await;
         }
         let since = cursor.committed();
+        let disruptions = crate::grpc::route::disruptions();
         let (frame_tx, mut frame_rx) = mpsc::unbounded_channel();
         let open = open_message_stream(&client, subscribed_users.clone(), since, move |frame| {
             let _ = frame_tx.send(frame);
@@ -185,6 +186,18 @@ async fn run_worker(
             }
             Err(e) => {
                 warn!("MessageStream open failed: {e}");
+                use crate::veil::transport_route::StreamFailure;
+                if crate::grpc::route::classify(&e).is_some() {
+                    let failure = if e.to_string().contains("timed out") {
+                        StreamFailure::OpenTimeout
+                    } else {
+                        StreamFailure::TransportUnknown
+                    };
+                    crate::grpc::route::report(
+                        crate::grpc::route::Report::StreamFailed { failure },
+                        disruptions,
+                    );
+                }
                 if wait_backoff(&mut cmd_rx, &mut subscribed_users, &event_tx, &mut attempt).await?
                 {
                     return Ok(());
@@ -196,6 +209,7 @@ async fn run_worker(
         attempt = 0;
         let _ = event_tx.send(StreamEvent::Connected).await;
         info!("message stream connected");
+        crate::grpc::route::report(crate::grpc::route::Report::StreamOpened, disruptions);
 
         let mut live = true;
         if let Err(e) = stream.send_frame(encode_heartbeat_frame()).await {
@@ -253,6 +267,13 @@ async fn run_worker(
         }
 
         drop(stream);
+        // The loop leaves only when the stream died under us (a command returns instead).
+        crate::grpc::route::report(
+            crate::grpc::route::Report::StreamFailed {
+                failure: crate::veil::transport_route::StreamFailure::MidSessionUnknown,
+            },
+            disruptions,
+        );
         let _ = event_tx.send(StreamEvent::Disconnected).await;
         if wait_backoff(&mut cmd_rx, &mut subscribed_users, &event_tx, &mut attempt).await? {
             return Ok(());

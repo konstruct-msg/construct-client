@@ -46,7 +46,7 @@
 //! read one (`HISTORY_IMPORTED`). `--history-nearby-to <device id>`: send it over the local
 //! network to that device, which takes it by itself while it runs (`HISTORY_NEARBY` steps).
 //!
-//! `--veil on|off`: once started, set the VEIL mode (`VEIL` lines follow); `--veil-link <link>`:
+//! `--veil on|off|auto`: once started, set the VEIL mode (`VEIL` lines follow); `--veil-link <link>`:
 //! take the front of a `konstruct://veil-config` link first; `--veil-voucher`: print a voucher
 //! link for another device (`VEIL_VOUCHER`).
 //!
@@ -293,7 +293,10 @@ async fn main() {
                     Some("off") => {
                         client.send(ClientCommand::SetVeilMode(construct_client::VeilMode::Off))
                     }
-                    Some(other) => panic!("--veil takes on or off, not {other}"),
+                    Some("auto") => {
+                        client.send(ClientCommand::SetVeilMode(construct_client::VeilMode::Auto))
+                    }
+                    Some(other) => panic!("--veil takes on, off or auto, not {other}"),
                     None => client.send(ClientCommand::LoadVeil),
                 }
                 match args.goodbye.as_deref() {

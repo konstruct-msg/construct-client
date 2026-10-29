@@ -14,6 +14,7 @@ use super::connection::{H2Session, connect_h2, connect_h2c};
 use super::error::GrpcError;
 use super::framing::{decode_frame, encode_frame};
 use super::route::{self, Route};
+use crate::veil::transport_route::Lane;
 
 pub(crate) type H2SendReq = h2::client::SendRequest<Bytes>;
 
@@ -23,6 +24,8 @@ const UNARY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 struct Inner {
     host: String,
     port: u16,
+    /// Which channel this client is for the VEIL router: signed in, or sealed (no identity).
+    lane: Lane,
     /// The connection, and the route generation it was made under.
     session: RwLock<Option<(H2Session, u64)>>,
     token: std::sync::RwLock<Option<String>>,
@@ -38,12 +41,22 @@ pub struct GrpcClient {
 impl GrpcClient {
     /// Parse `server_url` and install the rustls provider. Does not open TCP.
     pub fn new(server_url: &str) -> Self {
+        Self::with_lane(server_url, Lane::Auth)
+    }
+
+    /// A client that never holds a token (sealed sends, attachments, sticker packs).
+    pub fn new_anonymous(server_url: &str) -> Self {
+        Self::with_lane(server_url, Lane::Sealed)
+    }
+
+    fn with_lane(server_url: &str, lane: Lane) -> Self {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let (host, port) = parse_server_url(server_url);
         Self {
             inner: Arc::new(Inner {
                 host,
                 port,
+                lane,
                 session: RwLock::new(None),
                 token: std::sync::RwLock::new(None),
                 device_id: std::sync::RwLock::new(None),
@@ -65,6 +78,7 @@ impl GrpcClient {
 
     /// Drop the live H2 session so the next RPC opens a new TCP/TLS connection.
     pub async fn invalidate(&self) {
+        route::note_disruption();
         *self.inner.session.write().await = None;
     }
 
@@ -90,9 +104,7 @@ impl GrpcClient {
             let (route, generation) = route::open_within(route::TUNNEL_WAIT).await;
             let connection = match route {
                 Route::Direct => connect_h2(&self.inner.host, self.inner.port).await?,
-                Route::Veil { port } => connect_h2c(port).await.inspect_err(|_| {
-                    route::note_tunnel_failure();
-                })?,
+                Route::Veil { port } => connect_h2c(port).await?,
                 Route::Closed => {
                     return Err(GrpcError::transport("VEIL is on and no front is available"));
                 }
@@ -120,10 +132,34 @@ impl GrpcClient {
     /// Unary gRPC call. `path` is `/package.Service/Method`.
     /// One retry after a transport error (new session); auth errors are not retried.
     pub async fn unary(&self, path: &str, request_bytes: &[u8]) -> Result<Vec<u8>, GrpcError> {
+        let started = std::time::Instant::now();
+        let since = route::disruptions();
+        let result = self.unary_retrying(path, request_bytes).await;
+        let lane = self.inner.lane;
+        match &result {
+            Ok(_) => route::report(
+                route::Report::RpcSucceeded {
+                    lane,
+                    latency_ms: started.elapsed().as_millis().min(u32::MAX as u128) as u32,
+                },
+                since,
+            ),
+            Err(e) => {
+                if let Some(failure) = route::classify(e) {
+                    route::report(route::Report::RpcFailed { lane, failure }, since);
+                }
+            }
+        }
+        result
+    }
+
+    async fn unary_retrying(&self, path: &str, request_bytes: &[u8]) -> Result<Vec<u8>, GrpcError> {
         match self.unary_timed(path, request_bytes).await {
             Err(e) if e.is_retryable_transport() => {
                 debug!("unary '{path}' transport error, retrying once: {e}");
-                self.invalidate().await;
+                // The call's own retry, on a new connection: not a disruption from outside, so
+                // the failure (if the retry fails too) is still reported.
+                *self.inner.session.write().await = None;
                 self.unary_timed(path, request_bytes).await
             }
             other => other,
@@ -137,11 +173,6 @@ impl GrpcClient {
             Ok(result) => result,
             Err(_) => {
                 *self.inner.session.write().await = None;
-                // Through the tunnel, a call that never comes back is the front's doing as much as
-                // a connection that fails: it counts toward giving the session up.
-                if matches!(route::current().0, Route::Veil { .. }) {
-                    route::note_tunnel_failure();
-                }
                 Err(GrpcError::transport(format!("'{path}' timed out")))
             }
         }
@@ -436,6 +467,7 @@ mod tests {
     #[tokio::test]
     async fn calls_follow_the_route() {
         use std::sync::{Arc, Mutex};
+        let _turn = route::TEST_LOCK.lock().await;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let seen: Arc<Mutex<Vec<String>>> = Arc::default();

@@ -491,7 +491,7 @@ impl Client {
     ) -> Self {
         Self {
             grpc: GrpcClient::new(&cfg.server_url),
-            anonymous: GrpcClient::new(&cfg.server_url),
+            anonymous: GrpcClient::new_anonymous(&cfg.server_url),
             server_url: cfg.server_url,
             transport: cfg.transport,
             no_encrypt: cfg.no_encrypt,
