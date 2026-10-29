@@ -7,3 +7,9 @@ opt-level = "s"
 lto = true
 codegen-units = 1
 strip = true
+
+# rustls with a ClientHello rewriter (branch reality-0.23 of the fork, pinned): VEIL sends
+# Chrome's hello byte for byte through it (construct-docs decisions/desktop-veil.md). With no
+# rewriter set it is upstream rustls, so the direct connection is unchanged.
+[patch.crates-io]
+rustls = { git = "https://github.com/maxeliseyev/rustls.git", rev = "7df70d14" }

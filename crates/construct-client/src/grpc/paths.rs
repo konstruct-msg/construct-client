@@ -51,3 +51,5 @@ pub const STICKER_LIST_PACKS: &str = "/shared.proto.services.v1.StickerService/L
 pub const STICKER_MANIFEST: &str =
     "/shared.proto.services.v1.StickerService/GetStickerPackManifest";
 pub const STICKER_PACK_BLOBS: &str = "/shared.proto.services.v1.StickerService/GetStickerPackBlobs";
+pub const VEIL_ISSUE_CAPABILITY: &str = "/shared.proto.services.v1.VeilService/IssueVeilCapability";
+pub const VEIL_ISSUE_VOUCHER: &str = "/shared.proto.services.v1.VeilService/IssueBootstrapVoucher";

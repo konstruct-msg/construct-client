@@ -10,9 +10,10 @@ use http::{HeaderMap, Request};
 use tokio::sync::RwLock;
 use tracing::debug;
 
-use super::connection::{H2Session, connect_h2};
+use super::connection::{H2Session, connect_h2, connect_h2c};
 use super::error::GrpcError;
 use super::framing::{decode_frame, encode_frame};
+use super::route::{self, Route};
 
 pub(crate) type H2SendReq = h2::client::SendRequest<Bytes>;
 
@@ -22,7 +23,8 @@ const UNARY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 struct Inner {
     host: String,
     port: u16,
-    session: RwLock<Option<H2Session>>,
+    /// The connection, and the route generation it was made under.
+    session: RwLock<Option<(H2Session, u64)>>,
     token: std::sync::RwLock<Option<String>>,
     device_id: std::sync::RwLock<Option<String>>,
 }
@@ -73,13 +75,34 @@ impl GrpcClient {
 
     /// Connect once: callers racing here share one connection. Checked again under the write
     /// lock, because a second connection replacing the first drops it and every call on it.
+    /// A connection made on another route than the current one is replaced.
     async fn ensure(&self) -> Result<(), GrpcError> {
-        if self.inner.session.read().await.is_some() {
+        let fresh = |s: &Option<(H2Session, u64)>| {
+            s.as_ref()
+                .is_some_and(|(_, made)| *made == route::current().1)
+        };
+        if fresh(&*self.inner.session.read().await) {
             return Ok(());
         }
         let mut session = self.inner.session.write().await;
-        if session.is_none() {
-            *session = Some(connect_h2(&self.inner.host, self.inner.port).await?);
+        if !fresh(&session) {
+            *session = None;
+            let (route, generation) = route::open_within(route::TUNNEL_WAIT).await;
+            let connection = match route {
+                Route::Direct => connect_h2(&self.inner.host, self.inner.port).await?,
+                Route::Veil { port } => connect_h2c(port).await.inspect_err(|_| {
+                    route::note_tunnel_failure();
+                })?,
+                Route::Closed => {
+                    return Err(GrpcError::transport("VEIL is on and no front is available"));
+                }
+            };
+            // Made while the route changed: it may be on the old path, and with VEIL turned on
+            // that path is not allowed. Dropped; the call fails and the next one reconnects.
+            if route::current().1 != generation {
+                return Err(GrpcError::transport("the route changed while connecting"));
+            }
+            *session = Some((connection, generation));
         }
         Ok(())
     }
@@ -90,7 +113,7 @@ impl GrpcClient {
             .read()
             .await
             .as_ref()
-            .map(|s| s.send_request.clone())
+            .map(|(s, _)| s.send_request.clone())
             .ok_or_else(|| GrpcError::transport("H2 not connected"))
     }
 
@@ -400,5 +423,80 @@ mod tests {
         send.send_data(Bytes::new(), true).expect("end of stream");
 
         assert_eq!(server.await.unwrap(), LEN);
+    }
+
+    /// Where calls go follows the route: into the tunnel's local port with the server's own
+    /// `host`, nowhere while it is closed (VEIL on, no front — never directly), and a connection
+    /// made on an earlier route is not reused.
+    #[tokio::test]
+    async fn calls_follow_the_route() {
+        use std::sync::{Arc, Mutex};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let seen: Arc<Mutex<Vec<String>>> = Arc::default();
+        let connections = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        tokio::spawn({
+            let (seen, connections) = (seen.clone(), connections.clone());
+            async move {
+                while let Ok((tcp, _)) = listener.accept().await {
+                    connections.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let seen = seen.clone();
+                    tokio::spawn(async move {
+                        let mut conn = h2::server::handshake(tcp).await.unwrap();
+                        while let Some(Ok((request, mut respond))) = conn.accept().await {
+                            let host = request
+                                .headers()
+                                .get("host")
+                                .map(|h| h.to_str().unwrap().to_owned());
+                            seen.lock().unwrap().push(format!(
+                                "{} {}",
+                                request.uri().path(),
+                                host.unwrap_or_default()
+                            ));
+                            let response = http::Response::builder()
+                                .status(200)
+                                .header("content-type", "application/grpc")
+                                .body(())
+                                .unwrap();
+                            let mut stream = respond.send_response(response, false).unwrap();
+                            stream
+                                .send_data(Bytes::from_static(&[0, 0, 0, 0, 0]), false)
+                                .unwrap();
+                            let mut trailers = HeaderMap::new();
+                            trailers.insert("grpc-status", "0".parse().unwrap());
+                            stream.send_trailers(trailers).unwrap();
+                        }
+                    });
+                }
+            }
+        });
+        let client = GrpcClient::new("https://server.example:443");
+
+        route::set_route(Route::Veil { port });
+        client
+            .unary("/svc.S/One", b"")
+            .await
+            .expect("through the tunnel");
+        assert_eq!(
+            seen.lock().unwrap().as_slice(),
+            ["/svc.S/One server.example:443"]
+        );
+
+        route::set_route(Route::Closed);
+        let err = client.unary("/svc.S/Two", b"").await.unwrap_err();
+        assert!(err.to_string().contains("VEIL is on"), "{err}");
+        assert_eq!(seen.lock().unwrap().len(), 1, "nothing sent while closed");
+
+        route::set_route(Route::Veil { port });
+        client
+            .unary("/svc.S/Three", b"")
+            .await
+            .expect("through the tunnel again");
+        assert_eq!(
+            connections.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "the connection from before the change is not reused"
+        );
+        route::set_route(Route::Direct);
     }
 }

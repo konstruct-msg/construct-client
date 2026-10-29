@@ -35,6 +35,7 @@ mod sealing;
 pub mod stickers;
 mod streaming;
 mod trust;
+pub mod veil;
 
 mod client;
 pub use client::*;

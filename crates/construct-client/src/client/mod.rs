@@ -19,6 +19,7 @@ mod settings;
 mod stickers;
 mod tokens;
 mod transfer;
+mod veil;
 
 pub(crate) use auth::AuthMsg;
 pub use contacts::{FindStarted, SearchResult};
@@ -26,6 +27,7 @@ pub use lock::{AppLock, MIN_CODE_LEN};
 pub use profile::AvatarChange;
 pub use settings::{AccountSettings, InviteEntry, normalize_username};
 pub use stickers::StickerPackView;
+pub use veil::{VeilMode, VeilState, VeilStatus};
 
 use tokio::sync::mpsc;
 use zeroize::Zeroizing;
@@ -222,6 +224,14 @@ pub enum ClientCommand {
     AddStickerPack(String),
     /// Stop offering a pack in the picker.
     RemoveStickerPack(String),
+    /// VEIL off or on: [`ClientEvent::Veil`] follows.
+    SetVeilMode(VeilMode),
+    /// Take the front a `konstruct://veil-config` link names.
+    ImportVeilLink(String),
+    /// Where VEIL stands: [`ClientEvent::Veil`].
+    LoadVeil,
+    /// A voucher for another device: [`ClientEvent::VeilVoucher`].
+    IssueVeilVoucher,
 }
 
 /// What the client tells a front end.
@@ -311,6 +321,10 @@ pub enum ClientEvent {
     },
     /// The packs the server offers that the picker does not; or why they could not be read.
     StickerCatalog(Result<Vec<crate::stickers::CatalogPack>, String>),
+    /// Where VEIL stands: its mode, the tunnel, how many fronts this device holds.
+    Veil(VeilStatus),
+    /// A voucher link and its end (Unix seconds); or why there is none.
+    VeilVoucher(Result<(String, i64), String>),
     /// Whether the app lock is on, and its delay: after start and after each change.
     AppLock(AppLock),
     /// The code handed in matched, or why it did not.
@@ -453,6 +467,12 @@ pub(crate) struct Client {
     history_listener: Option<tokio::task::AbortHandle>,
     /// Sticker packs being fetched, and those that recently could not be.
     sticker_fetches: stickers::Fetches,
+    /// VEIL's tasks while an account is open.
+    veil: Option<veil::VeilRuntime>,
+    veil_status: Option<veil::Status>,
+    /// The tunnel, made once and kept: its coordinator outlives a change of mode.
+    veil_tunnel:
+        std::sync::Arc<tokio::sync::Mutex<Option<std::sync::Arc<crate::veil::tunnel::Tunnel>>>>,
     /// This device's X25519 identity secret, to open the device descriptions sealed to it.
     identity_secret: Option<Zeroizing<Vec<u8>>>,
     /// The username a new account registered with, until there is a store to keep it in.
@@ -495,6 +515,9 @@ impl Client {
             nearby_task: None,
             history_listener: None,
             sticker_fetches: Default::default(),
+            veil: None,
+            veil_status: None,
+            veil_tunnel: Default::default(),
             pending_link: None,
             pending_username: None,
             identity_secret: None,
@@ -601,6 +624,10 @@ impl Client {
             ClientCommand::LoadStickerCatalog => self.load_sticker_catalog(),
             ClientCommand::AddStickerPack(pack) => self.add_sticker_pack(pack),
             ClientCommand::RemoveStickerPack(pack) => self.remove_sticker_pack(pack),
+            ClientCommand::SetVeilMode(mode) => self.set_veil_mode(mode),
+            ClientCommand::ImportVeilLink(link) => self.import_veil_link(link),
+            ClientCommand::LoadVeil => self.load_veil(),
+            ClientCommand::IssueVeilVoucher => self.issue_veil_voucher(),
         }
     }
 
