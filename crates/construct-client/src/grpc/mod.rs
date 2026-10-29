@@ -24,10 +24,12 @@ mod invite;
 mod keys;
 mod media;
 mod paths;
+pub mod route;
 mod sealed;
 mod stickers;
 mod stream;
 pub(crate) mod users;
+mod veil;
 
 pub use account::{
     Device, delete_account, list_devices, logout, own_username, revoke_device, set_device_metadata,
@@ -57,3 +59,4 @@ pub use sealed::{
 pub use stickers::{sticker_manifest, sticker_pack_blobs, sticker_packs};
 pub use stream::open_message_stream;
 pub use users::find_user;
+pub use veil::{issue_bootstrap_voucher, issue_veil_capability};

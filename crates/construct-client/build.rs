@@ -28,6 +28,7 @@ fn compile_protos() {
         format!("{protos_dir}/services/server_trust_service.proto"),
         format!("{protos_dir}/services/media_service.proto"),
         format!("{protos_dir}/services/sticker_service.proto"),
+        format!("{protos_dir}/services/veil_service.proto"),
     ];
 
     let protos_path = std::path::Path::new(&protos_dir);

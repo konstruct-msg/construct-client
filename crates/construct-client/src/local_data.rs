@@ -74,6 +74,11 @@ impl DataDir {
         self.dir.join("media")
     }
 
+    /// construct-veil's per-network method scores (its own SQLite file; nothing secret).
+    pub fn veil_scores_path(&self) -> PathBuf {
+        self.dir.join("veil-scores.sqlite")
+    }
+
     /// Where sticker packs are kept (`stickers::Library`): public files, checked by hash.
     pub fn stickers_dir(&self) -> PathBuf {
         self.dir.join("stickers")

@@ -466,6 +466,8 @@ impl App {
             ClientEvent::Stickers { .. }
             | ClientEvent::StickerImage { .. }
             | ClientEvent::StickerCatalog(_) => {}
+            // VEIL is set in the window's settings.
+            ClientEvent::Veil(_) | ClientEvent::VeilVoucher(_) => {}
         }
     }
 

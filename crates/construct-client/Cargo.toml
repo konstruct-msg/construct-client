@@ -14,6 +14,10 @@ post-quantum = ["construct-core/post-quantum"]
 # No front-end dependency belongs here — no ratatui, no crossterm, no windowing toolkit.
 # `tests::the_client_crate_depends_on_no_front_end` reads this file and fails on one.
 [dependencies]
+# VEIL (veil-front) in this process: the coordinator, its pinned TLS to the front, AUTH v2/v3.
+# Pinned by commit, as construct-core pins it.
+construct-veil = { git = "https://github.com/konstruct-msg/construct-veil", rev = "a0a22a778e2559a8aa4cbcfcbd9cd546e6b6863b", features = ["coordinator"] }
+construct-veil-protocol = { git = "https://github.com/konstruct-msg/construct-veil", rev = "a0a22a778e2559a8aa4cbcfcbd9cd546e6b6863b" }
 # Crypto (Orchestrator). Production public host (ams.konstruct.cc) is HTTP/2; QUIC/H3 is
 # quic.konstruct.cc with a pinned gateway cert (iOS construct-transport), not this client.
 construct-core = { path = "../../../construct-core", features = ["store"] }
@@ -51,6 +55,7 @@ aes-gcm = "0.10"
 zeroize = { version = "1", features = ["std"] }
 hkdf = "0.12"
 sha2 = "0.10"
+hmac = "0.12"
 rand = "0.8"
 hex = "0.4"
 ed25519-dalek = { version = "2.0", features = ["std", "rand_core"] }
@@ -80,4 +85,5 @@ construct-store = { path = "../../../construct-core/store", features = ["vendore
 prost-build = "0.13"
 
 [dev-dependencies]
+rcgen = "0.13"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }

@@ -83,6 +83,8 @@ impl Client {
         let session: Session =
             serde_json::from_slice(&session).map_err(|e| format!("session unreadable: {e}"))?;
         self.store = Some(store.for_account(&session.user_id));
+        // Before anything is sent: with VEIL on, nothing leaves outside the tunnel.
+        self.start_veil();
         Ok(session)
     }
 
@@ -598,6 +600,7 @@ impl Client {
     fn stop_session(&mut self) {
         // Dropping the handle stops the orchestrator task; the stream worker is told.
         self.orch_handle = None;
+        self.stop_veil();
         self.stop_history_listener();
         if let Some(ref tx) = self.stream_tx.take() {
             let _ = tx.try_send(crate::streaming::StreamCmd::Shutdown);

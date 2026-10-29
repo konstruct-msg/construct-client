@@ -157,6 +157,7 @@ impl Client {
         self.publish_device_description(false);
         self.start_history_listener(std::time::Duration::ZERO);
         self.seed_stickers();
+        self.provision_veil();
 
         inbound::spawn_relay(
             stream_rx,

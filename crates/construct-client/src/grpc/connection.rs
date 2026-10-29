@@ -47,21 +47,38 @@ pub async fn connect_h2(host: &str, port: u16) -> Result<H2Session, GrpcError> {
         .await
         .map_err(|_| GrpcError::tls("TLS handshake timed out"))?
         .map_err(|e| GrpcError::tls(format!("TLS handshake: {e}")))?;
+    handshake(tls_stream).await
+}
 
+/// Plain HTTP/2 to the local end of the VEIL tunnel. The TLS on the wire is the tunnel's, to
+/// the front; the requests inside still name the real server (`host`), which routes on it.
+pub async fn connect_h2c(port: u16) -> Result<H2Session, GrpcError> {
+    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+    info!(%addr, "h2c connecting through VEIL");
+    let tcp = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(addr))
+        .await
+        .map_err(|_| GrpcError::transport(format!("VEIL tunnel {addr}: connect timed out")))?
+        .map_err(|e| GrpcError::transport(format!("VEIL tunnel {addr}: {e}")))?;
+    let _ = tcp.set_nodelay(true);
+    handshake(tcp).await
+}
+
+async fn handshake<T>(io: T) -> Result<H2Session, GrpcError>
+where
+    T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
     let (send_request, conn) = h2::client::Builder::new()
         .initial_window_size(1024 * 1024)
         .initial_connection_window_size(1024 * 1024)
-        .handshake(tls_stream)
+        .handshake(io)
         .await
         .map_err(|e| GrpcError::transport(format!("h2 handshake: {e}")))?;
-
     let driver = tokio::spawn(async move {
         if let Err(e) = conn.await {
             warn!("h2 connection closed: {e}");
         }
     });
-
-    debug!(host, "h2 session ready");
+    debug!("h2 session ready");
     Ok(H2Session {
         send_request,
         driver,

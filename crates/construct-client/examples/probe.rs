@@ -46,6 +46,10 @@
 //! read one (`HISTORY_IMPORTED`). `--history-nearby-to <device id>`: send it over the local
 //! network to that device, which takes it by itself while it runs (`HISTORY_NEARBY` steps).
 //!
+//! `--veil on|off`: once started, set the VEIL mode (`VEIL` lines follow); `--veil-link <link>`:
+//! take the front of a `konstruct://veil-config` link first; `--veil-voucher`: print a voucher
+//! link for another device (`VEIL_VOUCHER`).
+//!
 //! `--find <username or invite link>` instead of `--add`: a username is looked up (only accounts
 //! that made themselves discoverable are found), an invite link is redeemed; either is added and
 //! sent to.
@@ -85,6 +89,9 @@ struct Args {
     history_file: Option<String>,
     import_history: Option<String>,
     history_nearby_to: Option<String>,
+    veil: Option<String>,
+    veil_link: Option<String>,
+    veil_voucher: bool,
     wait_secs: u64,
 }
 
@@ -116,6 +123,9 @@ fn parse_args() -> Args {
         history_file: None,
         import_history: None,
         history_nearby_to: None,
+        veil: None,
+        veil_link: None,
+        veil_voucher: false,
         wait_secs: 30,
     };
     let mut it = std::env::args().skip(1);
@@ -148,6 +158,9 @@ fn parse_args() -> Args {
             "--import-history" => args.import_history = Some(value()),
             "--history-nearby-to" => args.history_nearby_to = Some(value()),
             "--link-code" => args.link_code = Some(value()),
+            "--veil" => args.veil = Some(value()),
+            "--veil-link" => args.veil_link = Some(value()),
+            "--veil-voucher" => args.veil_voucher = true,
             "--wait" => args.wait_secs = value().parse().expect("--wait takes seconds"),
             other => panic!("unknown flag {other}"),
         }
@@ -176,6 +189,10 @@ async fn main() {
         tx,
     );
     client.send(ClientCommand::RestoreFromDisk);
+    // Before signing in: with VEIL on and no front yet, the front has to come first.
+    if let Some(link) = args.veil_link.take() {
+        client.send(ClientCommand::ImportVeilLink(link));
+    }
 
     let deadline = tokio::time::sleep(std::time::Duration::from_secs(args.wait_secs));
     tokio::pin!(deadline);
@@ -265,6 +282,19 @@ async fn main() {
                 }
                 if let Some(device_id) = args.history_nearby_to.take() {
                     client.send(ClientCommand::OfferHistoryNearby { device_id });
+                }
+                if args.veil_voucher {
+                    client.send(ClientCommand::IssueVeilVoucher);
+                }
+                match args.veil.take().as_deref() {
+                    Some("on") => {
+                        client.send(ClientCommand::SetVeilMode(construct_client::VeilMode::On))
+                    }
+                    Some("off") => {
+                        client.send(ClientCommand::SetVeilMode(construct_client::VeilMode::Off))
+                    }
+                    Some(other) => panic!("--veil takes on or off, not {other}"),
+                    None => client.send(ClientCommand::LoadVeil),
                 }
                 match args.goodbye.as_deref() {
                     Some("logout") => client.send(ClientCommand::Logout),
@@ -469,6 +499,9 @@ async fn main() {
             ClientEvent::HistoryExported(result) => println!("HISTORY_EXPORTED {result:?}"),
             ClientEvent::HistoryImported(result) => println!("HISTORY_IMPORTED {result:?}"),
             ClientEvent::HistoryNearby(step) => println!("HISTORY_NEARBY {step:?}"),
+            ClientEvent::Veil(status) => println!("VEIL {status:?}"),
+            ClientEvent::VeilVoucher(Ok((link, exp))) => println!("VEIL_VOUCHER exp={exp} {link}"),
+            ClientEvent::VeilVoucher(Err(e)) => println!("VEIL_VOUCHER_FAILED {e}"),
             ClientEvent::LoggedOut if args.goodbye.is_some() => {
                 println!("LOGGED_OUT");
                 return;
