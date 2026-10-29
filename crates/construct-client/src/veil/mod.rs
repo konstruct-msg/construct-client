@@ -20,6 +20,12 @@ pub fn install_chrome_hello() {
 }
 
 fn shape_like_chrome(config: &mut rustls::ClientConfig) {
+    // Chrome offers `h2, http/1.1` on every HTTPS connection; veil-front asks for `h2` alone,
+    // which JA4 does not see (it keeps only the first protocol) but the list on the wire does.
+    // The front still picks h2; were it to pick http/1.1, the h2 handshake would fail aloud.
+    if config.alpn_protocols == [b"h2".to_vec()] {
+        config.alpn_protocols.push(b"http/1.1".to_vec());
+    }
     config.client_hello_rewriter = Some(Arc::new(chrome_hello::ChromeHello::new(
         chrome_hello::Profile::Chrome155,
     )));
@@ -93,6 +99,13 @@ mod tests {
             chrome_hello::ja4(hello).as_deref(),
             Some(CHROME_155_JA4),
             "the hello on the wire"
+        );
+        // Chrome's ALPN list, as a live Chrome 155 capture has it (JA4 keeps only `h2`).
+        let parsed = chrome_hello::ParsedHello::parse(hello).expect("a hello");
+        assert_eq!(
+            parsed.extension(0x0010), // ALPN
+            Some(&b"\x00\x0c\x02h2\x08http/1.1"[..]),
+            "ALPN h2, http/1.1"
         );
 
         server.read_tls(&mut &first_flight[..]).unwrap();
