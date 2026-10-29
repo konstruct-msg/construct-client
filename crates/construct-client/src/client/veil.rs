@@ -10,6 +10,11 @@
 //! signed in — in any mode, so they are there before the mode is turned on — or from a
 //! `konstruct://veil-config` link. The device's own access key (`veil_sk`) is made here once and
 //! never leaves it; only its public half goes to the server, which binds capabilities to it.
+//!
+//! **Before there is an account** (a new install on a blocked network), a link "arms" VEIL, as
+//! on iOS (decisions/user-vouched-veil-bootstrap.md): its front is held in memory, the route is
+//! closed to anything but the tunnel, and registering or linking goes through it. When the new
+//! account's store is made, the front and the mode move into it.
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -64,11 +69,36 @@ pub struct VeilStatus {
     pub fronts: usize,
 }
 
-/// The tasks VEIL runs while an account is open.
+/// Where the tunnel takes its fronts from: the account's store, or, before there is one, the
+/// front of a link (in memory only — a voucher lasts minutes).
+enum Fronts {
+    Store(LocalStore),
+    Armed(Front),
+}
+
+impl Fronts {
+    fn usable(&self) -> Vec<Front> {
+        let now = now();
+        match self {
+            Self::Store(store) => fronts(store),
+            Self::Armed(front) => vec![front.clone()],
+        }
+        .into_iter()
+        .filter(|f| f.usable_at(now))
+        .collect()
+    }
+}
+
+/// Shared with the tunnel loop, which reads it on every round: the armed front becomes the
+/// account's without the tunnel being restarted.
+type FrontSource = Arc<Mutex<Fronts>>;
+
+/// The tasks VEIL runs while an account is open, or while it is armed before one.
 #[derive(Default)]
 pub(super) struct VeilRuntime {
     tunnel_loop: Option<tokio::task::AbortHandle>,
     provisioner: Option<tokio::task::AbortHandle>,
+    source: Option<FrontSource>,
 }
 
 impl Drop for VeilRuntime {
@@ -240,10 +270,23 @@ impl Client {
                 route::set_route(Route::Closed);
                 let scores = self.data.as_ref().map(|d| d.veil_scores_path());
                 let tunnel = self.veil_tunnel.clone();
-                Some(
-                    tokio::spawn(keep_tunnel(store.clone(), tunnel, scores, status.clone()))
+                match veil_sk(&store) {
+                    Ok(sk) => Some(
+                        tokio::spawn(keep_tunnel(
+                            Arc::new(Mutex::new(Fronts::Store(store.clone()))),
+                            sk,
+                            tunnel,
+                            scores,
+                            status.clone(),
+                        ))
                         .abort_handle(),
-                )
+                    ),
+                    Err(e) => {
+                        tracing::warn!("{e}");
+                        status.update(|s| s.state = VeilState::NoFront);
+                        None
+                    }
+                }
             }
         };
         self.drop_connections();
@@ -251,6 +294,7 @@ impl Client {
         self.veil = Some(VeilRuntime {
             tunnel_loop,
             provisioner: None,
+            source: None,
         });
         if signed_in {
             self.provision_veil();
@@ -317,6 +361,11 @@ impl Client {
 
     pub(super) fn set_veil_mode(&mut self, mode: VeilMode) {
         let Some(store) = self.store.as_ref() else {
+            // No account yet: turning it off disarms a link.
+            if mode == VeilMode::Off && self.armed.take().is_some() {
+                tracing::info!("VEIL disarmed");
+                self.stop_veil();
+            }
             return;
         };
         let byte = u8::from(mode == VeilMode::On);
@@ -331,7 +380,7 @@ impl Client {
     /// tunnel starts over to use it.
     pub(super) fn import_veil_link(&mut self, link: String) {
         let Some(store) = self.store.clone() else {
-            return;
+            return self.arm_veil(&link);
         };
         match trust::import_link(&link, &fronts(&store), now()) {
             Ok(front) => {
@@ -350,11 +399,81 @@ impl Client {
     }
 }
 
+impl Client {
+    /// No account yet: a link's front carries what comes before one — registering, linking.
+    /// Nothing goes anywhere else while it is armed.
+    fn arm_veil(&mut self, link: &str) {
+        let front = match trust::import_link(link, &[], now()) {
+            Ok(front) => front,
+            Err(e) => {
+                return self.emit(ClientEvent::Notice(format!(
+                    "This VEIL link is refused: {e}"
+                )));
+            }
+        };
+        register(std::slice::from_ref(&front));
+        tracing::info!(front = %host(&front.relay), "VEIL armed before sign-in");
+        self.armed = Some(front.clone());
+        self.veil = None;
+        route::set_route(Route::Closed);
+        self.drop_connections();
+        let status = self.veil_status();
+        status.update(|s| {
+            s.mode = VeilMode::On;
+            s.state = VeilState::Connecting;
+            s.fronts = 1;
+        });
+        // A bearer capability needs no key of ours; the device key is made with the account.
+        let sk = zeroize::Zeroizing::new(rand::random::<[u8; 32]>());
+        let source = Arc::new(Mutex::new(Fronts::Armed(front)));
+        let task = tokio::spawn(keep_tunnel(
+            source.clone(),
+            sk,
+            self.veil_tunnel.clone(),
+            None,
+            status,
+        ))
+        .abort_handle();
+        self.veil = Some(VeilRuntime {
+            tunnel_loop: Some(task),
+            provisioner: None,
+            source: Some(source),
+        });
+    }
+
+    /// The new account's store is made: an armed front and the mode go into it, and VEIL goes on
+    /// from the store (the device key is made, a capability of its own follows sign-in).
+    pub(super) fn adopt_armed_veil(&mut self) {
+        let (Some(front), Some(store)) = (self.armed.take(), self.store.clone()) else {
+            return;
+        };
+        let held = merge(&store, vec![front]).len();
+        if let Err(e) = store.secure_save(KEY_MODE, &[1]) {
+            tracing::warn!("VEIL mode not kept: {e}");
+        }
+        if let Err(e) = veil_sk(&store) {
+            tracing::warn!("{e}");
+        }
+        tracing::info!("VEIL front kept with the new account");
+        self.veil_status().update(|s| s.fronts = held);
+        // The tunnel stays as it is — the same front, and connections on it — and its loop reads
+        // the account's fronts from now on. A restart here, a minute after the voucher's first
+        // session, left the front's probe hanging (2026-10-29).
+        match self.veil.as_ref().and_then(|v| v.source.clone()) {
+            Some(source) => {
+                *source.lock().unwrap_or_else(|e| e.into_inner()) = Fronts::Store(store);
+            }
+            None => self.start_veil(),
+        }
+    }
+}
+
 /// While the mode is on: a session to the newest live front, the route pointed at it, and the
 /// next front when it dies or stops carrying connections. With none answering, the route stays
 /// closed and the fronts are tried again after a pause.
 async fn keep_tunnel(
-    store: LocalStore,
+    fronts: FrontSource,
+    sk: zeroize::Zeroizing<[u8; 32]>,
     holder: Arc<tokio::sync::Mutex<Option<Arc<Tunnel>>>>,
     scores: Option<std::path::PathBuf>,
     status: Status,
@@ -372,18 +491,8 @@ async fn keep_tunnel(
         }
         held.clone().expect("set above")
     };
-    let sk = match veil_sk(&store) {
-        Ok(sk) => sk,
-        Err(e) => {
-            tracing::warn!("{e}");
-            return status.update(|s| s.state = VeilState::NoFront);
-        }
-    };
     loop {
-        let candidates: Vec<Front> = fronts(&store)
-            .into_iter()
-            .filter(|f| f.usable_at(now()))
-            .collect();
+        let candidates = fronts.lock().unwrap_or_else(|e| e.into_inner()).usable();
         status.update(|s| s.fronts = candidates.len());
         for front in &candidates {
             status.update(|s| s.state = VeilState::Connecting);

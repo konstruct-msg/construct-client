@@ -366,6 +366,8 @@ impl Client {
                 Err(e) => return self.emit(ClientEvent::SaveFailed(format!("Save failed: {e}"))),
             }
         }
+        // Registered or linked through an armed front: it stays the account's.
+        self.adopt_armed_veil();
         match self
             .save_session(&session)
             .and_then(|()| self.write_pending_link())
@@ -495,7 +497,8 @@ impl Client {
         });
         match created {
             Ok(store) => {
-                self.store = Some(crate::local_store::LocalStore::new(store, &session.user_id))
+                self.store = Some(crate::local_store::LocalStore::new(store, &session.user_id));
+                self.adopt_armed_veil();
             }
             Err(e) => {
                 self.pending_session = Some(session);
@@ -600,7 +603,6 @@ impl Client {
     fn stop_session(&mut self) {
         // Dropping the handle stops the orchestrator task; the stream worker is told.
         self.orch_handle = None;
-        self.stop_veil();
         self.stop_history_listener();
         if let Some(ref tx) = self.stream_tx.take() {
             let _ = tx.try_send(crate::streaming::StreamCmd::Shutdown);
@@ -616,6 +618,8 @@ impl Client {
         let wiped = self
             .data_dir()
             .and_then(|data| data.wipe(store).map_err(|e| format!("{e:#}")));
+        // Only now: the sign-out the server was told of went the way VEIL sends things.
+        self.stop_veil();
         if let Err(e) = wiped {
             self.emit(ClientEvent::Notice(format!("Logout error: {e}")));
         }

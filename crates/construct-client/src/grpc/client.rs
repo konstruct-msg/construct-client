@@ -137,6 +137,11 @@ impl GrpcClient {
             Ok(result) => result,
             Err(_) => {
                 *self.inner.session.write().await = None;
+                // Through the tunnel, a call that never comes back is the front's doing as much as
+                // a connection that fails: it counts toward giving the session up.
+                if matches!(route::current().0, Route::Veil { .. }) {
+                    route::note_tunnel_failure();
+                }
                 Err(GrpcError::transport(format!("'{path}' timed out")))
             }
         }

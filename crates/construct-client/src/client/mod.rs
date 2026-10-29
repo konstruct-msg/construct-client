@@ -470,6 +470,8 @@ pub(crate) struct Client {
     /// VEIL's tasks while an account is open.
     veil: Option<veil::VeilRuntime>,
     veil_status: Option<veil::Status>,
+    /// A link's front before there is an account (VEIL armed).
+    armed: Option<crate::veil::trust::Front>,
     /// The tunnel, made once and kept: its coordinator outlives a change of mode.
     veil_tunnel:
         std::sync::Arc<tokio::sync::Mutex<Option<std::sync::Arc<crate::veil::tunnel::Tunnel>>>>,
@@ -517,6 +519,7 @@ impl Client {
             sticker_fetches: Default::default(),
             veil: None,
             veil_status: None,
+            armed: None,
             veil_tunnel: Default::default(),
             pending_link: None,
             pending_username: None,

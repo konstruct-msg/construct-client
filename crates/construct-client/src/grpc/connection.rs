@@ -60,7 +60,14 @@ pub async fn connect_h2c(port: u16) -> Result<H2Session, GrpcError> {
         .map_err(|_| GrpcError::transport(format!("VEIL tunnel {addr}: connect timed out")))?
         .map_err(|e| GrpcError::transport(format!("VEIL tunnel {addr}: {e}")))?;
     let _ = tcp.set_nodelay(true);
-    handshake(tcp).await
+    // The local end always accepts; whether the front behind it answers shows only here. A
+    // tunnel that takes the connection and never brings the server's preface would otherwise
+    // hold this client forever, and never count as a failure the tunnel loop can act on.
+    tokio::time::timeout(CONNECT_TIMEOUT, handshake(tcp))
+        .await
+        .map_err(|_| {
+            GrpcError::transport(format!("VEIL tunnel {addr}: no answer through the front"))
+        })?
 }
 
 async fn handshake<T>(io: T) -> Result<H2Session, GrpcError>
