@@ -246,6 +246,7 @@ impl Client {
                 )
             }
         };
+        self.drop_connections();
         let signed_in = self.orch_handle.is_some();
         self.veil = Some(VeilRuntime {
             tunnel_loop,
@@ -266,10 +267,22 @@ impl Client {
         self.veil.get_or_insert_with(Default::default).provisioner = Some(task);
     }
 
+    /// Connections open now were made on the route before; a live one (the message stream) would
+    /// stay on it until something replaced it. Closed now, as iOS closes its channels when the
+    /// mode changes: what was on them reconnects along the new route.
+    fn drop_connections(&self) {
+        let (signed, anonymous) = (self.grpc.clone(), self.anonymous.clone());
+        tokio::spawn(async move {
+            signed.invalidate().await;
+            anonymous.invalidate().await;
+        });
+    }
+
     /// The account is closed: back to direct, the tunnel down.
     pub(super) fn stop_veil(&mut self) {
         self.veil = None;
         route::set_route(Route::Direct);
+        self.drop_connections();
         let tunnel = self.veil_tunnel.clone();
         tokio::spawn(async move {
             if let Some(t) = tunnel.lock().await.as_ref() {

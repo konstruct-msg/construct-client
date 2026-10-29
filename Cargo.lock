@@ -770,7 +770,7 @@ dependencies = [
 [[package]]
 name = "construct-veil"
 version = "3.5.0"
-source = "git+https://github.com/konstruct-msg/construct-veil?rev=a0a22a778e2559a8aa4cbcfcbd9cd546e6b6863b#a0a22a778e2559a8aa4cbcfcbd9cd546e6b6863b"
+source = "git+https://github.com/konstruct-msg/construct-veil?rev=ba2bd355a3b24acd330786d7bb82442c224f9218#ba2bd355a3b24acd330786d7bb82442c224f9218"
 dependencies = [
  "async-trait",
  "base64",
@@ -797,7 +797,7 @@ dependencies = [
 [[package]]
 name = "construct-veil-protocol"
 version = "3.5.0"
-source = "git+https://github.com/konstruct-msg/construct-veil?rev=a0a22a778e2559a8aa4cbcfcbd9cd546e6b6863b#a0a22a778e2559a8aa4cbcfcbd9cd546e6b6863b"
+source = "git+https://github.com/konstruct-msg/construct-veil?rev=ba2bd355a3b24acd330786d7bb82442c224f9218#ba2bd355a3b24acd330786d7bb82442c224f9218"
 dependencies = [
  "bytes",
  "ed25519-dalek",

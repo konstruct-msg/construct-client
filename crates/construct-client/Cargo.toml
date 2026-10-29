@@ -16,8 +16,8 @@ post-quantum = ["construct-core/post-quantum"]
 [dependencies]
 # VEIL (veil-front) in this process: the coordinator, its pinned TLS to the front, AUTH v2/v3.
 # Pinned by commit, as construct-core pins it.
-construct-veil = { git = "https://github.com/konstruct-msg/construct-veil", rev = "a0a22a778e2559a8aa4cbcfcbd9cd546e6b6863b", features = ["coordinator"] }
-construct-veil-protocol = { git = "https://github.com/konstruct-msg/construct-veil", rev = "a0a22a778e2559a8aa4cbcfcbd9cd546e6b6863b" }
+construct-veil = { git = "https://github.com/konstruct-msg/construct-veil", rev = "ba2bd355a3b24acd330786d7bb82442c224f9218", features = ["coordinator"] }
+construct-veil-protocol = { git = "https://github.com/konstruct-msg/construct-veil", rev = "ba2bd355a3b24acd330786d7bb82442c224f9218" }
 # Crypto (Orchestrator). Production public host (ams.konstruct.cc) is HTTP/2; QUIC/H3 is
 # quic.konstruct.cc with a pinned gateway cert (iOS construct-transport), not this client.
 construct-core = { path = "../../../construct-core", features = ["store"] }
