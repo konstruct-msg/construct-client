@@ -251,8 +251,10 @@ fn peer_slot(account: &str) -> String {
 /// Pass refusal of an envelope that presented one): not presented again until the epoch rolls,
 /// and their envelopes pay meanwhile. Not dropped — the usual cause is a device of theirs whose
 /// window lapsed while it was off, and it works again once that device publishes; a dropped key
-/// would never come back, since they have no reason to send their card again. In memory, as the
-/// cost of forgetting is one more refusal.
+/// would never come back, since they have no reason to send their card again. A card of a newer
+/// generation from them lifts it at once (the refusal was the old key after their rotation); a
+/// card of the same or an older one does not. In memory, as the cost of forgetting is one more
+/// refusal.
 #[derive(Default)]
 pub struct Suspended(std::collections::HashMap<String, u64>);
 
@@ -264,6 +266,11 @@ impl Suspended {
 
     pub fn is_suspended(&self, account: &str, epoch: u64) -> bool {
         self.0.get(&account.to_lowercase()) == Some(&epoch)
+    }
+
+    /// iOS's `liftSuspension(for:)`: that account only.
+    pub fn lift(&mut self, account: &str) {
+        self.0.remove(&account.to_lowercase());
     }
 }
 

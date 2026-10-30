@@ -2192,6 +2192,7 @@ impl Task {
             return tracing::warn!("contact card without a key");
         };
         if crate::intake::Store(&self.storage).offer_peer(account, &key) {
+            self.intake_suspended.lift(account);
             tracing::info!(generation = key.generation, "contact's intake key kept");
         }
     }
@@ -3654,5 +3655,36 @@ mod intake_tests {
         let own = task.identity.user_id.clone();
         task.card_received(&own, &card);
         assert_eq!(crate::intake::Store(&task.storage).peer(&own), None);
+    }
+
+    /// A newer card from a contact refused today lifts their suspension, and only theirs; the
+    /// same card again does not (iOS #431, Android #207).
+    #[test]
+    fn a_newer_card_lifts_that_contacts_suspension() {
+        const CAROL: &str = "7c3a9e52-1b4d-4f60-8e2a-5d9b0c1f3e47";
+        let (mut task, _rx, _) = task_with_bob();
+        let epoch = crate::intake::epoch_now();
+        task.card_received(BOB, &crate::intake::own_card(&their_key(2)));
+        task.intake_suspended.suspend(BOB, epoch);
+        task.intake_suspended.suspend(CAROL, epoch);
+
+        task.card_received(BOB, &crate::intake::own_card(&their_key(3)));
+        assert!(!task.intake_suspended.is_suspended(BOB, epoch), "adopted");
+        assert!(
+            task.intake_suspended.is_suspended(CAROL, epoch),
+            "not theirs"
+        );
+
+        task.intake_suspended.suspend(BOB, epoch);
+        task.card_received(BOB, &crate::intake::own_card(&their_key(3)));
+        assert!(
+            task.intake_suspended.is_suspended(BOB, epoch),
+            "the same card"
+        );
+        task.card_received(BOB, &crate::intake::own_card(&their_key(1)));
+        assert!(
+            task.intake_suspended.is_suspended(BOB, epoch),
+            "an older card"
+        );
     }
 }

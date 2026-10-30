@@ -140,6 +140,10 @@ fn a_refused_key_rests_until_the_epoch_rolls() {
         "past epochs are dropped"
     );
     assert!(suspended.is_suspended("carol", 101));
+    suspended.suspend("dave", 101);
+    suspended.lift("Carol");
+    assert!(!suspended.is_suspended("carol", 101), "lifted, any case");
+    assert!(suspended.is_suspended("dave", 101), "only that account");
 }
 
 #[test]
