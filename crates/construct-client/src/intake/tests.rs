@@ -182,3 +182,55 @@ fn the_server_opens_the_tag_the_contact_published() {
     );
     assert_eq!(sealed_tag(&theirs, "bob", 100, vec![1; 31]), None);
 }
+
+/// A card names a key the server holds: published, and still inside the window.
+#[test]
+fn the_server_holds_a_key_for_a_week_from_its_publish() {
+    assert!(!server_holds(None, 100));
+    assert!(server_holds(Some(100), 100));
+    assert!(server_holds(Some(100), 106));
+    assert!(!server_holds(Some(100), 107), "the window ran out");
+    assert!(!server_holds(Some(101), 100), "a marker from the future");
+}
+
+#[test]
+fn a_rotation_goes_past_both_generations() {
+    assert_eq!(rotation_floor(Some(&key(3, 1)), Some(5)), 5);
+    assert_eq!(rotation_floor(Some(&key(4, 1)), Some(1)), 4);
+    assert_eq!(
+        rotation_floor(Some(&key(3, 1)), None),
+        3,
+        "server not asked"
+    );
+    assert_eq!(rotation_floor(None, Some(2)), 2);
+    assert_eq!(rotation_floor(None, None), 0);
+}
+
+/// A publish that lands after a newer key was adopted marks nothing.
+#[test]
+fn a_publish_marks_only_the_key_still_ours() {
+    let local = crate::local_store::LocalStore::open_in_memory().unwrap();
+    let store = Store(&local);
+    store.adopt(&key(1, 1));
+    assert!(store.mark_published(&key(1, 1), 100));
+    assert_eq!(store.published_epoch(), Some(100));
+    store.adopt(&key(2, 2));
+    assert!(!store.mark_published(&key(1, 1), 100));
+    assert_eq!(store.published_epoch(), None);
+}
+
+/// The lazy card waits for the publish of the current key.
+#[test]
+fn a_card_waits_for_the_publish() {
+    let local = crate::local_store::LocalStore::open_in_memory().unwrap();
+    let store = Store(&local);
+    assert_eq!(store.card_key(100), None, "no key");
+    store.adopt(&key(0, 1));
+    store.set_published_epoch(100);
+    assert_eq!(store.card_key(100), None, "a key of no generation");
+    store.adopt(&key(2, 2));
+    assert_eq!(store.card_key(100), None, "not published since it changed");
+    store.set_published_epoch(100);
+    assert_eq!(store.card_key(100), Some(key(2, 2)));
+    assert_eq!(store.card_key(107), None, "its window ran out");
+}

@@ -31,6 +31,9 @@
 //! `--profile <name>` [`--avatar <jpeg>`]: set our shared name and picture; `--share-with <id>`:
 //! share our profile with that contact. A profile shared with us prints `CONTACT`.
 //!
+//! `--remove <id>`: once started, remove that contact, as the person does — which rotates the
+//! account's intake key.
+//!
 //! `--invite`: once the account's recovery key is in place, mint an invite link and print it;
 //! with `--revoke-invites`, then revoke every live invite (`INVITES` lists them).
 //!
@@ -81,6 +84,7 @@ struct Args {
     profile: Option<String>,
     avatar: Option<String>,
     share_with: Option<String>,
+    remove: Option<String>,
     goodbye: Option<String>,
     offer_link: bool,
     link_code: Option<String>,
@@ -115,6 +119,7 @@ fn parse_args() -> Args {
         profile: None,
         avatar: None,
         share_with: None,
+        remove: None,
         goodbye: None,
         offer_link: false,
         link_code: None,
@@ -150,6 +155,7 @@ fn parse_args() -> Args {
             "--profile" => args.profile = Some(value()),
             "--avatar" => args.avatar = Some(value()),
             "--share-with" => args.share_with = Some(value()),
+            "--remove" => args.remove = Some(value()),
             "--goodbye" => args.goodbye = Some(value()),
             "--offer-link" => args.offer_link = true,
             "--revoke-invites" => args.revoke_invites = true,
@@ -246,6 +252,9 @@ async fn main() {
                         display_name: Some(name),
                         avatar,
                     });
+                }
+                if let Some(peer_id) = args.remove.take() {
+                    client.send(ClientCommand::DeleteContact { peer_id });
                 }
                 if let Some(contact_id) = args.share_with.take() {
                     client.send(ClientCommand::ShareProfile {

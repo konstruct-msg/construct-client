@@ -22,6 +22,9 @@ use construct_core::intake::{IntakeKeyState, intake_epoch, intake_tag};
 pub const WINDOW: u64 = 7;
 /// How often a running process asks whether to publish; the RPC goes once an epoch.
 pub const RECHECK: std::time::Duration = std::time::Duration::from_secs(3600);
+/// After a rotation each contact's card goes at its own random moment within this: one envelope
+/// each, never a burst the server could line up with the publish.
+pub const SWEEP_SPREAD: std::time::Duration = std::time::Duration::from_secs(3600);
 
 const OWN_KEY: &str = "intake_own_key";
 const PUBLISHED_EPOCH: &str = "intake_published_epoch";
@@ -101,6 +104,20 @@ pub fn should_publish(last: Option<u64>, current: u64) -> bool {
     last != Some(current)
 }
 
+/// Whether the server holds the tags of the key published in `marker`, in `current`: a card
+/// names only such a key (iOS `IntakePublishing.serverHolds`). The marker is cleared whenever our
+/// key changes, so it always speaks of the current one.
+pub fn server_holds(marker: Option<u64>, current: u64) -> bool {
+    marker.is_some_and(|m| current >= m && current - m < WINDOW)
+}
+
+/// The generation a rotation mints above: past both ours and the server's, so the new key
+/// replaces the account's set. A server that could not be asked counts as 0 — the rotation still
+/// happens, as the old key must not stay ours.
+pub fn rotation_floor(held: Option<&IntakeKeyState>, server: Option<u32>) -> u32 {
+    held.map_or(0, |k| k.generation).max(server.unwrap_or(0))
+}
+
 /// The tags of `key` for `account`, from `epoch` on, as `PublishIntakeTags` takes them.
 pub fn window(key: &IntakeKeyState, account: &str, epoch: u64) -> Vec<(u64, Vec<u8>)> {
     (epoch..epoch + WINDOW)
@@ -150,6 +167,26 @@ impl Store<'_> {
 
     pub fn set_published_epoch(&self, epoch: u64) {
         let _ = self.0.secure_save(PUBLISHED_EPOCH, &epoch.to_be_bytes());
+    }
+
+    /// Mark `published` as published in `epoch` — only while it is still our key: a publish that
+    /// lands after a newer key was adopted says nothing of the newer one. Whether it was marked.
+    pub fn mark_published(&self, published: &IntakeKeyState, epoch: u64) -> bool {
+        if self.own() != Held::Key(published.clone()) {
+            return false;
+        }
+        self.set_published_epoch(epoch);
+        true
+    }
+
+    /// Our key as a card may name it in `epoch`: one of a generation, whose tags the server holds.
+    pub fn card_key(&self, epoch: u64) -> Option<IntakeKeyState> {
+        match self.own() {
+            Held::Key(key) if key.generation > 0 && server_holds(self.published_epoch(), epoch) => {
+                Some(key)
+            }
+            _ => None,
+        }
     }
 
     /// The key `account` accepts, as their card gave it.
