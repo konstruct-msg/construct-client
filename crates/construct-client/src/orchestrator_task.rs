@@ -318,6 +318,11 @@ enum OrchestratorCommand {
         evidence: crate::device_certs::Evidence,
         keys: crate::device_certs::SubjectKeys,
     },
+    /// After a rotation to `generation`: our card to `account`, at its moment in the sweep.
+    CardSweep {
+        account: String,
+        generation: u32,
+    },
     /// What became of the sealed envelope of `local_id` to `device`; `vouched` when it presented
     /// the recipient's intake tag instead of a token.
     SealedSettled {
@@ -339,6 +344,17 @@ enum SealedOutcome {
     /// Refused on Privacy Pass grounds although it presented a tag: proof the tag was not
     /// honoured, since an honoured one is never asked for a token. Sent again, paying.
     CredentialRefused(Box<SealedInner>),
+}
+
+/// What became of a publish of our intake tags.
+enum Published {
+    /// Taken, and marked for the key still ours.
+    Stored,
+    /// Refused: the account is at `current`, above the key published.
+    Stale {
+        current: u32,
+    },
+    Failed,
 }
 
 /// One send, queued for the worker that sends them in order.
@@ -846,7 +862,15 @@ impl Task {
                 let result = receiver.accept(&self.orchestrator, &known, &pin);
                 let _ = reply.send((receiver, result));
             }
-            OrchestratorCommand::ForgetContact { contact_id } => self.forget_contact(&contact_id),
+            // The person removed them, here: their copy of our key is revoked by replacing it.
+            OrchestratorCommand::ForgetContact { contact_id } => {
+                self.forget_contact(&contact_id);
+                self.rotate_intake(&contact_id).await;
+            }
+            OrchestratorCommand::CardSweep {
+                account,
+                generation,
+            } => self.card_sweep(&account, generation).await,
             OrchestratorCommand::RememberContact { contact_id } => {
                 tracing::debug!(%contact_id, "remembered contact for stream routing");
                 self.known_contacts.insert(contact_id);
@@ -1880,25 +1904,155 @@ impl Task {
         let Some(own) = self.own_intake_key().await else {
             return;
         };
-        let tags = crate::intake::window(&own, &self.identity.user_id, epoch);
-        match crate::grpc::publish_intake_tags(&self.grpc, &tags, own.generation).await {
-            Ok((_, current)) if current > own.generation => tracing::info!(
+        match self.publish_key(&own, epoch).await {
+            Published::Stored => self.offer_own_intake_key(&own).await,
+            Published::Stale { current } => tracing::info!(
                 generation = own.generation,
                 current,
                 "intake publish refused: the account moved on, its key is due from our devices"
             ),
+            Published::Failed => {}
+        }
+    }
+
+    /// Publish the window of `own` from `epoch`; marked only when it lands and `own` is still our
+    /// key — a failed publish is tried again at the next connection.
+    async fn publish_key(
+        &mut self,
+        own: &construct_core::intake::IntakeKeyState,
+        epoch: u64,
+    ) -> Published {
+        let tags = crate::intake::window(own, &self.identity.user_id, epoch);
+        match crate::grpc::publish_intake_tags(&self.grpc, &tags, own.generation).await {
+            Ok((_, current)) if current > own.generation => Published::Stale { current },
             Ok((accepted, _)) => {
-                // Marked only now: a failed publish is tried again at the next connection.
-                crate::intake::Store(&self.storage).set_published_epoch(epoch);
+                if !crate::intake::Store(&self.storage).mark_published(own, epoch) {
+                    tracing::info!("intake tags published for a key since replaced — not marked");
+                    return Published::Failed;
+                }
                 tracing::info!(
                     accepted,
                     generation = own.generation,
                     epoch,
                     "intake tags published"
                 );
-                self.offer_own_intake_key(&own).await;
+                Published::Stored
             }
-            Err(e) => tracing::info!(error = %e, "intake tags not published"),
+            Err(e) => {
+                tracing::info!(error = %e, "intake tags not published");
+                Published::Failed
+            }
+        }
+    }
+
+    /// A new key for the account, because the person removed `removed` here — rotation is
+    /// revocation, there is no per-contact deny on the server. In order: adopt (forgetting who had
+    /// the old key and that it was published), publish, our devices in one SENDER_SYNC, then each
+    /// remaining contact at its own moment within the hour. The sweep only when the publish was
+    /// stored: a card names only a key the server holds. A failed publish leaves the new key to
+    /// the next ordinary one, and contacts to the lazy card after it.
+    async fn rotate_intake(&mut self, removed: &str) {
+        let server = match crate::grpc::get_intake_state(&self.grpc).await {
+            Ok((generation, _)) => Some(generation),
+            Err(e) => {
+                tracing::info!(error = %e, "intake state unavailable — rotating above our own");
+                None
+            }
+        };
+        let Some(mut key) = self.rotated_key(server) else {
+            return;
+        };
+        let epoch = crate::intake::epoch_now();
+        let mut published = self.publish_key(&key, epoch).await;
+        // A sibling rotated in the same minute: once above it — an address, not a retry budget.
+        if let Published::Stale { current } = published {
+            let Some(again) = self.adopt_minted(current) else {
+                return;
+            };
+            key = again;
+            published = self.publish_key(&key, epoch).await;
+        }
+        if !matches!(published, Published::Stored) {
+            return tracing::info!(
+                generation = key.generation,
+                "rotated intake key not published yet — contacts get it lazily after it is"
+            );
+        }
+        self.offer_own_intake_key(&key).await;
+        let me = self.identity.user_id.clone();
+        let contacts: Vec<String> = self
+            .known_contacts
+            .iter()
+            .filter(|a| *a != removed && **a != me)
+            .cloned()
+            .collect();
+        tracing::info!(
+            generation = key.generation,
+            contacts = contacts.len(),
+            "intake key rotated — cards spread over the hour"
+        );
+        for account in contacts {
+            let delay = std::time::Duration::from_secs(rand::Rng::gen_range(
+                &mut rand::thread_rng(),
+                0..crate::intake::SWEEP_SPREAD.as_secs(),
+            ));
+            let back = self.self_cmd.clone();
+            let generation = key.generation;
+            tokio::spawn(async move {
+                tokio::time::sleep(delay).await;
+                let _ = back.send(OrchestratorCommand::CardSweep {
+                    account,
+                    generation,
+                });
+            });
+        }
+    }
+
+    /// The rotation's new key, above ours and the server's `server` (None: not asked), made ours.
+    fn rotated_key(
+        &mut self,
+        server: Option<u32>,
+    ) -> Option<construct_core::intake::IntakeKeyState> {
+        let held = match crate::intake::Store(&self.storage).own() {
+            crate::intake::Held::Key(key) => Some(key),
+            crate::intake::Held::Absent => None,
+            // Never made over a key we cannot see.
+            crate::intake::Held::Unreadable => {
+                tracing::warn!("intake key unreadable — not rotated");
+                return None;
+            }
+        };
+        self.adopt_minted(crate::intake::rotation_floor(held.as_ref(), server))
+    }
+
+    /// A new key above `above`, made ours.
+    fn adopt_minted(&mut self, above: u32) -> Option<construct_core::intake::IntakeKeyState> {
+        let key = match construct_core::intake::intake_mint(above) {
+            Ok(key) => key,
+            Err(e) => {
+                tracing::error!(error = ?e, "intake key not made");
+                return None;
+            }
+        };
+        crate::intake::Store(&self.storage).adopt(&key).then(|| {
+            tracing::info!(generation = key.generation, "intake key rotated");
+            key
+        })
+    }
+
+    /// A contact's moment in a rotation's sweep. Nothing when a later rotation replaced the key
+    /// (its own sweep covers them) or they are no longer a contact; `card_for` skips devices that
+    /// already got it with a message meanwhile.
+    async fn card_sweep(&mut self, account: &str, generation: u32) {
+        let current = matches!(
+            crate::intake::Store(&self.storage).own(),
+            crate::intake::Held::Key(key) if key.generation == generation
+        );
+        if !current || !self.known_contacts.contains(account) {
+            return;
+        }
+        for event in self.card_for(account) {
+            self.process(event).await;
         }
     }
 
@@ -1976,15 +2130,17 @@ impl Task {
     /// Our card for each device of `account` we hold a session with and have not handed our
     /// current key, once (iOS `sendContactCard`): when we first hear from it and when we first
     /// write to it. Never swept across the contact list — each card is a sealed envelope, for
-    /// contacts the person may never write to again. Nothing while our key is not settled.
+    /// contacts the person may never write to again. Nothing while our key is not settled and
+    /// published.
     fn card_for(&mut self, account: &str) -> Vec<IncomingEvent> {
         if account == self.identity.user_id {
             return Vec::new();
         }
         let store = crate::intake::Store(&self.storage);
-        let own = match store.own() {
-            crate::intake::Held::Key(key) if key.generation > 0 => key,
-            _ => return Vec::new(),
+        // A card names only a key the server holds: one before its publish lands would be refused
+        // (NOT_ACCEPTED) and rested for the day. It goes with the first message after.
+        let Some(own) = store.card_key(crate::intake::epoch_now()) else {
+            return Vec::new();
         };
         let sent = store.sent_to();
         let owed: Vec<String> = self
@@ -3461,6 +3617,28 @@ mod intake_tests {
         assert!(!is_privacy_pass_refusal(&GrpcError::transport(
             "privacy_pass:missing"
         )));
+    }
+
+    /// Removing a contact replaces our key even when the server cannot be asked: above our own
+    /// generation, with who had the old one and its publish forgotten. (Without the network: the
+    /// gRPC route is one per process, and another test moves it.)
+    #[test]
+    fn a_rotation_replaces_our_key() {
+        let (mut task, _rx, _) = task_with_bob();
+        let store = crate::intake::Store(&task.storage);
+        store.adopt(&their_key(3));
+        store.mark_sent(&["d1".into()]);
+        store.set_published_epoch(crate::intake::epoch_now());
+        assert!(task.rotated_key(None).is_some());
+        let store = crate::intake::Store(&task.storage);
+        let crate::intake::Held::Key(now) = store.own() else {
+            panic!("no key after the rotation");
+        };
+        assert_eq!(now.generation, 4);
+        assert_ne!(now.key, their_key(3).key);
+        assert!(store.sent_to().is_empty());
+        assert_eq!(store.published_epoch(), None, "the publish did not land");
+        assert_eq!(store.card_key(crate::intake::epoch_now()), None);
     }
 
     /// A contact's card is kept by their account; one under our own id outside SENDER_SYNC is not.
