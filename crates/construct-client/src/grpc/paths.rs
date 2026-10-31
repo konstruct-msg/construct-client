@@ -50,6 +50,9 @@ pub const USER_PROFILE: &str = "/shared.proto.services.v1.UserService/GetUserPro
 pub const USER_UPDATE_PROFILE: &str = "/shared.proto.services.v1.UserService/UpdateUserProfile";
 pub const USER_CHECK_USERNAME: &str =
     "/shared.proto.services.v1.UserService/CheckUsernameAvailability";
+pub const USER_BLOCK: &str = "/shared.proto.services.v1.UserService/BlockUser";
+pub const USER_UNBLOCK: &str = "/shared.proto.services.v1.UserService/UnblockUser";
+pub const USER_BLOCKED: &str = "/shared.proto.services.v1.UserService/GetBlockedUsers";
 pub const USER_SET_DISCOVERABLE: &str = "/shared.proto.services.v1.UserService/SetDiscoverable";
 pub const DEVICE_SET_METADATA: &str = "/shared.proto.services.v1.DeviceService/SetDeviceMetadata";
 pub const STICKER_LIST_PACKS: &str = "/shared.proto.services.v1.StickerService/ListStickerPacks";

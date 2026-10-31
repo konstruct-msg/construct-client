@@ -32,8 +32,9 @@ pub(crate) mod users;
 mod veil;
 
 pub use account::{
-    Device, delete_account, list_devices, logout, own_username, revoke_device, set_device_metadata,
-    set_discoverable, set_username, username_refusal,
+    Device, block_user, blocked_users, delete_account, list_devices, logout, own_username,
+    revoke_device, set_device_metadata, set_discoverable, set_username, unblock_user,
+    username_refusal,
 };
 pub use auth::{
     AuthTokens, JoinRequest, JoinStatus, LinkResult, approve_join_request, authenticate_device,

@@ -239,6 +239,12 @@ pub enum ClientCommand {
     IssueVeilVoucher,
     /// The person closed the notice of trimmed messages: [`ClientEvent::MailboxGap`] with `None`.
     CloseMailboxGap,
+    /// Block or unblock a contact. What arrives from a blocked contact is dropped after it is opened; the contact is sent
+    /// as updated (`BridgeEvent::ContactUpdated`).
+    SetBlocked {
+        contact_id: String,
+        blocked: bool,
+    },
 }
 
 /// What the client tells a front end.
@@ -388,6 +394,8 @@ enum Inbox {
     Wipe,
     /// The stream reported messages trimmed before we collected them.
     MailboxGap(crate::mailbox_gap::Report),
+    /// The stream is connected: a block that could not be sent is sent again.
+    SyncBlocks,
     /// A history import landed.
     HistoryImported {
         summary: crate::history::HistorySummary,
@@ -478,6 +486,8 @@ pub(crate) struct Client {
     nearby_task: Option<tokio::task::AbortHandle>,
     /// Waiting, while signed in, for history another device offers this one.
     history_listener: Option<tokio::task::AbortHandle>,
+    /// Keeps the server's block list as the person's own blocks (`crate::block_sync`).
+    block_sync: Option<(crate::block_sync::Worker, tokio::task::AbortHandle)>,
     /// Sticker packs being fetched, and those that recently could not be.
     sticker_fetches: stickers::Fetches,
     /// VEIL's tasks while an account is open.
@@ -529,6 +539,7 @@ impl Client {
             link_task: None,
             nearby_task: None,
             history_listener: None,
+            block_sync: None,
             sticker_fetches: Default::default(),
             veil: None,
             veil_status: None,
@@ -552,6 +563,7 @@ impl Client {
                 Inbox::Recovery(state) => self.emit(ClientEvent::Recovery(state)),
                 Inbox::Wipe => self.logout(),
                 Inbox::MailboxGap(report) => self.mailbox_gap_reported(report),
+                Inbox::SyncBlocks => self.sync_blocks(),
                 Inbox::HistoryImported { summary, contacts } => {
                     self.history_imported(summary, contacts)
                 }
@@ -647,6 +659,10 @@ impl Client {
             ClientCommand::LoadVeil => self.load_veil(),
             ClientCommand::IssueVeilVoucher => self.issue_veil_voucher(),
             ClientCommand::CloseMailboxGap => self.close_mailbox_gap(),
+            ClientCommand::SetBlocked {
+                contact_id,
+                blocked,
+            } => self.set_blocked(contact_id, blocked),
         }
     }
 

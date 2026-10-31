@@ -158,6 +158,13 @@ impl Client {
         self.start_history_listener(std::time::Duration::ZERO);
         self.seed_stickers();
         self.provision_veil();
+        if let Some(store) = self.store.clone() {
+            self.block_sync = Some(crate::block_sync::spawn(
+                self.grpc.clone(),
+                store,
+                self.events.clone(),
+            ));
+        }
 
         inbound::spawn_relay(
             stream_rx,

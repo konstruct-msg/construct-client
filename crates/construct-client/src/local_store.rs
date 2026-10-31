@@ -107,6 +107,8 @@ pub struct StoredContact {
     pub sharing: bool,
     /// The name we gave them ourselves; it never leaves this device.
     pub alias: Option<String>,
+    /// We blocked them: what they send is dropped after it is opened (`crate::block_sync`).
+    pub blocked: bool,
 }
 
 /// Our profile as we share it.
@@ -123,6 +125,7 @@ pub struct OwnProfileView {
 
 const STREAM_CURSOR_KEY: &str = "stream_cursor";
 const MAILBOX_GAP_KEY: &str = "mailbox_gap.v1";
+const BLOCK_WISHES_KEY: &str = "block_sync.pending.v1";
 
 #[derive(Clone)]
 pub struct LocalStore {
@@ -825,6 +828,48 @@ impl LocalStore {
         Ok(self.store.contact(user_id)?.map(view_contact))
     }
 
+    /// Whether `id` is blocked here. Asked of every message that arrives. An unknown id, or a
+    /// store that cannot be read, is not blocked: a block is the person's own suppression, not a
+    /// boundary whose failed lookup should drop what is meant for them (iOS `BlockedContacts`).
+    pub fn is_blocked(&self, id: &str) -> bool {
+        match self.store.contact(id) {
+            Ok(contact) => contact.is_some_and(|c| c.is_blocked),
+            Err(e) => {
+                tracing::warn!("block flag not read: {e}");
+                false
+            }
+        }
+    }
+
+    /// Set the flag; `false` when there is no row for `id` to carry it.
+    pub fn set_blocked(&self, id: &str, blocked: bool) -> Result<bool> {
+        Ok(self.store.set_contact_blocked(id, blocked)?)
+    }
+
+    /// What the person wants the server's block list to hold, not yet sent (`crate::block_sync`).
+    /// Who one blocks says who one knows, so it is kept with the account. An unreadable record is
+    /// dropped: the server's list is read back after it.
+    pub fn block_wishes(&self) -> crate::block_sync::Wishes {
+        match self.secure_load(BLOCK_WISHES_KEY) {
+            Ok(Some(kept)) => serde_json::from_slice(&kept).unwrap_or_else(|e| {
+                tracing::warn!("{BLOCK_WISHES_KEY} does not parse, dropped: {e}");
+                Default::default()
+            }),
+            Ok(None) => Default::default(),
+            Err(e) => {
+                tracing::warn!("{BLOCK_WISHES_KEY} not read: {e:#}");
+                Default::default()
+            }
+        }
+    }
+
+    pub fn set_block_wishes(&self, wishes: &crate::block_sync::Wishes) -> Result<()> {
+        if wishes.is_empty() {
+            return self.secure_delete(BLOCK_WISHES_KEY);
+        }
+        self.secure_save(BLOCK_WISHES_KEY, &serde_json::to_vec(wishes)?)
+    }
+
     /// Delete a contact with its chat, messages and devices.
     pub fn delete_contact(&self, user_id: &str) -> Result<bool> {
         Ok(self.store.delete_contact(user_id)?)
@@ -913,6 +958,7 @@ fn view_contact(c: Contact) -> StoredContact {
         alias: c.local_alias,
         avatar: c.avatar,
         sharing: c.am_i_sharing_with,
+        blocked: c.is_blocked,
         user_id: c.id,
     }
 }
@@ -1078,6 +1124,54 @@ mod tests {
         assert!(!kept.record(report), "closed survives the store");
         s.secure_save(MAILBOX_GAP_KEY, b"{not json").unwrap();
         assert_eq!(s.mailbox_gap(), Default::default(), "unreadable is dropped");
+    }
+
+    /// The flag is the account's own: kept when the contact's name changes, off for anyone with no
+    /// row, and gone with the contact.
+    #[test]
+    fn a_block_is_kept_through_an_update_and_goes_with_the_contact() {
+        let s = LocalStore::open_in_memory().unwrap();
+        let bob = |name: &str| StoredContact {
+            user_id: "bob".into(),
+            display_name: name.into(),
+            ..Default::default()
+        };
+        assert!(!s.is_blocked("bob"), "nobody yet");
+        assert!(!s.set_blocked("bob", true).unwrap(), "no row to carry it");
+        s.upsert_contact(&bob("Bob")).unwrap();
+        assert!(!s.is_blocked("bob"));
+        assert!(s.set_blocked("bob", true).unwrap());
+        s.upsert_contact(&bob("Bobby")).unwrap();
+        assert!(s.is_blocked("bob"), "an update does not lift it");
+        assert!(s.get_contact_by_id("bob").unwrap().unwrap().blocked);
+        assert!(s.get_contacts().unwrap()[0].blocked);
+        s.delete_contact("bob").unwrap();
+        s.upsert_contact(&bob("Bob")).unwrap();
+        assert!(
+            !s.is_blocked("bob"),
+            "a contact added again starts unblocked"
+        );
+    }
+
+    #[test]
+    fn the_wishes_for_the_server_are_kept_and_an_empty_set_is_removed() {
+        use crate::block_sync::Intent;
+        let s = LocalStore::open_in_memory().unwrap();
+        assert!(s.block_wishes().is_empty());
+        let wishes = [(
+            "bob".to_string(),
+            Intent {
+                blocked: true,
+                reason: Some("spam".into()),
+            },
+        )]
+        .into();
+        s.set_block_wishes(&wishes).unwrap();
+        assert_eq!(s.block_wishes(), wishes);
+        s.set_block_wishes(&Default::default()).unwrap();
+        assert_eq!(s.secure_load(BLOCK_WISHES_KEY).unwrap(), None);
+        s.secure_save(BLOCK_WISHES_KEY, b"{not json").unwrap();
+        assert!(s.block_wishes().is_empty(), "unreadable is dropped");
     }
 
     #[test]
