@@ -9,6 +9,7 @@
 //! either: it has no front-end dependency, and a test fails if one is added.
 
 pub mod auth;
+pub mod block_sync;
 pub mod bridge;
 pub mod config;
 pub mod content;

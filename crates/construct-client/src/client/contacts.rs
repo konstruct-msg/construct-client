@@ -119,6 +119,43 @@ impl Client {
         self.emit(ClientEvent::ContactRemoved { peer_id });
     }
 
+    /// Block or unblock `contact_id`. The flag is set here first: it is what drops what arrives.
+    /// The server's row follows from the queue, and a block of the person's own retires the key
+    /// they hold of ours (`decisions/intake-key-is-the-accounts-not-the-devices.md`, point 4).
+    /// Nobody to block — no row for them here — changes nothing.
+    pub(super) fn set_blocked(&mut self, contact_id: String, blocked: bool) {
+        let Some(store) = self.store.as_ref() else {
+            return;
+        };
+        match store.set_blocked(&contact_id, blocked) {
+            Ok(true) => {}
+            Ok(false) => return self.emit(ClientEvent::Notice("No such contact".into())),
+            Err(e) => {
+                return self.emit(ClientEvent::Notice(format!("Block not saved: {e}")));
+            }
+        }
+        if let Err(e) = crate::block_sync::record(store, &contact_id, blocked, None) {
+            // The flag holds; the server's row is read back the other way at the next start.
+            tracing::warn!("block wish not kept: {e:#}");
+        }
+        self.sync_blocks();
+        if let Ok(Some(contact)) = store.get_contact_by_id(&contact_id) {
+            self.emit(ClientEvent::Bridge(
+                crate::bridge::BridgeEvent::ContactUpdated { contact },
+            ));
+        }
+        if blocked && let Some(ref orch) = self.orch_handle {
+            orch.blocked(contact_id);
+        }
+    }
+
+    /// Send what is waiting for the server, and read its list back.
+    pub(super) fn sync_blocks(&self) {
+        if let Some((worker, _)) = &self.block_sync {
+            worker.wake();
+        }
+    }
+
     /// Re-subscribe the stream for the full contact set — never a subset.
     fn resubscribe_stream(&self) {
         let Some(ref stream_tx) = self.stream_tx else {
@@ -200,6 +237,58 @@ mod tests {
             peer_id: "alice".into(),
         });
         assert_eq!(last_subscription(&mut stream_rx), vec!["bob"]);
+    }
+
+    /// A block sets the flag that drops what arrives, queues the server's row for the sync worker
+    /// and tells the front end the contact changed; blocking nobody changes nothing.
+    #[test]
+    fn blocking_sets_the_flag_queues_the_row_and_reports_back() {
+        let (mut client, mut events) = client();
+        let store = crate::local_store::LocalStore::open_in_memory().unwrap();
+        store
+            .upsert_contact(&StoredContact {
+                user_id: "bob".into(),
+                display_name: "Bob".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        client.store = Some(store.clone());
+
+        client.handle(ClientCommand::SetBlocked {
+            contact_id: "bob".into(),
+            blocked: true,
+        });
+        assert!(store.is_blocked("bob"));
+        let wish = &store.block_wishes()["bob"];
+        assert!(wish.blocked && wish.reason.is_none());
+        assert!(matches!(
+            events.try_recv(),
+            Ok(ClientEvent::Bridge(crate::bridge::BridgeEvent::ContactUpdated { contact }))
+                if contact.user_id == "bob" && contact.blocked
+        ));
+
+        client.handle(ClientCommand::SetBlocked {
+            contact_id: "bob".into(),
+            blocked: false,
+        });
+        assert!(!store.is_blocked("bob"));
+        assert!(
+            !store.block_wishes()["bob"].blocked,
+            "the later wish replaces the earlier"
+        );
+        assert!(matches!(
+            events.try_recv(),
+            Ok(ClientEvent::Bridge(crate::bridge::BridgeEvent::ContactUpdated { contact }))
+                if !contact.blocked
+        ));
+
+        client.handle(ClientCommand::SetBlocked {
+            contact_id: "nobody".into(),
+            blocked: true,
+        });
+        assert!(!store.block_wishes().contains_key("nobody"));
+        assert!(matches!(events.try_recv(), Ok(ClientEvent::Notice(_))));
+        assert!(events.try_recv().is_err());
     }
 
     /// A front end learns of a change only from events — the command alone changes nothing

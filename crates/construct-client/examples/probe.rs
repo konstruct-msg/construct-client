@@ -34,6 +34,10 @@
 //! `--remove <id>`: once started, remove that contact, as the person does — which rotates the
 //! account's intake key.
 //!
+//! `--block <id>` / `--unblock <id>`: once started, block or unblock that contact, as the person
+//! does — what arrives from them is dropped, the server's row follows, a block rotates the
+//! account's intake key. `CONTACT` prints `blocked=`.
+//!
 //! `--invite`: once the account's recovery key is in place, mint an invite link and print it;
 //! with `--revoke-invites`, then revoke every live invite (`INVITES` lists them).
 //!
@@ -85,6 +89,8 @@ struct Args {
     avatar: Option<String>,
     share_with: Option<String>,
     remove: Option<String>,
+    block: Option<String>,
+    unblock: Option<String>,
     goodbye: Option<String>,
     offer_link: bool,
     link_code: Option<String>,
@@ -120,6 +126,8 @@ fn parse_args() -> Args {
         avatar: None,
         share_with: None,
         remove: None,
+        block: None,
+        unblock: None,
         goodbye: None,
         offer_link: false,
         link_code: None,
@@ -156,6 +164,8 @@ fn parse_args() -> Args {
             "--avatar" => args.avatar = Some(value()),
             "--share-with" => args.share_with = Some(value()),
             "--remove" => args.remove = Some(value()),
+            "--block" => args.block = Some(value()),
+            "--unblock" => args.unblock = Some(value()),
             "--goodbye" => args.goodbye = Some(value()),
             "--offer-link" => args.offer_link = true,
             "--revoke-invites" => args.revoke_invites = true,
@@ -252,6 +262,16 @@ async fn main() {
                         display_name: Some(name),
                         avatar,
                     });
+                }
+                for (contact_id, blocked) in
+                    [(args.block.take(), true), (args.unblock.take(), false)]
+                {
+                    if let Some(contact_id) = contact_id {
+                        client.send(ClientCommand::SetBlocked {
+                            contact_id,
+                            blocked,
+                        });
+                    }
                 }
                 if let Some(peer_id) = args.remove.take() {
                     client.send(ClientCommand::DeleteContact { peer_id });
@@ -437,10 +457,11 @@ async fn main() {
             }
             ClientEvent::Bridge(BridgeEvent::Error(e)) => println!("ERROR {e}"),
             ClientEvent::Bridge(BridgeEvent::ContactUpdated { contact: c }) => println!(
-                "CONTACT {} name={:?} sharing={} avatar={:?}",
+                "CONTACT {} name={:?} sharing={} blocked={} avatar={:?}",
                 c.user_id,
                 c.display_name,
                 c.sharing,
+                c.blocked,
                 c.avatar.as_ref().map(Vec::len)
             ),
             ClientEvent::Bridge(BridgeEvent::UnvouchedDevices {

@@ -71,6 +71,7 @@ pub(super) fn spawn_relay(
                     let _ = events.send(ClientEvent::Bridge(BridgeEvent::Error(label)));
                 }
                 StreamEvent::Connected => {
+                    let _ = inbox.send(Inbox::SyncBlocks);
                     let _ = events.send(ClientEvent::Bridge(BridgeEvent::StreamStatus {
                         connected: true,
                     }));

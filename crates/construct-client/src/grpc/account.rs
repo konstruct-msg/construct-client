@@ -4,11 +4,13 @@
 use prost::Message;
 
 use crate::proto::services::v1::{
-    CheckUsernameAvailabilityRequest, CheckUsernameAvailabilityResponse, DeleteAccountRequest,
-    DeleteAccountResponse, GetUserProfileRequest, GetUserProfileResponse, ListDevicesRequest,
-    ListDevicesResponse, LogoutRequest, LogoutResponse, RevokeDeviceRequest, RevokeDeviceResponse,
-    SetDeviceMetadataRequest, SetDiscoverableRequest, SetDiscoverableResponse,
-    UpdateUserProfileRequest, UpdateUserProfileResponse,
+    BlockUserRequest, BlockUserResponse, CheckUsernameAvailabilityRequest,
+    CheckUsernameAvailabilityResponse, DeleteAccountRequest, DeleteAccountResponse,
+    GetBlockedUsersRequest, GetBlockedUsersResponse, GetUserProfileRequest, GetUserProfileResponse,
+    ListDevicesRequest, ListDevicesResponse, LogoutRequest, LogoutResponse, RevokeDeviceRequest,
+    RevokeDeviceResponse, SetDeviceMetadataRequest, SetDiscoverableRequest,
+    SetDiscoverableResponse, UnblockUserRequest, UnblockUserResponse, UpdateUserProfileRequest,
+    UpdateUserProfileResponse,
 };
 
 use super::client::GrpcClient;
@@ -140,6 +142,57 @@ pub async fn set_username(
         .profile
         .and_then(|p| p.username)
         .unwrap_or_else(|| username.to_owned()))
+}
+
+/// `UserService.BlockUser`: the server's row for this block. It refuses a call; what arrives as a
+/// message is dropped here (`crate::block_sync`). The blocker is the caller, as iOS sends it.
+pub async fn block_user(
+    client: &GrpcClient,
+    user_id: &str,
+    reason: Option<&str>,
+) -> Result<(), GrpcError> {
+    let req = BlockUserRequest {
+        user_id: user_id.to_owned(),
+        reason: reason.map(str::to_owned),
+        ..Default::default()
+    };
+    let bytes = client
+        .unary(paths::USER_BLOCK, &req.encode_to_vec())
+        .await?;
+    BlockUserResponse::decode(bytes.as_slice())
+        .map_err(|e| GrpcError::transport(format!("BlockUser decode: {e}")))?;
+    Ok(())
+}
+
+/// `UserService.UnblockUser`.
+pub async fn unblock_user(client: &GrpcClient, user_id: &str) -> Result<(), GrpcError> {
+    let req = UnblockUserRequest {
+        user_id: user_id.to_owned(),
+        ..Default::default()
+    };
+    let bytes = client
+        .unary(paths::USER_UNBLOCK, &req.encode_to_vec())
+        .await?;
+    UnblockUserResponse::decode(bytes.as_slice())
+        .map_err(|e| GrpcError::transport(format!("UnblockUser decode: {e}")))?;
+    Ok(())
+}
+
+/// `UserService.GetBlockedUsers`: everyone this account blocks on the server, from any of its
+/// devices. The user id is left empty — the caller's own list, as iOS asks it.
+pub async fn blocked_users(client: &GrpcClient) -> Result<Vec<String>, GrpcError> {
+    let bytes = client
+        .unary(
+            paths::USER_BLOCKED,
+            &GetBlockedUsersRequest::default().encode_to_vec(),
+        )
+        .await?;
+    let resp = GetBlockedUsersResponse::decode(bytes.as_slice())
+        .map_err(|e| GrpcError::transport(format!("GetBlockedUsers decode: {e}")))?;
+    if resp.has_more {
+        tracing::warn!("the server's block list has more than one page: the rest is not read");
+    }
+    Ok(resp.blocked_users.into_iter().map(|b| b.user_id).collect())
 }
 
 /// `UserService.SetDiscoverable`: whether `FindUser` finds us by username.

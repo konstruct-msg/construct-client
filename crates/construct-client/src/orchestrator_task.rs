@@ -72,6 +72,13 @@ impl OrchestratorHandle {
             .send(OrchestratorCommand::ForgetContact { contact_id });
     }
 
+    /// The person blocked `contact_id` here: the key they hold of ours is retired.
+    pub(crate) fn blocked(&self, contact_id: String) {
+        let _ = self
+            .cmd_tx
+            .send(OrchestratorCommand::Blocked { contact_id });
+    }
+
     /// Mark an account as locally known, so its deliveries enter the core.
     pub fn remember_contact(&self, contact_id: String) {
         let _ = self
@@ -278,6 +285,10 @@ impl std::fmt::Debug for HistoryJob {
 enum OrchestratorCommand {
     History(HistoryJob),
     ForgetContact {
+        contact_id: String,
+    },
+    /// The person blocked them, here: a new intake key, as when a contact is removed.
+    Blocked {
         contact_id: String,
     },
     RememberContact {
@@ -867,6 +878,9 @@ impl Task {
                 self.forget_contact(&contact_id);
                 self.rotate_intake(&contact_id).await;
             }
+            // Their session stays, so unblocking resumes where it was and the ratchet moves on
+            // while they write; only the key that let them reach us is replaced.
+            OrchestratorCommand::Blocked { contact_id } => self.rotate_intake(&contact_id).await,
             OrchestratorCommand::CardSweep {
                 account,
                 generation,
@@ -1979,13 +1993,7 @@ impl Task {
             );
         }
         self.offer_own_intake_key(&key).await;
-        let me = self.identity.user_id.clone();
-        let contacts: Vec<String> = self
-            .known_contacts
-            .iter()
-            .filter(|a| *a != removed && **a != me)
-            .cloned()
-            .collect();
+        let contacts = self.sweep_targets(removed);
         tracing::info!(
             generation = key.generation,
             contacts = contacts.len(),
@@ -2006,6 +2014,23 @@ impl Task {
                 });
             });
         }
+    }
+
+    /// Who is scheduled a card after a rotation: every contact but the one dropped, the blocked
+    /// and ourselves. Blocking is asked again at each send (`may_get_our_card`); this is only who
+    /// is scheduled.
+    fn sweep_targets(&self, removed: &str) -> Vec<String> {
+        self.known_contacts
+            .iter()
+            .filter(|a| *a != removed && self.may_get_our_card(a))
+            .cloned()
+            .collect()
+    }
+
+    /// Whether `account` is given our card: not us, and not someone the person blocked — a card
+    /// is a key of ours, and a block retires the one they hold.
+    fn may_get_our_card(&self, account: &str) -> bool {
+        account != self.identity.user_id && !self.storage.is_blocked(account)
     }
 
     /// The rotation's new key, above ours and the server's `server` (None: not asked), made ours.
@@ -2133,7 +2158,9 @@ impl Task {
     /// contacts the person may never write to again. Nothing while our key is not settled and
     /// published.
     fn card_for(&mut self, account: &str) -> Vec<IncomingEvent> {
-        if account == self.identity.user_id {
+        // Asked at each send, not when it was scheduled: a rotation's cards are spread over an
+        // hour, and someone blocked within it gets nothing.
+        if !self.may_get_our_card(account) {
             return Vec::new();
         }
         let store = crate::intake::Store(&self.storage);
@@ -2385,6 +2412,18 @@ impl Task {
                 plaintext,
             } => {
                 let account = self.account_of(&contact_id);
+                // Decrypt-but-suppress (iOS `SECURITY[block_drop]`): the ratchet has already
+                // advanced, so unblocking resumes the session cleanly. No chat, no notice, no
+                // receipt — a receipt would tell the blocked person it arrived — and the
+                // delivery is passed like a duplicate so the queue drains.
+                if self.storage.is_blocked(&account) {
+                    tracing::info!(
+                        message_id = %message_id,
+                        "SECURITY[block_drop]: message from a blocked contact suppressed"
+                    );
+                    self.cursor.commit(&self.storage, &message_id);
+                    return;
+                }
                 self.adopt_writer(&account);
                 tracing::info!(
                     device = %contact_id,
@@ -2447,6 +2486,15 @@ impl Task {
                 body,
                 ..
             } => {
+                // As their messages are: a blocked contact's receipts, profile and cards are
+                // not applied. A card would hand them a key of ours the block retired.
+                if self.storage.is_blocked(&self.account_of(&contact_id)) {
+                    tracing::info!(
+                        content_type,
+                        "SECURITY[block_drop]: control frame from a blocked contact suppressed"
+                    );
+                    return;
+                }
                 if content_type == crate::knst::CONTENT_DELIVERY_RECEIPT {
                     self.receipt_received(&body);
                 } else if content_type == crate::knst::CONTENT_PROFILE {
@@ -3686,5 +3734,128 @@ mod intake_tests {
             task.intake_suspended.is_suspended(BOB, epoch),
             "an older card"
         );
+    }
+}
+
+/// A blocked contact's deliveries are opened and dropped (iOS `SECURITY[block_drop]`): the ratchet
+/// moves on, the queue drains, and nothing shows or answers.
+#[cfg(test)]
+mod block_tests {
+    use super::*;
+
+    const BOB: &str = "2f1d6c1e-6c39-4f8e-9a51-0d7d3c7a9b10";
+    const CAROL: &str = "7c3a9e52-1b4d-4f60-8e2a-5d9b0c1f3e47";
+    const MESSAGE: &str = "6ba7b810-9dad-11d1-80b4-00c04fd430c8";
+
+    /// A task that knows Bob (a contact, blocked or not) and one device of his.
+    fn task_with_bob(blocked: bool) -> (Task, String) {
+        let (mut task, _rx) = tests::test_task_sending();
+        let identity = vec![4u8; 32];
+        let device = construct_core::device_id::derive_device_id(&identity);
+        assert!(task.peers.record(&task.storage, BOB, &device, &identity));
+        task.storage
+            .upsert_contact(&crate::local_store::StoredContact {
+                user_id: BOB.into(),
+                display_name: "bob".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        task.known_contacts.insert(BOB.into());
+        assert!(task.storage.set_blocked(BOB, blocked).unwrap());
+        (task, device)
+    }
+
+    async fn hears_text(task: &mut Task, device: &str) -> Vec<IncomingEvent> {
+        task.cursor.note("m1", Some("5000-0".into()));
+        let mut follow_ups = Vec::new();
+        task.dispatch(
+            Action::MessageDecrypted {
+                contact_id: device.into(),
+                message_id: "m1".into(),
+                plaintext: crate::knst::encode_text("hello", MESSAGE),
+            },
+            &mut follow_ups,
+        )
+        .await;
+        follow_ups
+    }
+
+    #[tokio::test]
+    async fn what_a_blocked_contact_sends_is_not_kept_and_not_answered_but_passed() {
+        let (mut task, device) = task_with_bob(true);
+        let follow_ups = hears_text(&mut task, &device).await;
+        assert!(task.storage.get_messages(BOB, 10).unwrap().is_empty());
+        assert!(
+            follow_ups.is_empty(),
+            "no receipt: it would tell them it arrived"
+        );
+        assert_eq!(
+            task.storage.load_stream_cursor().unwrap().as_deref(),
+            Some("5000-0"),
+            "the queue drains: it is not delivered again"
+        );
+    }
+
+    /// The same delivery from a contact who is not blocked is kept and answered.
+    #[tokio::test]
+    async fn the_same_from_a_contact_who_is_not_blocked_is_kept_and_answered() {
+        let (mut task, device) = task_with_bob(false);
+        let follow_ups = hears_text(&mut task, &device).await;
+        assert_eq!(task.storage.get_messages(BOB, 10).unwrap().len(), 1);
+        assert!(
+            follow_ups
+                .iter()
+                .any(|e| matches!(e, IncomingEvent::OutgoingMessage { .. })),
+            "a receipt"
+        );
+        assert_eq!(
+            task.storage.load_stream_cursor().unwrap().as_deref(),
+            Some("5000-0")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_blocked_contacts_control_frames_are_not_applied() {
+        for (blocked, name) in [(true, "bob"), (false, "Боб")] {
+            let (mut task, device) = task_with_bob(blocked);
+            let profile = crate::profile::ProfileShare {
+                display_name: "Боб".into(),
+                edited_at_ms: 7,
+                avatar: crate::profile::Avatar::Removed,
+            };
+            let mut follow_ups = Vec::new();
+            task.dispatch(
+                Action::ControlFrameDecrypted {
+                    contact_id: device,
+                    message_id: "m2".into(),
+                    content_type: crate::knst::CONTENT_PROFILE,
+                    body: profile.encode(),
+                },
+                &mut follow_ups,
+            )
+            .await;
+            let held = task.storage.get_contact_by_id(BOB).unwrap().unwrap();
+            assert_eq!(held.display_name, name, "blocked {blocked}");
+        }
+    }
+
+    /// Our card is a key of ours: not to the blocked, not to ourselves, and the rotation's sweep
+    /// leaves them out beside the one dropped.
+    #[test]
+    fn the_blocked_get_no_card_and_no_place_in_a_rotations_sweep() {
+        let (mut task, _) = task_with_bob(true);
+        task.known_contacts.insert(CAROL.into());
+        let own = task.identity.user_id.clone();
+        task.known_contacts.insert(own.clone());
+        assert!(!task.may_get_our_card(BOB));
+        assert!(task.may_get_our_card(CAROL));
+        assert!(!task.may_get_our_card(&own));
+        assert_eq!(task.sweep_targets("someone-removed"), [CAROL]);
+        assert_eq!(task.sweep_targets(CAROL), Vec::<String>::new());
+
+        task.storage.set_blocked(BOB, false).unwrap();
+        let mut all = task.sweep_targets(CAROL);
+        all.sort();
+        assert_eq!(all, [BOB], "unblocked, they are scheduled again");
     }
 }
