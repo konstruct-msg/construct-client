@@ -521,6 +521,7 @@ impl Client {
         // Before the screens are drawn: a locked window shows nothing of the account.
         self.emit_app_lock();
         self.emit(ClientEvent::Started(contacts));
+        self.emit_mailbox_gap();
         self.ensure_recovery_key();
     }
 

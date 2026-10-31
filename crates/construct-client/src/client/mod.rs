@@ -237,6 +237,8 @@ pub enum ClientCommand {
     LoadVeil,
     /// A voucher for another device: [`ClientEvent::VeilVoucher`].
     IssueVeilVoucher,
+    /// The person closed the notice of trimmed messages: [`ClientEvent::MailboxGap`] with `None`.
+    CloseMailboxGap,
 }
 
 /// What the client tells a front end.
@@ -350,6 +352,10 @@ pub enum ClientEvent {
     Settings(AccountSettings),
     /// A one-line message for the user.
     Notice(String),
+    /// Messages the server's queue removed before this device collected them, as one notice
+    /// above the chat list until [`ClientCommand::CloseMailboxGap`]; `None` when there is none
+    /// (`crate::mailbox_gap`). Sent after each start and whenever it changes.
+    MailboxGap(Option<crate::mailbox_gap::Interval>),
 }
 
 /// The account as a front end shows it. No key material.
@@ -380,6 +386,8 @@ enum Inbox {
     Recovery(crate::recovery::RecoveryState),
     /// The server was told of a sign-out or a deletion (or could not be): wipe now.
     Wipe,
+    /// The stream reported messages trimmed before we collected them.
+    MailboxGap(crate::mailbox_gap::Report),
     /// A history import landed.
     HistoryImported {
         summary: crate::history::HistorySummary,
@@ -543,6 +551,7 @@ impl Client {
                 Inbox::InviteAccepted { user_id, username } => self.add_contact(user_id, username),
                 Inbox::Recovery(state) => self.emit(ClientEvent::Recovery(state)),
                 Inbox::Wipe => self.logout(),
+                Inbox::MailboxGap(report) => self.mailbox_gap_reported(report),
                 Inbox::HistoryImported { summary, contacts } => {
                     self.history_imported(summary, contacts)
                 }
@@ -637,6 +646,7 @@ impl Client {
             ClientCommand::ImportVeilLink(link) => self.import_veil_link(link),
             ClientCommand::LoadVeil => self.load_veil(),
             ClientCommand::IssueVeilVoucher => self.issue_veil_voucher(),
+            ClientCommand::CloseMailboxGap => self.close_mailbox_gap(),
         }
     }
 

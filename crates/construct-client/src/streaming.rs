@@ -64,6 +64,9 @@ pub enum StreamEvent {
     },
     /// Stream rejected the bearer token (gRPC 16). Do not wipe keys.
     AuthRequired,
+    /// The mailbox lost messages after our cursor before we collected them; sent once per
+    /// stream, before the first delivery (`crate::mailbox_gap`).
+    MailboxGap(crate::mailbox_gap::Report),
 }
 
 /// Watermark shared by the stream worker (reconnect subscribe) and the
@@ -416,12 +419,18 @@ async fn dispatch_incoming(frame: bytes::Bytes, event_tx: &mpsc::Sender<StreamEv
         }
         Some(message_stream_response::Response::MailboxGap(gap)) => {
             // Messages trimmed from the mailbox after our cursor are gone; the server knows only
-            // the interval (decisions/mailbox-gap-is-reported.md). Not shown to the person yet.
+            // the interval (decisions/mailbox-gap-is-reported.md). The person is told.
             warn!(
                 after_cursor = %gap.after_cursor,
                 resumes_at = %gap.resumes_at,
                 "MessageStream mailbox gap: undelivered messages were trimmed"
             );
+            let _ = event_tx
+                .send(StreamEvent::MailboxGap(crate::mailbox_gap::Report {
+                    after_cursor: gap.after_cursor,
+                    resumes_at: gap.resumes_at,
+                }))
+                .await;
         }
         Some(message_stream_response::Response::Receipt(_)) => {
             debug!("MessageStream receipt ignored");
@@ -470,7 +479,29 @@ fn envelope_message_id(envelope: &Envelope) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::proto::services::v1::{HeartbeatAck, MessageError};
+    use crate::proto::services::v1::{HeartbeatAck, MailboxGap, MessageError};
+
+    #[tokio::test]
+    async fn dispatch_routes_mailbox_gap() {
+        let (event_tx, mut event_rx) = mpsc::channel::<StreamEvent>(1);
+        let resp = MessageStreamResponse {
+            response: Some(message_stream_response::Response::MailboxGap(MailboxGap {
+                after_cursor: "1700000000000-0".to_string(),
+                resumes_at: "1700000600000-0".to_string(),
+            })),
+            ..Default::default()
+        };
+
+        dispatch_incoming(encode_frame(&resp.encode_to_vec()), &event_tx).await;
+
+        match event_rx.try_recv() {
+            Ok(StreamEvent::MailboxGap(report)) => {
+                assert_eq!(report.after_cursor, "1700000000000-0");
+                assert_eq!(report.resumes_at, "1700000600000-0");
+            }
+            other => panic!("expected a mailbox gap, got {other:?}"),
+        }
+    }
 
     #[test]
     fn backoff_caps_at_sixty() {
