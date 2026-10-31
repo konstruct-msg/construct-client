@@ -468,6 +468,13 @@ impl App {
             | ClientEvent::StickerCatalog(_) => {}
             // VEIL is set in the window's settings.
             ClientEvent::Veil(_) | ClientEvent::VeilVoucher(_) => {}
+            // The terminal has no notice to close: it says so on the status line.
+            ClientEvent::MailboxGap(Some(_)) => {
+                self.status = "Some messages may not have arrived: the server removed them \
+                               before this device collected them"
+                    .into()
+            }
+            ClientEvent::MailboxGap(None) => {}
         }
     }
 

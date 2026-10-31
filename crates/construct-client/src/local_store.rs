@@ -122,6 +122,7 @@ pub struct OwnProfileView {
 // ── The store ─────────────────────────────────────────────────────────────────
 
 const STREAM_CURSOR_KEY: &str = "stream_cursor";
+const MAILBOX_GAP_KEY: &str = "mailbox_gap.v1";
 
 #[derive(Clone)]
 pub struct LocalStore {
@@ -448,6 +449,27 @@ impl LocalStore {
 
     pub fn clear_stream_cursor(&self) -> Result<()> {
         self.secure_delete(STREAM_CURSOR_KEY)
+    }
+
+    // ── Messages the server trimmed before we collected them (crate::mailbox_gap) ──
+
+    /// The notice as kept; an unreadable one is dropped, as a notice nobody can show.
+    pub fn mailbox_gap(&self) -> crate::mailbox_gap::Notice {
+        match self.secure_load(MAILBOX_GAP_KEY) {
+            Ok(Some(kept)) => serde_json::from_slice(&kept).unwrap_or_else(|e| {
+                tracing::warn!("{MAILBOX_GAP_KEY} does not parse, dropped: {e}");
+                Default::default()
+            }),
+            Ok(None) => Default::default(),
+            Err(e) => {
+                tracing::warn!("{MAILBOX_GAP_KEY} not read: {e:#}");
+                Default::default()
+            }
+        }
+    }
+
+    pub fn set_mailbox_gap(&self, notice: &crate::mailbox_gap::Notice) -> Result<()> {
+        self.secure_save(MAILBOX_GAP_KEY, &serde_json::to_vec(notice)?)
     }
 
     // ── Messages ──────────────────────────────────────────────────────────────
@@ -1031,6 +1053,31 @@ mod tests {
             timestamp_ms: ts,
             ..Default::default()
         }
+    }
+
+    /// The notice outlives a restart with the reports it was made of, and a closed one stays
+    /// closed for the same report.
+    #[test]
+    fn the_mailbox_gap_notice_is_kept_with_the_account() {
+        use crate::mailbox_gap::Report;
+        let s = LocalStore::open_in_memory().unwrap();
+        assert_eq!(s.mailbox_gap(), Default::default(), "nothing kept yet");
+        let report = Report {
+            after_cursor: "100-0".into(),
+            resumes_at: String::new(),
+        };
+        let mut notice = s.mailbox_gap();
+        assert!(notice.record(report.clone()));
+        s.set_mailbox_gap(&notice).unwrap();
+        assert!(s.mailbox_gap().interval().is_some(), "read back open");
+        let mut notice = s.mailbox_gap();
+        notice.close();
+        s.set_mailbox_gap(&notice).unwrap();
+        let mut kept = s.mailbox_gap();
+        assert!(kept.interval().is_none());
+        assert!(!kept.record(report), "closed survives the store");
+        s.secure_save(MAILBOX_GAP_KEY, b"{not json").unwrap();
+        assert_eq!(s.mailbox_gap(), Default::default(), "unreadable is dropped");
     }
 
     #[test]

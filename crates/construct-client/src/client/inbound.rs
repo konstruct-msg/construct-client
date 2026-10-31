@@ -90,7 +90,47 @@ pub(super) fn spawn_relay(
                 StreamEvent::AuthRequired => {
                     let _ = inbox.send(Inbox::StreamAuthRequired);
                 }
+                // The store is the client's: the notice is kept there before it is shown.
+                StreamEvent::MailboxGap(report) => {
+                    let _ = inbox.send(Inbox::MailboxGap(report));
+                }
             }
         }
     });
+}
+
+impl super::Client {
+    /// The server reported messages it trimmed before we collected them: keep the report with the
+    /// account and show the notice, unless it is one already open or already closed.
+    pub(super) fn mailbox_gap_reported(&self, report: crate::mailbox_gap::Report) {
+        let Some(store) = &self.store else {
+            return tracing::warn!("mailbox gap reported with no store open: not kept");
+        };
+        let mut notice = store.mailbox_gap();
+        if !notice.record(report) {
+            return tracing::info!("mailbox gap reported again: already shown or closed");
+        }
+        if let Err(e) = store.set_mailbox_gap(&notice) {
+            tracing::warn!("mailbox gap notice not saved: {e:#}");
+        }
+        self.emit(ClientEvent::MailboxGap(notice.interval()));
+    }
+
+    /// The person closed the notice.
+    pub(super) fn close_mailbox_gap(&self) {
+        let Some(store) = &self.store else { return };
+        let mut notice = store.mailbox_gap();
+        notice.close();
+        if let Err(e) = store.set_mailbox_gap(&notice) {
+            tracing::warn!("mailbox gap notice not saved closed: {e:#}");
+        }
+        self.emit(ClientEvent::MailboxGap(None));
+    }
+
+    /// The notice as kept, after a start: one not closed before a restart is shown again.
+    pub(super) fn emit_mailbox_gap(&self) {
+        if let Some(store) = &self.store {
+            self.emit(ClientEvent::MailboxGap(store.mailbox_gap().interval()));
+        }
+    }
 }

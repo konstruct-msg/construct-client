@@ -21,6 +21,7 @@ mod invite;
 mod knst;
 mod local_data;
 pub mod local_store;
+pub mod mailbox_gap;
 pub mod media;
 pub mod names;
 mod nearby;
