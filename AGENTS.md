@@ -37,7 +37,7 @@ Canonical source: `~/Code/construct-docs/decisions/rules-from-the-first-year.md`
 
 ## Rules
 
-1. **Prior art first.** Before any protocol mechanism, write down how Signal / MLS / Matrix solve it and why we deviate. The reference client is iOS.
+1. **Prior art first.** Before any protocol mechanism, write down how Signal / MLS / Matrix solve it and why we deviate. The reference client is iOS. Read them, do not recall them: the note links the code or spec it read (Session too when the question is metadata). For a delivery, crypto or privacy mechanism it answers what theirs does, who may call it and what a refused caller sees, and what happens to a party without the credential; it lists what in ours is our own, why, and what would let us remove it; and it gives the share of real traffic each new condition or exception affects. `~/Code/construct-docs/scripts/check_prior_art.py` refuses a decision note without the link.
 2. **The core decides, this client executes.** If two clients must compute it identically, or it touches ratchet/session state or a session's lifecycle, it is a `construct-core` call. A decision rebuilt here does not fail loudly — the message just never appears. Look in `construct-core/src/construct_core.udl` first.
 3. **A control message names the state it refers to.** A timer, cooldown, window, tie-break or retry budget in a fix means the message has no address.
 4. **Reproduce before fixing**; a fix counts when the case that was red turns green (interop probe, `examples/probe.rs`).
