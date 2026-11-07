@@ -9,6 +9,8 @@
 //! `build.rs` downloads and verifies the prebuilt (pinned by sha256) and exposes its path as
 //! `WEBRTC_LIB_PATH`.
 
+pub mod ffi;
+
 /// The field-trial key that turns hybrid DTLS on (X25519MLKEM768 first group).
 pub const PQ_TRIAL: &[u8] = b"WebRTC-EnableDtlsPqc";
 /// The hybrid group the phones negotiate; its presence here is what the guard checks.

@@ -176,7 +176,21 @@ fn main() {
             lib.parent().expect("lib dir").display()
         );
         println!("cargo:rustc-link-lib=dylib=webrtc");
+        // The test binary must find libwebrtc.so at runtime without polluting the host.
+        println!(
+            "cargo:rustc-link-arg=-Wl,-rpath,{}",
+            lib.parent().expect("lib dir").display()
+        );
         println!("cargo:rerun-if-env-changed=LD_LIBRARY_PATH");
+        // The C++ shim over the prebuilt's C++ API, compiled against its headers.
+        cc::Build::new()
+            .cpp(true)
+            .include(dir.join("include"))
+            .file("src/ffi/shim.cpp")
+            .flag_if_supported("-std=c++17")
+            .compile("construct_webrtc_shim");
+        println!("cargo:rerun-if-changed=src/ffi/shim.cpp");
+        println!("cargo:rerun-if-changed=src/ffi/shim.h");
     }
     // Windows linking (`libwebrtc.dll.lib` import library) is the next step; the guard test
     // still reads the .dll bytes there.

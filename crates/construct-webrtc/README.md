@@ -23,7 +23,12 @@ The media plane for Desktop (Linux/Windows) calls, started as a spike. Decision:
 
 ## Next steps
 
-1. Windows linking: `libwebrtc.dll.lib` import library (already in the win archive).
-2. C++ FFI: a thin C shim over `libwebrtc::LibWebRTC` / `RTCPeerConnection`, bound via
-   `bindgen`; loopback offer/answer test on Linux (like the iOS `WebRTCLoopbackHandshakeTests`).
-3. AEC with cpal, Opus, relay-only ICE; then interop against an iOS/macOS peer.
+1. Run the Linux-gated test (`cargo test -p construct-webrtc --target x86_64-unknown-linux-gnu`
+   on Linux, or in CI): proves the FFI chain and that `WebRTC-EnableDtlsPqc` applies at runtime.
+   `build.rs` compiles `src/ffi/shim.cpp` and links `libwebrtc.so` there; the shim itself was
+   compile-checked on macOS against the real headers (`clang++ -I <include> -c src/ffi/shim.cpp`).
+2. Loopback offer/answer over the same shim (two peer connections, one process), asserting DTLS
+   state `kConnected` and a TLS 1.3 cipher; the negotiated *group* needs a `tcpdump` capture as
+   on iOS, since the wrapper exposes `ssl_cipher_suite` but not `ssl_group_id`.
+3. Windows linking: `libwebrtc.dll.lib` import library (already in the win archive).
+4. AEC with cpal, Opus, relay-only ICE; then interop against an iOS/macOS peer.

@@ -12,3 +12,4 @@ publish = false
 # (construct-docs decisions/calls-post-quantum-dtls.md). The C++ FFI bindings come next.
 [build-dependencies]
 sha2 = "0.10"
+cc = "1"
