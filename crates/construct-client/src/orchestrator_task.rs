@@ -1373,12 +1373,9 @@ impl Task {
         fetched: crate::grpc::FetchedPreKeyBundle,
     ) -> Result<(), String> {
         let device = fetched.device_id;
-        self.orchestrator.init_session_with_bundle(
-            &device,
-            fetched.bundle.x3dh,
-            fetched.bundle.kyber,
-            false,
-        )?;
+        self.orchestrator
+            .init_session_with_bundle(&device, fetched.bundle.x3dh, fetched.bundle.kyber, false)
+            .map_err(|e| format!("init_session_with_bundle: {e}"))?;
         self.session_established_at_ms
             .insert(device.clone(), now_ms_u64());
         self.process(IncomingEvent::SessionInitCompleted {
