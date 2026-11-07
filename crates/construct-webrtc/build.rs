@@ -137,7 +137,15 @@ fn main() {
             let zip = dir.join(prebuilt.zip_file);
             if !zip.exists() {
                 let status = Command::new("curl")
-                    .args(["-fL", "--retry", "3", "-o"])
+                    .args([
+                        "-fL",
+                        "--retry",
+                        "5",
+                        "--retry-all-errors",
+                        "--connect-timeout",
+                        "20",
+                        "-o",
+                    ])
                     .arg(&zip)
                     .arg(format!("{BASE}/{TAG}/{}", prebuilt.zip_file))
                     .status()
