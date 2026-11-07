@@ -29,6 +29,10 @@ On x86_64 Linux (colima QEMU VM + ubuntu:24.04): `cargo test` green, 4 tests:
   (`WebRTC-EnableDtlsPqc` enabled), then two in-process peer connections complete offer/answer
   and the DTLS handshake — state `kConnected` (2), TLS 1.3 cipher suite (0x1301–0x1305).
 - The three PQ guard tests (byte scan + mutation) as before.
+- **Group confirmed on the wire** (`tcpdump` + `tshark` over the loopback handshake): ClientHello
+  key_share carries X25519MLKEM768 first (group `4588` = `0x11ec`, 1216-byte share) + X25519;
+  ServerHello selects X25519MLKEM768 (1120-byte share), cipher `TLS_AES_128_GCM_SHA256`. tshark
+  shows the group as "Unknown (4588)" because it lacks the name, not because the group is wrong.
 
 Gotchas found while getting the loopback to run:
 
@@ -44,7 +48,5 @@ A shipped Linux app must carry or document them.
 
 ## Next steps
 
-1. Capture the DTLS handshake with `tcpdump` to confirm the negotiated *group* is
-   `X25519MLKEM768` — the wrapper exposes `ssl_cipher_suite` but not `ssl_group_id`.
-2. Windows linking: `libwebrtc.dll.lib` import library (already in the win archive).
-3. AEC with cpal, Opus, relay-only ICE; then interop against an iOS/macOS peer.
+1. Windows linking: `libwebrtc.dll.lib` import library (already in the win archive).
+2. AEC with cpal, Opus, relay-only ICE; then interop against an iOS/macOS peer.
