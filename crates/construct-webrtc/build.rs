@@ -182,10 +182,17 @@ fn main() {
             lib.parent().expect("lib dir").display()
         );
         println!("cargo:rerun-if-env-changed=LD_LIBRARY_PATH");
-        // The C++ shim over the prebuilt's C++ API, compiled against its headers.
+        // The C++ shim over the prebuilt's C++ API, compiled against its headers. The archive
+        // unpacks as <dir>/<top>/lib/libwebrtc.so and <dir>/<top>/include/*.h; the include dir
+        // sits beside the lib dir.
+        let include_dir = lib
+            .parent()
+            .and_then(Path::parent)
+            .expect("prebuilt lib is two levels under the unpack dir")
+            .join("include");
         cc::Build::new()
             .cpp(true)
-            .include(dir.join("include"))
+            .include(include_dir)
             .file("src/ffi/shim.cpp")
             .flag_if_supported("-std=c++17")
             .compile("construct_webrtc_shim");

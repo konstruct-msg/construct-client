@@ -21,14 +21,20 @@ The media plane for Desktop (Linux/Windows) calls, started as a spike. Decision:
 | libwebrtc-win-x64-release.zip | `0cf141cd803af8f860080d94861d2d591ab9081a28f5cdead1b7c775ad5d3bf8` |
 | libwebrtc-win-arm64-release.zip | `2546c8cc20a4326d6b40e06a250a642733e80e03a1ba36a0b115a491d65d3f85` |
 
+## Verified (2026-11-07)
+
+On x86_64 Linux (colima QEMU VM + ubuntu:24.04): `cargo test` green, 4 tests. The Linux-gated
+`the_pq_field_trial_applies_at_runtime` calls into the linked `libwebrtc.so` and confirms
+`WebRTC-EnableDtlsPqc` is enabled after `InitializeWithFieldTrials` — the FFI chain works.
+
+`libwebrtc.so` needs these at runtime (install before running):
+`libglib2.0-0 libxcomposite1 libxdamage1 libxext6 libxfixes3 libxrandr2 libgbm1 libdrm2`.
+A shipped Linux app must carry or document them.
+
 ## Next steps
 
-1. Run the Linux-gated test (`cargo test -p construct-webrtc --target x86_64-unknown-linux-gnu`
-   on Linux, or in CI): proves the FFI chain and that `WebRTC-EnableDtlsPqc` applies at runtime.
-   `build.rs` compiles `src/ffi/shim.cpp` and links `libwebrtc.so` there; the shim itself was
-   compile-checked on macOS against the real headers (`clang++ -I <include> -c src/ffi/shim.cpp`).
-2. Loopback offer/answer over the same shim (two peer connections, one process), asserting DTLS
+1. Loopback offer/answer over the same shim (two peer connections, one process), asserting DTLS
    state `kConnected` and a TLS 1.3 cipher; the negotiated *group* needs a `tcpdump` capture as
    on iOS, since the wrapper exposes `ssl_cipher_suite` but not `ssl_group_id`.
-3. Windows linking: `libwebrtc.dll.lib` import library (already in the win archive).
-4. AEC with cpal, Opus, relay-only ICE; then interop against an iOS/macOS peer.
+2. Windows linking: `libwebrtc.dll.lib` import library (already in the win archive).
+3. AEC with cpal, Opus, relay-only ICE; then interop against an iOS/macOS peer.
