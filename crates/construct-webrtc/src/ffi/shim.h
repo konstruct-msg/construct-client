@@ -19,6 +19,12 @@ int ct_webrtc_field_trial_enabled(const char* key);
 
 void ct_webrtc_terminate(void);
 
+// Runs a loopback: two peer connections in one process, offer/answer, ICE over
+// host candidates, then the DTLS handshake. Returns the negotiated TLS cipher
+// suite (0 on failure) and writes the DTLS transport state into out_dtls_state
+// (2 == kConnected).
+int ct_loopback_handshake(int timeout_ms, int* out_dtls_state);
+
 #ifdef __cplusplus
 }
 #endif

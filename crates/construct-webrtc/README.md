@@ -23,9 +23,20 @@ The media plane for Desktop (Linux/Windows) calls, started as a spike. Decision:
 
 ## Verified (2026-11-07)
 
-On x86_64 Linux (colima QEMU VM + ubuntu:24.04): `cargo test` green, 4 tests. The Linux-gated
-`the_pq_field_trial_applies_at_runtime` calls into the linked `libwebrtc.so` and confirms
-`WebRTC-EnableDtlsPqc` is enabled after `InitializeWithFieldTrials` — the FFI chain works.
+On x86_64 Linux (colima QEMU VM + ubuntu:24.04): `cargo test` green, 4 tests:
+
+- `the_runtime_negotiates_pq_dtls` calls into the linked `libwebrtc.so`: field trial applied
+  (`WebRTC-EnableDtlsPqc` enabled), then two in-process peer connections complete offer/answer
+  and the DTLS handshake — state `kConnected` (2), TLS 1.3 cipher suite (0x1301–0x1305).
+- The three PQ guard tests (byte scan + mutation) as before.
+
+Gotchas found while getting the loopback to run:
+
+- `factory->Initialize()` is required after `CreateRTCPeerConnectionFactory`.
+- `Create`/`CreateOffer`/`CreateAnswer` take non-null `RTCMediaConstraints::Create()`; passing
+  `nullptr` segfaults in `RTCPeerConnectionImpl::Initialize`.
+- A peer connection initializes the **AudioDeviceModule** unconditionally, so the process needs
+  an audio server: headless, `pulseaudio --start` + `pactl load-module module-null-sink`.
 
 `libwebrtc.so` needs these at runtime (install before running):
 `libglib2.0-0 libxcomposite1 libxdamage1 libxext6 libxfixes3 libxrandr2 libgbm1 libdrm2`.
@@ -33,8 +44,7 @@ A shipped Linux app must carry or document them.
 
 ## Next steps
 
-1. Loopback offer/answer over the same shim (two peer connections, one process), asserting DTLS
-   state `kConnected` and a TLS 1.3 cipher; the negotiated *group* needs a `tcpdump` capture as
-   on iOS, since the wrapper exposes `ssl_cipher_suite` but not `ssl_group_id`.
+1. Capture the DTLS handshake with `tcpdump` to confirm the negotiated *group* is
+   `X25519MLKEM768` — the wrapper exposes `ssl_cipher_suite` but not `ssl_group_id`.
 2. Windows linking: `libwebrtc.dll.lib` import library (already in the win archive).
 3. AEC with cpal, Opus, relay-only ICE; then interop against an iOS/macOS peer.

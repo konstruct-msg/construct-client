@@ -194,9 +194,11 @@ fn main() {
             .cpp(true)
             .include(include_dir)
             .file("src/ffi/shim.cpp")
+            .file("src/ffi/shim_loop.cpp")
             .flag_if_supported("-std=c++17")
             .compile("construct_webrtc_shim");
         println!("cargo:rerun-if-changed=src/ffi/shim.cpp");
+        println!("cargo:rerun-if-changed=src/ffi/shim_loop.cpp");
         println!("cargo:rerun-if-changed=src/ffi/shim.h");
     }
     // Windows linking (`libwebrtc.dll.lib` import library) is the next step; the guard test
