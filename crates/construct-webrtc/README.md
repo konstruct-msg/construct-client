@@ -1,0 +1,55 @@
+# construct-webrtc (spike)
+
+The media plane for Desktop (Linux/Windows) calls, started as a spike. Decision:
+`construct-docs/decisions/desktop-calls-webrtc-stack.md` (libwebrtc, not webrtc-rs). Task:
+`construct-docs/todo/272-desktop-zvonki-linux-windows.md`.
+
+## What exists
+
+- `build.rs` fetches the pinned `webrtc-sdk/libwebrtc` prebuilt (m150 line, MIT C++ wrapper),
+  verifies it by sha256, links it on Linux, and exposes `WEBRTC_LIB_PATH`.
+- `src/lib.rs` has the PQ-DTLS guard: the prebuilt must contain the `WebRTC-EnableDtlsPqc`
+  field-trial key and the `X25519MLKEM768` group. `cargo test` fails if a future prebuilt
+  update drops either.
+
+## Pins (tag `libwebrtc.m150.7871.07`)
+
+| archive | sha256 |
+|---|---|
+| libwebrtc-linux-x64-release.zip | `ef380526cf9616848bc0b97b24990cbf2ad851c209d5dce93cc3ebb9d3789fbc` |
+| libwebrtc-linux-arm64-release.zip | `887de0a1da6c9b8807da9fe2fc237e03ac5fcc3df4142a5f8889d66baa24bf08` |
+| libwebrtc-win-x64-release.zip | `0cf141cd803af8f860080d94861d2d591ab9081a28f5cdead1b7c775ad5d3bf8` |
+| libwebrtc-win-arm64-release.zip | `2546c8cc20a4326d6b40e06a250a642733e80e03a1ba36a0b115a491d65d3f85` |
+
+## Verified (2026-11-07)
+
+On x86_64 Linux (colima QEMU VM + ubuntu:24.04): `cargo test` green, 4 tests:
+
+- `the_runtime_negotiates_pq_dtls` calls into the linked `libwebrtc.so`: field trial applied
+  (`WebRTC-EnableDtlsPqc` enabled), then two in-process peer connections complete offer/answer
+  and the DTLS handshake — state `kConnected` (2), TLS 1.3 cipher suite (0x1301–0x1305).
+- The three PQ guard tests (byte scan + mutation) as before.
+- **Group confirmed on the wire** (`tcpdump` + `tshark` over the loopback handshake): ClientHello
+  key_share carries X25519MLKEM768 first (group `4588` = `0x11ec`, 1216-byte share) + X25519;
+  ServerHello selects X25519MLKEM768 (1120-byte share), cipher `TLS_AES_128_GCM_SHA256`. tshark
+  shows the group as "Unknown (4588)" because it lacks the name, not because the group is wrong.
+
+Gotchas found while getting the loopback to run:
+
+- `factory->Initialize()` is required after `CreateRTCPeerConnectionFactory`.
+- `Create`/`CreateOffer`/`CreateAnswer` take non-null `RTCMediaConstraints::Create()`; passing
+  `nullptr` segfaults in `RTCPeerConnectionImpl::Initialize`.
+- A peer connection initializes the **AudioDeviceModule** unconditionally, so the process needs
+  an audio server: headless, `pulseaudio --start` + `pactl load-module module-null-sink`.
+
+`libwebrtc.so` needs these at runtime (install before running):
+`libglib2.0-0 libxcomposite1 libxdamage1 libxext6 libxfixes3 libxrandr2 libgbm1 libdrm2`.
+A shipped Linux app must carry or document them.
+
+## Next steps
+
+1. Verify Windows linking (written, not run): `build.rs` renames `libwebrtc.dll.lib` →
+   `webrtc.lib` for `-l webrtc`, defines `LIB_WEBRTC_API_DLL` (dllimport), and compiles the
+   shim with MSVC. `libwebrtc.dll` must sit next to the exe at runtime. Needs a windows-latest
+   CI run; the loopback test also needs a WASAPI audio endpoint there.
+2. AEC with cpal, Opus, relay-only ICE; then interop against an iOS/macOS peer.

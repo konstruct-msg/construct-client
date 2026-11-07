@@ -748,7 +748,7 @@ dependencies = [
 
 [[package]]
 name = "construct-core"
-version = "0.60.0"
+version = "0.63.0"
 dependencies = [
  "aes-gcm",
  "argon2",
@@ -853,6 +853,14 @@ dependencies = [
  "thiserror 1.0.69",
  "tokio-util",
  "zeroize",
+]
+
+[[package]]
+name = "construct-webrtc"
+version = "0.1.0"
+dependencies = [
+ "cc",
+ "sha2",
 ]
 
 [[package]]
