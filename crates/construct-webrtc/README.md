@@ -48,5 +48,8 @@ A shipped Linux app must carry or document them.
 
 ## Next steps
 
-1. Windows linking: `libwebrtc.dll.lib` import library (already in the win archive).
+1. Verify Windows linking (written, not run): `build.rs` renames `libwebrtc.dll.lib` →
+   `webrtc.lib` for `-l webrtc`, defines `LIB_WEBRTC_API_DLL` (dllimport), and compiles the
+   shim with MSVC. `libwebrtc.dll` must sit next to the exe at runtime. Needs a windows-latest
+   CI run; the loopback test also needs a WASAPI audio endpoint there.
 2. AEC with cpal, Opus, relay-only ICE; then interop against an iOS/macOS peer.

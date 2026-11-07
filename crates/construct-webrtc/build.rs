@@ -169,38 +169,47 @@ fn main() {
     };
 
     println!("cargo:rustc-env=WEBRTC_LIB_PATH={}", lib.display());
-    if link && os == "linux" {
-        // The .so is `libwebrtc.so`, so `-l webrtc` finds it from the search path.
-        println!(
-            "cargo:rustc-link-search=native={}",
-            lib.parent().expect("lib dir").display()
-        );
-        println!("cargo:rustc-link-lib=dylib=webrtc");
-        // The test binary must find libwebrtc.so at runtime without polluting the host.
-        println!(
-            "cargo:rustc-link-arg=-Wl,-rpath,{}",
-            lib.parent().expect("lib dir").display()
-        );
-        println!("cargo:rerun-if-env-changed=LD_LIBRARY_PATH");
-        // The C++ shim over the prebuilt's C++ API, compiled against its headers. The archive
-        // unpacks as <dir>/<top>/lib/libwebrtc.so and <dir>/<top>/include/*.h; the include dir
-        // sits beside the lib dir.
-        let include_dir = lib
-            .parent()
-            .and_then(Path::parent)
-            .expect("prebuilt lib is two levels under the unpack dir")
-            .join("include");
-        cc::Build::new()
-            .cpp(true)
-            .include(include_dir)
+
+    // The C++ shim over the prebuilt's C++ API, compiled against its headers. The archive
+    // unpacks as <dir>/<top>/lib/libwebrtc.{so,dll} and <dir>/<top>/include/*.h; the include
+    // dir sits beside the lib dir.
+    let include_dir = lib
+        .parent()
+        .and_then(Path::parent)
+        .expect("prebuilt lib is two levels under the unpack dir")
+        .join("include");
+    if link {
+        let lib_dir = lib.parent().expect("lib dir");
+        println!("cargo:rustc-link-search=native={}", lib_dir.display());
+        if os == "linux" {
+            // The .so is `libwebrtc.so`, so `-l webrtc` finds it from the search path.
+            println!("cargo:rustc-link-lib=dylib=webrtc");
+            // The test binary must find libwebrtc.so at runtime without polluting the host.
+            println!(
+                "cargo:rustc-link-arg=-Wl,-rpath,{lib_dir}",
+                lib_dir = lib_dir.display()
+            );
+            println!("cargo:rerun-if-env-changed=LD_LIBRARY_PATH");
+        } else if os == "windows" {
+            // The import library is `libwebrtc.dll.lib`; give it the name `-l webrtc` looks
+            // for (`webrtc.lib`). The DLL it imports stays `libwebrtc.dll`, shipped beside the
+            // exe. Consuming the prebuilt DLL also needs LIB_WEBRTC_API_DLL (dllimport).
+            let import =
+                find_named(&dir, "libwebrtc.dll.lib").expect("import lib in the win archive");
+            std::fs::copy(&import, lib_dir.join("webrtc.lib")).expect("copy import library");
+            println!("cargo:rustc-link-lib=dylib=webrtc");
+        }
+        let mut build = cc::Build::new();
+        build.cpp(true).include(&include_dir).std("c++17");
+        if os == "windows" {
+            build.define("LIB_WEBRTC_API_DLL", "1");
+        }
+        build
             .file("src/ffi/shim.cpp")
             .file("src/ffi/shim_loop.cpp")
-            .flag_if_supported("-std=c++17")
             .compile("construct_webrtc_shim");
         println!("cargo:rerun-if-changed=src/ffi/shim.cpp");
         println!("cargo:rerun-if-changed=src/ffi/shim_loop.cpp");
         println!("cargo:rerun-if-changed=src/ffi/shim.h");
     }
-    // Windows linking (`libwebrtc.dll.lib` import library) is the next step; the guard test
-    // still reads the .dll bytes there.
 }
