@@ -622,6 +622,16 @@ impl App {
                     "⚠ @{name}: {count} new device(s) not vouched for by their other devices — compare safety numbers"
                 );
             }
+            BridgeEvent::CallState { call } => match call {
+                Some(call) => {
+                    let direction = match call.direction {
+                        client::calls::Direction::Outgoing => "outgoing",
+                        client::calls::Direction::Incoming => "incoming",
+                    };
+                    self.status = format!("📞 {direction} {}: {:?}", call.peer_id, call.phase);
+                }
+                None => self.status = "call ended".to_string(),
+            },
         }
     }
 
