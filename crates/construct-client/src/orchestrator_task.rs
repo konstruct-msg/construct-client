@@ -24,6 +24,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 
 use construct_core::orchestration::{
+    OpenRefusal,
     actions::{Action, IncomingEvent},
     orchestrator::Orchestrator,
 };
@@ -1142,9 +1143,11 @@ impl Task {
         let devices: Vec<String> = match to_device {
             Some(device) => vec![device],
             None => match self.recipient_devices(&peer).await {
-                Ok(devices) if !devices.is_empty() => devices,
-                Ok(_) => {
-                    self.ui_error(format!("[NO_CALL_DEVICES] {peer} has no device to call"));
+                Ok((devices, _)) if !devices.is_empty() => devices,
+                Ok((_, refused)) => {
+                    self.ui_error(post_quantum_refusal_notice(&peer, &refused).unwrap_or_else(
+                        || format!("[NO_CALL_DEVICES] {peer} has no device to call"),
+                    ));
                     return;
                 }
                 Err(e) => {
@@ -1562,11 +1565,13 @@ impl Task {
             return vec![event];
         };
         let devices = match self.recipient_devices(&contact_id).await {
-            Ok(devices) if !devices.is_empty() => devices,
-            Ok(_) => {
-                self.ui_error(format!(
-                    "[NO_DEVICES] {contact_id} has no device to send to"
-                ));
+            Ok((devices, _)) if !devices.is_empty() => devices,
+            Ok((_, refused)) => {
+                self.ui_error(
+                    post_quantum_refusal_notice(&contact_id, &refused).unwrap_or_else(|| {
+                        format!("[NO_DEVICES] {contact_id} has no device to send to")
+                    }),
+                );
                 return Vec::new();
             }
             Err(e) => {
@@ -1601,15 +1606,20 @@ impl Task {
             .collect()
     }
 
-    /// The devices of `account` a message goes to, each with a session (see `refresh_devices`).
-    async fn recipient_devices(&mut self, account: &str) -> Result<Vec<String>, String> {
-        self.refresh_devices(account).await?;
-        Ok(self
+    /// The devices of `account` a message goes to, each with a session (see `refresh_devices`),
+    /// and the devices the core refused to open one with on the way.
+    async fn recipient_devices(
+        &mut self,
+        account: &str,
+    ) -> Result<(Vec<String>, Vec<(String, OpenRefusal)>), String> {
+        let refused = self.refresh_devices(account).await?;
+        let devices = self
             .peers
             .devices_of(account)
             .into_iter()
             .filter(|d| *d != self.identity.device_id && self.orchestrator.has_active_session(d))
-            .collect())
+            .collect();
+        Ok((devices, refused))
     }
 
     /// Bring `account`'s device set up to date and give each device a session.
@@ -1617,8 +1627,12 @@ impl Task {
     /// The set is asked of the server when nothing is known, when a known device has no session,
     /// or every `DEVICES_RECHECK` — a device the account gained since (a desktop linked to the
     /// phone) is otherwise never written to. That ask spends no one-time prekeys; only devices
-    /// that need a session are asked again for a bundle that does.
-    async fn refresh_devices(&mut self, account: &str) -> Result<(), String> {
+    /// that need a session are asked again for a bundle that does. Returns the devices the core
+    /// refused to open a session with, each with its refusal.
+    async fn refresh_devices(
+        &mut self,
+        account: &str,
+    ) -> Result<Vec<(String, OpenRefusal)>, String> {
         let known = self.peers.devices_of(account);
         let missing = known.iter().any(|d| {
             *d != self.identity.device_id && !self.orchestrator.has_session_for_sending(d)
@@ -1628,7 +1642,7 @@ impl Task {
             .get(account)
             .is_none_or(|at| at.elapsed() >= DEVICES_RECHECK);
         if !known.is_empty() && !missing && !stale {
-            return Ok(());
+            return Ok(Vec::new());
         }
         self.devices_checked
             .insert(account.to_string(), tokio::time::Instant::now());
@@ -1676,29 +1690,34 @@ impl Task {
             })
             .collect();
         if need.is_empty() {
-            return Ok(());
+            return Ok(Vec::new());
         }
         let fetched = crate::grpc::get_pre_key_bundles(&self.grpc, account, need, true)
             .await
             .map_err(|e| format!("GetPreKeyBundles: {e}"))?;
+        let mut refused = Vec::new();
         for bundle in fetched.bundles {
             let device = bundle.device_id.clone();
-            if let Err(e) = self.open_session(bundle).await {
-                tracing::warn!(%account, %device, error = %e, "device left out of the send");
+            if let Err(refusal) = self.open_session(bundle).await {
+                tracing::warn!(%account, %device, error = %refusal, "device left out of the send");
+                refused.push((device, refusal));
             }
         }
-        Ok(())
+        Ok(refused)
     }
 
     /// Open an INITIATOR session with a fetched bundle's device.
     async fn open_session(
         &mut self,
         fetched: crate::grpc::FetchedPreKeyBundle,
-    ) -> Result<(), String> {
+    ) -> Result<(), OpenRefusal> {
         let device = fetched.device_id;
-        self.orchestrator
-            .init_session_with_bundle(&device, fetched.bundle.x3dh, fetched.bundle.kyber, false)
-            .map_err(|e| format!("init_session_with_bundle: {e}"))?;
+        self.orchestrator.init_session_with_bundle(
+            &device,
+            fetched.bundle.x3dh,
+            fetched.bundle.kyber,
+            false,
+        )?;
         self.session_established_at_ms
             .insert(device.clone(), now_ms_u64());
         self.process(IncomingEvent::SessionInitCompleted {
@@ -1709,7 +1728,7 @@ impl Task {
         if self.orchestrator.has_active_session(&device) {
             Ok(())
         } else {
-            Err("no session after init".into())
+            Err(OpenRefusal::Other("no session after init".into()))
         }
     }
 
@@ -3124,6 +3143,21 @@ fn changed(storage: &LocalStore, id: &str) -> Option<BridgeEvent> {
     Some(BridgeEvent::MessageChanged { message })
 }
 
+/// What the screens are told when no device of `account` can be written to and the core refused
+/// a session because the bundle carries no post-quantum keys this device can trust — usually a
+/// peer on a build from before PQXDH v2. Read from the refusal's type, as iOS does
+/// (`SessionError.peerNotPostQuantum`); `None` when no refusal was that one, and the caller says
+/// there is no device.
+fn post_quantum_refusal_notice(account: &str, refused: &[(String, OpenRefusal)]) -> Option<String> {
+    refused.iter().find_map(|(_, refusal)| match refusal {
+        OpenRefusal::PqRequired { reason, .. } => Some(format!(
+            "[PEER_NOT_POST_QUANTUM] {account}: their app has no post-quantum keys this device \
+             can trust ({reason:?}) — ask them to update the app"
+        )),
+        OpenRefusal::Other(_) => None,
+    })
+}
+
 fn should_drop_stale_session_replay(
     context: &StreamMessageContext,
     session_established_at_ms: &HashMap<String, u64>,
@@ -3410,6 +3444,40 @@ mod tests {
         assert_eq!(stream_cursor_millis(Some("1787431771124")), None);
         assert_eq!(stream_cursor_millis(Some("not-a-cursor")), None);
         assert_eq!(stream_cursor_millis(None), None);
+    }
+
+    #[test]
+    fn a_post_quantum_refusal_is_named_to_the_screens() {
+        use construct_core::orchestration::PqxdhRefusal;
+        let refused = vec![
+            (
+                "dev-a".to_string(),
+                OpenRefusal::Other("PEER_SPK_STALE".into()),
+            ),
+            (
+                "dev-b".to_string(),
+                OpenRefusal::PqRequired {
+                    reason: PqxdhRefusal::NoKyberPrekey,
+                    contact_id: "dev-b".into(),
+                },
+            ),
+        ];
+        let notice = post_quantum_refusal_notice("bob", &refused).expect("a PQ refusal is named");
+        assert!(
+            notice.starts_with("[PEER_NOT_POST_QUANTUM] bob"),
+            "{notice}"
+        );
+        assert!(notice.contains("NoKyberPrekey"), "{notice}");
+    }
+
+    #[test]
+    fn any_other_refusal_leaves_the_no_device_notice() {
+        let refused = vec![(
+            "dev-a".to_string(),
+            OpenRefusal::Other("no session after init".into()),
+        )];
+        assert_eq!(post_quantum_refusal_notice("bob", &refused), None);
+        assert_eq!(post_quantum_refusal_notice("bob", &[]), None);
     }
 
     #[test]
