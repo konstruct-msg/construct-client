@@ -367,6 +367,26 @@ pub fn busy(call_id: &str, device_id: &str) -> WebRtcSignal {
 
 /// An ICE candidate, its `candidate` bytes sealed by the core's ratchet on the way out (the
 /// producer of a live candidate in stage B passes `Bytes` here).
+pub fn ice_candidate(
+    call_id: &str,
+    device_id: &str,
+    sdp_m_line_index: u32,
+    sdp_mid: String,
+    candidate: bytes::Bytes,
+) -> WebRtcSignal {
+    WebRtcSignal {
+        call_id: call_id.to_owned(),
+        sender_device_id: device_id.to_owned(),
+        timestamp: now_ms(),
+        signal: Some(web_rtc_signal::Signal::IceCandidate(IceCandidate {
+            sdp_m_line_index,
+            sdp_mid,
+            candidate,
+            ..Default::default()
+        })),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -452,25 +472,5 @@ mod tests {
         let busy_sig = busy("c1", "peer-device");
         m.on_signal(&busy_sig, "peer-device");
         assert_eq!(m.active().unwrap().phase, Phase::Over(Outcome::Busy));
-    }
-}
-
-pub fn ice_candidate(
-    call_id: &str,
-    device_id: &str,
-    sdp_m_line_index: u32,
-    sdp_mid: String,
-    candidate: bytes::Bytes,
-) -> WebRtcSignal {
-    WebRtcSignal {
-        call_id: call_id.to_owned(),
-        sender_device_id: device_id.to_owned(),
-        timestamp: now_ms(),
-        signal: Some(web_rtc_signal::Signal::IceCandidate(IceCandidate {
-            sdp_m_line_index,
-            sdp_mid,
-            candidate,
-            ..Default::default()
-        })),
     }
 }
