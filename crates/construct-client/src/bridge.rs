@@ -31,6 +31,10 @@ pub enum BridgeEvent {
     Error(String),
     /// Double Ratchet session with this contact is ready for encrypt/decrypt.
     SessionReady { contact_id: String },
+    /// The 1:1 call changed: its snapshot, or `None` when the call ended.
+    CallState {
+        call: Option<crate::calls::CallState>,
+    },
     /// Devices of this contact's account that no device we trust vouched for: perhaps the
     /// contact linked a device without a certificate, perhaps the server added one. Only an
     /// alarm — they still receive messages (decisions/devices-of-an-account-sign-each-other.md).

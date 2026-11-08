@@ -7,6 +7,7 @@
 //! (`decisions/desktop-is-the-tui-client-with-a-second-shell.md`) talks to it the same way.
 
 mod auth;
+mod calls;
 mod contacts;
 mod identity;
 mod inbound;
@@ -245,6 +246,16 @@ pub enum ClientCommand {
         contact_id: String,
         blocked: bool,
     },
+    /// Begin a 1:1 audio call to this contact: [`BridgeEvent::CallState`] follows.
+    StartCall {
+        contact_id: String,
+    },
+    /// The person answered the ringing incoming call.
+    AcceptCall,
+    /// The person declined the ringing incoming call.
+    DeclineCall,
+    /// The person (or the app) ended the held call.
+    EndCall,
 }
 
 /// What the client tells a front end.
@@ -663,6 +674,10 @@ impl Client {
                 contact_id,
                 blocked,
             } => self.set_blocked(contact_id, blocked),
+            ClientCommand::StartCall { contact_id } => self.start_call(contact_id),
+            ClientCommand::AcceptCall => self.accept_call(),
+            ClientCommand::DeclineCall => self.decline_call(),
+            ClientCommand::EndCall => self.end_call(),
         }
     }
 

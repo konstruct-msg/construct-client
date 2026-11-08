@@ -79,6 +79,29 @@ impl OrchestratorHandle {
             .send(OrchestratorCommand::Blocked { contact_id });
     }
 
+    /// Begin a 1:1 audio call to `contact_id`.
+    pub fn start_call(&self, contact_id: String) {
+        let _ = self.cmd_tx.send(OrchestratorCommand::StartCall {
+            peer: contact_id,
+            call_type: crate::proto::signaling::v1::CallType::Audio,
+        });
+    }
+
+    /// The person answered the ringing incoming call.
+    pub fn accept_call(&self) {
+        let _ = self.cmd_tx.send(OrchestratorCommand::AcceptCall);
+    }
+
+    /// The person declined the ringing incoming call.
+    pub fn decline_call(&self) {
+        let _ = self.cmd_tx.send(OrchestratorCommand::DeclineCall);
+    }
+
+    /// The person (or the app) ended the held call.
+    pub fn end_call(&self) {
+        let _ = self.cmd_tx.send(OrchestratorCommand::EndCall);
+    }
+
     /// Mark an account as locally known, so its deliveries enter the core.
     pub fn remember_contact(&self, contact_id: String) {
         let _ = self
@@ -342,6 +365,32 @@ enum OrchestratorCommand {
         vouched: bool,
         outcome: SealedOutcome,
     },
+    /// Begin a 1:1 call to `peer` (audio for now).
+    StartCall {
+        peer: String,
+        call_type: crate::proto::signaling::v1::CallType,
+    },
+    /// The person answered the ringing incoming call.
+    AcceptCall,
+    /// The person declined the ringing incoming call.
+    DeclineCall,
+    /// The person (or the app) ended the held call.
+    EndCall,
+    /// Send one `WebRtcSignal` E2EE: to `to_device`, or every device of `peer` when `None`.
+    SendCallSignal {
+        peer: String,
+        signal: crate::proto::signaling::v1::WebRtcSignal,
+        to_device: Option<String>,
+    },
+    /// The Signal stream opened (best-effort); held so it stays alive.
+    SignalStreamOpened(crate::grpc::SignalStream),
+    /// A message from the Signal stream: wakeup, presence, busy/offline.
+    SignalStreamMessage(crate::proto::signaling::v1::SignalResponse),
+    /// A presence signal (hangup/busy) to send on the stream, to every device of `peer`.
+    SignalStreamPresence {
+        peer: String,
+        signal: crate::proto::signaling::v1::WebRtcSignal,
+    },
 }
 
 #[derive(Debug)]
@@ -553,6 +602,10 @@ struct Task {
     /// Our card on its way to a contact's device: (message id, device), marked as handed over
     /// when the server takes it.
     cards_in_flight: HashSet<(String, String)>,
+    /// The 1:1 call, if one is held (stage A: signaling only, no media).
+    calls: crate::calls::Manager,
+    /// The auxiliary Signal stream, when it opened: wakeup and presence (never SDP).
+    signal_stream: Option<crate::grpc::SignalStream>,
 }
 
 impl Task {
@@ -602,6 +655,8 @@ impl Task {
             spend_units: crate::tokens::SpendUnits::default(),
             intake_suspended: crate::intake::Suspended::default(),
             cards_in_flight: HashSet::new(),
+            calls: crate::calls::Manager::new(),
+            signal_stream: None,
         }
     }
 
@@ -754,6 +809,26 @@ impl Task {
         }
         // Tokens before the first message, not with it: a cold wallet fills at launch.
         self.top_up_tokens();
+        // The auxiliary Signal stream: best-effort, kept for the life of the task. Wakeup and
+        // presence ride it; SDP never does (call-signaling-e2ee-primary).
+        {
+            let grpc = self.grpc.clone();
+            let back = self.self_cmd.clone();
+            let back_for_messages = back.clone();
+            tokio::spawn(async move {
+                match crate::grpc::open_signal_stream(&grpc, move |response| {
+                    let _ =
+                        back_for_messages.send(OrchestratorCommand::SignalStreamMessage(response));
+                })
+                .await
+                {
+                    Ok(stream) => {
+                        let _ = back.send(OrchestratorCommand::SignalStreamOpened(stream));
+                    }
+                    Err(e) => tracing::warn!(error = %e, "Signal stream could not open"),
+                }
+            });
+        }
         // The first tick is now: rotation and top-up are checked at launch too.
         let mut maintenance = tokio::time::interval(crate::prekeys::MAINTENANCE_INTERVAL);
         maintenance.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -932,7 +1007,255 @@ impl Task {
                 self.sealed_settled(device, local_id, vouched, outcome)
                     .await
             }
+            OrchestratorCommand::StartCall { peer, call_type } => {
+                self.start_call(peer, call_type).await;
+            }
+            OrchestratorCommand::AcceptCall => {
+                self.fetch_turn().await;
+                let signals = self
+                    .calls
+                    .accept(&self.identity.device_id, &self.identity.user_id);
+                self.send_call_signals(signals).await;
+                self.emit_call_state();
+            }
+            OrchestratorCommand::DeclineCall => {
+                let signals = self.calls.decline(&self.identity.device_id);
+                self.send_call_signals(signals).await;
+                self.emit_call_state();
+            }
+            OrchestratorCommand::EndCall => {
+                let signals = self.calls.end(&self.identity.device_id);
+                self.send_call_signals(signals).await;
+                self.emit_call_state();
+            }
+            OrchestratorCommand::SendCallSignal {
+                peer,
+                signal,
+                to_device,
+            } => {
+                self.send_call_signal(peer, signal, to_device).await;
+            }
+            OrchestratorCommand::SignalStreamOpened(stream) => {
+                tracing::info!("Signal stream open");
+                self.signal_stream = Some(stream);
+            }
+            OrchestratorCommand::SignalStreamMessage(response) => {
+                self.handle_signal_response(response).await;
+            }
+            OrchestratorCommand::SignalStreamPresence { peer, signal } => {
+                if let Some(stream) = &self.signal_stream
+                    && let Err(e) = stream.send_routed(signal, peer).await
+                {
+                    tracing::warn!(error = %e, "Signal stream presence not sent");
+                }
+            }
         }
+    }
+
+    /// A message from the Signal stream: wakeup, presence, busy/offline. SDP never arrives here.
+    async fn handle_signal_response(
+        &mut self,
+        response: crate::proto::signaling::v1::SignalResponse,
+    ) {
+        use crate::proto::signaling::v1::signal_response::Response as R;
+        match response.response {
+            Some(R::Signal(signal)) => {
+                let sender_device = signal.sender_device_id.clone();
+                let signals = self.calls.on_signal(&signal, &sender_device);
+                self.send_call_signals(signals).await;
+                self.emit_call_state();
+            }
+            Some(R::IncomingCall(notification)) => {
+                // Wakeup only: the offer itself arrives E2EE and creates the call. The server
+                // sent this so a ringing UI can appear before the offer lands.
+                tracing::info!(
+                    call_id = %notification.call_id,
+                    caller = %notification.caller_id,
+                    call_type = notification.call_type,
+                    "incoming call notification"
+                );
+            }
+            Some(R::Error(error)) => {
+                tracing::warn!(code = error.code, message = %error.message, "Signal stream error");
+            }
+            Some(R::Pong(_)) => {}
+            None => {}
+        }
+    }
+
+    /// TURN credentials for the active call, best-effort: media (stage B) needs them for
+    /// relay-only ICE, and the server may refuse a late ask. The result is logged until then.
+    async fn fetch_turn(&self) {
+        let Some(call_id) = self.calls.active().map(|c| c.call_id.clone()) else {
+            return;
+        };
+        match crate::grpc::get_turn_credentials(&self.grpc, &call_id).await {
+            Ok(creds) => {
+                tracing::debug!(urls = ?creds.urls, expires_at = creds.expires_at, "TURN credentials fetched")
+            }
+            Err(e) => tracing::warn!(error = %e, "GetTurnCredentials failed"),
+        }
+    }
+
+    /// Begin an outgoing call: build the offer, register it with the server (best-effort — the
+    /// offer still goes E2EE), and send the offer to every device of `peer` with a session.
+    async fn start_call(&mut self, peer: String, call_type: crate::proto::signaling::v1::CallType) {
+        if self.calls.is_busy() {
+            self.ui_error("[BUSY] a call is already in progress".to_string());
+            return;
+        }
+        let call_id = uuid::Uuid::new_v4().to_string();
+        let offer = self.calls.begin_outgoing(
+            call_id.clone(),
+            peer.clone(),
+            call_type,
+            &self.identity.device_id,
+            &self.identity.user_id,
+        );
+        // Wake the callee if the server can; the offer itself never goes through this RPC.
+        // caller_name is empty, as iOS sends it: the callee names the caller by their contacts.
+        if let Err(e) = crate::grpc::initiate_call(&self.grpc, &call_id, &peer, call_type, "").await
+        {
+            tracing::warn!(error = %e, "InitiateCall failed — the call proceeds on the E2EE path");
+        }
+        self.send_call_signal(offer.peer, offer.signal, offer.to_device)
+            .await;
+        self.fetch_turn().await;
+        self.emit_call_state();
+    }
+
+    /// Send one `WebRtcSignal` E2EE through the core: framed, then encrypted on each device's
+    /// ratchet. `to_device` names one device; `None` fans out to every device with a session.
+    async fn send_call_signal(
+        &mut self,
+        peer: String,
+        signal: crate::proto::signaling::v1::WebRtcSignal,
+        to_device: Option<String>,
+    ) {
+        let message_id = uuid::Uuid::new_v4().to_string();
+        let framed = crate::knst::frame_whole(
+            &signal.encode_to_vec(),
+            crate::knst::CONTENT_CALL_SIGNAL,
+            &message_id,
+        );
+        let fan_out = to_device.is_none();
+        let devices: Vec<String> = match to_device {
+            Some(device) => vec![device],
+            None => match self.recipient_devices(&peer).await {
+                Ok(devices) if !devices.is_empty() => devices,
+                Ok(_) => {
+                    self.ui_error(format!("[NO_CALL_DEVICES] {peer} has no device to call"));
+                    return;
+                }
+                Err(e) => {
+                    self.ui_error(format!("[CALL_SEND_FAILED] {e}"));
+                    return;
+                }
+            },
+        };
+        if fan_out {
+            self.calls.note_offered(&devices);
+        }
+        for device in devices {
+            let event = IncomingEvent::OutgoingCallSignal {
+                contact_id: device,
+                message_id: message_id.clone(),
+                proto_bytes: framed.clone(),
+            };
+            // Through the event channel, not `process` here: sending a signal can decrypt one
+            // (a ringing answer) and dispatch would recurse into this method.
+            let _ = self.self_tx.send(event);
+        }
+        // Hangup and busy are presence too: the stream frees the server's occupancy and tells
+        // the peer's other devices. Offer/answer/ICE never go near the stream.
+        if matches!(
+            &signal.signal,
+            Some(crate::proto::signaling::v1::web_rtc_signal::Signal::Hangup(
+                _
+            )) | Some(crate::proto::signaling::v1::web_rtc_signal::Signal::Busy(_))
+        ) {
+            self.presence_on_stream(peer, signal);
+        }
+    }
+
+    /// A presence signal on the Signal stream, to every device of `peer`. The E2EE send is the
+    /// primary path; this is the auxiliary one (`call-signaling-e2ee-primary`).
+    fn presence_on_stream(&self, peer: String, signal: crate::proto::signaling::v1::WebRtcSignal) {
+        let _ = self
+            .self_cmd
+            .send(OrchestratorCommand::SignalStreamPresence { peer, signal });
+    }
+
+    async fn send_call_signals(&mut self, signals: Vec<crate::calls::SignalToSend>) {
+        for to_send in signals {
+            self.send_call_signal(to_send.peer, to_send.signal, to_send.to_device)
+                .await;
+        }
+    }
+
+    /// A call signal decrypted by the core: parse the `WebRtcSignal` and route it into the call.
+    /// Synchronous, and answers enqueue as commands: `dispatch` runs inside `process`, which a
+    /// signal send can re-enter (`refresh_devices` → `open_session` → `process`), so awaiting a
+    /// send here would recurse.
+    fn call_signal_decrypted(&mut self, contact_id: String, proto_bytes: Vec<u8>) {
+        let signal = match crate::proto::signaling::v1::WebRtcSignal::decode(proto_bytes.as_slice())
+        {
+            Ok(signal) => signal,
+            Err(e) => {
+                tracing::warn!(error = %e, "call signal does not parse");
+                return;
+            }
+        };
+        let sender_device = contact_id;
+        let account = self.account_of(&sender_device);
+        use crate::proto::signaling::v1::web_rtc_signal::Signal as S;
+        if let Some(S::Offer(offer)) = &signal.signal {
+            if self.calls.is_busy() {
+                // A call is already held: answer busy (stage A, on the E2EE path).
+                let busy = crate::calls::busy(&signal.call_id, &self.identity.device_id);
+                self.enqueue_call_signal(account, busy, Some(sender_device));
+                return;
+            }
+            let call_type = crate::proto::signaling::v1::CallType::try_from(offer.call_type)
+                .unwrap_or(crate::proto::signaling::v1::CallType::Audio);
+            self.calls.begin_incoming(
+                signal.call_id.clone(),
+                account.clone(),
+                sender_device.clone(),
+                call_type,
+            );
+            // Ring back on the E2EE path (stream presence is the follow-up step).
+            let ringing = crate::calls::ringing(&signal.call_id, &self.identity.device_id);
+            self.enqueue_call_signal(account, ringing, Some(sender_device));
+        } else {
+            for to_send in self.calls.on_signal(&signal, &sender_device) {
+                self.enqueue_call_signal(to_send.peer, to_send.signal, to_send.to_device);
+            }
+        }
+        self.emit_call_state();
+    }
+
+    /// Hand a signal to send back into the command loop, off the dispatch stack.
+    fn enqueue_call_signal(
+        &self,
+        peer: String,
+        signal: crate::proto::signaling::v1::WebRtcSignal,
+        to_device: Option<String>,
+    ) {
+        let _ = self.self_cmd.send(OrchestratorCommand::SendCallSignal {
+            peer,
+            signal,
+            to_device,
+        });
+    }
+
+    /// Push the call's current snapshot to the front end, or `None` when it ended.
+    fn emit_call_state(&self) {
+        let _ = self
+            .internal_tx
+            .send(crate::client::ClientEvent::Bridge(BridgeEvent::CallState {
+                call: self.calls.state(),
+            }));
     }
 
     /// Wait, off the task, for the directory to serve the keys of `device_id`: a device being
@@ -2473,8 +2796,12 @@ impl Task {
                 }
             }
 
-            Action::CallSignalDecrypted { .. } => {
-                // Calls not yet implemented in TUI.
+            Action::CallSignalDecrypted {
+                contact_id,
+                proto_bytes,
+                ..
+            } => {
+                self.call_signal_decrypted(contact_id, proto_bytes);
             }
 
             Action::ControlFrameDecrypted {

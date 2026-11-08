@@ -11,6 +11,7 @@
 pub mod auth;
 pub mod block_sync;
 pub mod bridge;
+pub mod calls;
 pub mod config;
 pub mod content;
 pub mod device_certs;

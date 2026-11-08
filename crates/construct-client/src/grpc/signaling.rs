@@ -43,7 +43,7 @@ pub async fn initiate_call(
         callee_user_id: callee_user_id.to_owned(),
         call_type: call_type as i32,
         caller_name: caller_name.to_owned(),
-        caller_avatar: Vec::new(),
+        caller_avatar: Bytes::new(),
     };
     let response = client
         .unary(SIGNALING_INITIATE_CALL, &request.encode_to_vec())
@@ -101,7 +101,7 @@ impl SignalStream {
                     })),
                 }),
                 caller_name: String::new(),
-                caller_avatar: Vec::new(),
+                caller_avatar: Bytes::new(),
             })),
         })
         .await
@@ -111,6 +111,13 @@ impl SignalStream {
 impl Drop for SignalStream {
     fn drop(&mut self) {
         self.task.abort();
+    }
+}
+
+/// The join handle is not `Debug`; the stream is, as a name.
+impl std::fmt::Debug for SignalStream {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SignalStream")
     }
 }
 
@@ -135,7 +142,7 @@ where
         .body(())
         .map_err(|e| GrpcError::transport(format!("build Signal stream request: {e}")))?;
 
-    let (resp_fut, mut send_stream) = send_req
+    let (resp_fut, send_stream) = send_req
         .send_request(req, false)
         .map_err(|e| GrpcError::transport(format!("open Signal stream: {e}")))?;
 
@@ -175,7 +182,7 @@ async fn pump_task<F>(
                     Some(request) => {
                         if let Err(e) = send_h2_data(&mut send, encode_frame(&request.encode_to_vec())).await {
                             warn!("Signal stream send failed: {e}");
-                            let _ = send.send_reset(h2::Reason::CANCEL);
+                            send.send_reset(h2::Reason::CANCEL);
                             return;
                         }
                     }
@@ -193,13 +200,13 @@ async fn pump_task<F>(
                 };
                 if let Err(e) = send_h2_data(&mut send, encode_frame(&ping.encode_to_vec())).await {
                     warn!("Signal stream keepalive failed: {e}");
-                    let _ = send.send_reset(h2::Reason::CANCEL);
+                    send.send_reset(h2::Reason::CANCEL);
                     return;
                 }
             }
             incoming = recv.data() => {
                 match incoming {
-                    Ok(Some(Ok(chunk))) => {
+                    Some(Ok(chunk)) => {
                         let n = chunk.len();
                         recv_buf.extend_from_slice(&chunk);
                         let _ = recv.flow_control().release_capacity(n);
@@ -227,16 +234,12 @@ async fn pump_task<F>(
                             }
                         }
                     }
-                    Ok(Some(Err(e))) => {
+                    Some(Err(e)) => {
                         warn!("Signal stream recv error: {e}");
                         return;
                     }
-                    Ok(None) => {
+                    None => {
                         debug!("Signal stream: server closed send side");
-                        return;
-                    }
-                    Err(e) => {
-                        warn!("Signal stream recv failed: {e}");
                         return;
                     }
                 }
