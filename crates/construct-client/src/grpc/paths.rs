@@ -61,3 +61,8 @@ pub const STICKER_MANIFEST: &str =
 pub const STICKER_PACK_BLOBS: &str = "/shared.proto.services.v1.StickerService/GetStickerPackBlobs";
 pub const VEIL_ISSUE_CAPABILITY: &str = "/shared.proto.services.v1.VeilService/IssueVeilCapability";
 pub const VEIL_ISSUE_VOUCHER: &str = "/shared.proto.services.v1.VeilService/IssueBootstrapVoucher";
+pub const SIGNALING_INITIATE_CALL: &str =
+    "/shared.proto.signaling.v1.SignalingService/InitiateCall";
+pub const SIGNALING_SIGNAL: &str = "/shared.proto.signaling.v1.SignalingService/Signal";
+pub const SIGNALING_GET_TURN_CREDENTIALS: &str =
+    "/shared.proto.signaling.v1.SignalingService/GetTurnCredentials";

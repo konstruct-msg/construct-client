@@ -26,6 +26,7 @@ mod media;
 mod paths;
 pub mod route;
 mod sealed;
+mod signaling;
 mod stickers;
 mod stream;
 pub(crate) mod users;
@@ -58,6 +59,7 @@ pub use sealed::{
     get_server_trust_delegations, issue_tokens, publish_intake_tags, send_own_device_copy,
     send_sealed_message,
 };
+pub use signaling::{SignalStream, get_turn_credentials, initiate_call, open_signal_stream};
 pub use stickers::{sticker_manifest, sticker_pack_blobs, sticker_packs};
 pub use stream::open_message_stream;
 pub use users::find_user;
