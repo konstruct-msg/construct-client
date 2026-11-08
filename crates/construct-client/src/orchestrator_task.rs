@@ -246,20 +246,8 @@ pub(crate) type HistoryAccepted = (
 pub(crate) struct StreamMessageContext {
     /// The account the delivery came from: what `known_contacts` is checked against.
     pub contact_id: String,
-    /// The device that wrote it: what the replay guard keys on, like the core.
-    pub device: String,
     pub message_id: String,
     pub stream_cursor: Option<String>,
-    pub content_type: u8,
-    pub msg_num: u32,
-}
-
-impl StreamMessageContext {
-    fn is_replay_sensitive(&self) -> bool {
-        self.msg_num == 0
-            || self.content_type == ContentType::SessionReset as u8
-            || self.content_type == ContentType::SessionResetInit as u8
-    }
 }
 
 /// Work on a history transfer that needs this device's keys, which the orchestrator holds.
@@ -580,7 +568,6 @@ struct Task {
     /// Commands back to this task, from its own sub-tasks.
     self_cmd: mpsc::UnboundedSender<OrchestratorCommand>,
     timers: HashMap<String, AbortHandle>,
-    session_established_at_ms: HashMap<String, u64>,
     known_contacts: HashSet<String>,
     peers: PeerDevices,
     certificate: Option<SenderCertificate>,
@@ -643,7 +630,6 @@ impl Task {
             self_tx,
             self_cmd,
             timers: HashMap::new(),
-            session_established_at_ms: HashMap::new(),
             known_contacts: known_contacts.into_iter().collect(),
             peers,
             certificate: None,
@@ -1354,7 +1340,6 @@ impl Task {
     fn forget_contact(&mut self, contact_id: &str) {
         for device in self.peers.devices_of(contact_id) {
             self.orchestrator.forget_contact_state(&device);
-            self.session_established_at_ms.remove(&device);
             for key in [format!("session_{device}"), format!("archive_{device}")] {
                 if let Err(e) = self.storage.secure_delete(&key) {
                     tracing::warn!(%key, error = %e, "forget_contact: failed to delete session key");
@@ -1428,11 +1413,8 @@ impl Task {
                         },
                         account,
                         device,
-                        ContentType::DecryptionError as u8,
-                        None,
                     )
                 } else {
-                    let msg_num = message_number(&body);
                     (
                         IncomingEvent::MessageReceived {
                             message_id: message_id.clone(),
@@ -1444,8 +1426,6 @@ impl Task {
                         },
                         account,
                         device,
-                        0,
-                        msg_num,
                     )
                 })
             }
@@ -1469,11 +1449,8 @@ impl Task {
                         },
                         account,
                         device,
-                        content_type,
-                        None,
                     )
                 } else {
-                    let msg_num = message_number(&wire_payload);
                     (
                         IncomingEvent::MessageReceived {
                             message_id: message_id.clone(),
@@ -1485,36 +1462,23 @@ impl Task {
                         },
                         account,
                         device,
-                        0,
-                        msg_num,
                     )
                 })
             }
         };
-        let Some((event, account, device, content_type, msg_num)) = routed else {
+        let Some((event, account, device)) = routed else {
             self.cursor.commit_direct(&self.storage, stream_cursor);
             return;
         };
-        let msg_num = match msg_num {
-            Some(Ok(n)) => n,
-            Some(Err(e)) => {
-                tracing::warn!(%message_id, %device, "delivery dropped: wire payload unpack failed: {e}");
-                self.cursor.commit_direct(&self.storage, stream_cursor);
-                return;
-            }
-            // A DECRYPTION_ERROR carries no ratchet message: never replay-sensitive.
-            None => 1,
-        };
-        tracing::info!(%message_id, %device, %account, content_type, msg_num, "sealed delivery opened");
+        // What the payload is — its number, whether it parses, whether it opens a state — is the
+        // core's to read. A payload it cannot parse comes back `MalformedDropped`.
+        tracing::info!(%message_id, %device, %account, "sealed delivery opened");
         self.handle_stream_message(
             event,
             StreamMessageContext {
                 contact_id: account,
-                device,
                 message_id,
                 stream_cursor,
-                content_type,
-                msg_num,
             },
         )
         .await;
@@ -1532,20 +1496,10 @@ impl Task {
             );
         }
 
-        if should_drop_stale_session_replay(&context, &self.session_established_at_ms) {
-            self.cursor
-                .commit_direct(&self.storage, context.stream_cursor.clone());
-            tracing::warn!(
-                contact_id = %context.contact_id,
-                message_id = %context.message_id,
-                content_type = context.content_type,
-                msg_num = context.msg_num,
-                stream_cursor = ?context.stream_cursor,
-                "dropped stale replay-sensitive stream message"
-            );
-            return;
-        }
-
+        // No message is dropped here for arriving before a session we opened ourselves: a peer
+        // that wrote first while we opened to it is two sides opening at once, which the core
+        // converges (sessions renew by sending), and a redelivery of one already read is the
+        // core's `Duplicate` (todo/284).
         self.cursor.note(&context.message_id, context.stream_cursor);
         self.process(event).await;
     }
@@ -1718,8 +1672,6 @@ impl Task {
             fetched.bundle.kyber,
             false,
         )?;
-        self.session_established_at_ms
-            .insert(device.clone(), now_ms_u64());
         self.process(IncomingEvent::SessionInitCompleted {
             contact_id: device.clone(),
             session_data: vec![],
@@ -2932,9 +2884,7 @@ impl Task {
                     tracing::warn!(device = %contact_id, %message_id, error = %e, "decryption error held");
                 }
             }
-            Action::SessionRetired { contact_id, .. } => {
-                self.session_established_at_ms.remove(&contact_id);
-            }
+            Action::SessionRetired { .. } => {}
             Action::ResendMessage {
                 contact_id,
                 message_id,
@@ -2986,14 +2936,6 @@ fn secure_store_key(slot: &construct_core::orchestration::actions::SecureStoreSl
         SecureStoreSlot::Session { contact_id } => format!("session_{contact_id}"),
         SecureStoreSlot::OrchestratorState => "construct.orchestrator_state".into(),
     }
-}
-
-fn message_number(wire_payload: &[u8]) -> Option<Result<u32, String>> {
-    Some(
-        construct_core::wire_payload::unpack(wire_payload)
-            .map(|decoded| decoded.message_number)
-            .map_err(|e| e.to_string()),
-    )
 }
 
 /// The envelope of a copy to one of our devices. Identified on purpose — sender and recipient are
@@ -3156,28 +3098,6 @@ fn post_quantum_refusal_notice(account: &str, refused: &[(String, OpenRefusal)])
         )),
         OpenRefusal::Other(_) => None,
     })
-}
-
-fn should_drop_stale_session_replay(
-    context: &StreamMessageContext,
-    session_established_at_ms: &HashMap<String, u64>,
-) -> bool {
-    if !context.is_replay_sensitive() {
-        return false;
-    }
-    let Some(established_at_ms) = session_established_at_ms.get(&context.device) else {
-        return false;
-    };
-    let Some(cursor_ms) = stream_cursor_millis(context.stream_cursor.as_deref()) else {
-        return false;
-    };
-    cursor_ms < *established_at_ms
-}
-
-fn stream_cursor_millis(cursor: Option<&str>) -> Option<u64> {
-    let cursor = cursor?;
-    let (millis, _) = cursor.split_once('-')?;
-    millis.parse().ok()
 }
 
 fn now_ms() -> i64 {
@@ -3436,17 +3356,6 @@ mod tests {
     };
 
     #[test]
-    fn stream_cursor_millis_parses_redis_stream_id() {
-        assert_eq!(
-            stream_cursor_millis(Some("1787431771124-0")),
-            Some(1787431771124)
-        );
-        assert_eq!(stream_cursor_millis(Some("1787431771124")), None);
-        assert_eq!(stream_cursor_millis(Some("not-a-cursor")), None);
-        assert_eq!(stream_cursor_millis(None), None);
-    }
-
-    #[test]
     fn a_post_quantum_refusal_is_named_to_the_screens() {
         use construct_core::orchestration::PqxdhRefusal;
         let refused = vec![
@@ -3478,107 +3387,6 @@ mod tests {
         )];
         assert_eq!(post_quantum_refusal_notice("bob", &refused), None);
         assert_eq!(post_quantum_refusal_notice("bob", &[]), None);
-    }
-
-    #[test]
-    fn stale_replay_guard_drops_old_msg_zero() {
-        let mut established = HashMap::new();
-        established.insert("bob-device".to_string(), 2000);
-
-        let context = stream_context("bob", 0, 0, Some("1000-0"));
-
-        assert!(should_drop_stale_session_replay(&context, &established));
-    }
-
-    #[test]
-    fn stale_replay_guard_drops_old_reset_control() {
-        let mut established = HashMap::new();
-        established.insert("bob-device".to_string(), 2000);
-
-        let context = stream_context("bob", ContentType::SessionReset as u8, 42, Some("1000-0"));
-
-        assert!(should_drop_stale_session_replay(&context, &established));
-    }
-
-    #[test]
-    fn stale_replay_guard_keeps_old_regular_message() {
-        let mut established = HashMap::new();
-        established.insert("bob-device".to_string(), 2000);
-
-        let context = stream_context("bob", 0, 42, Some("1000-0"));
-
-        assert!(!should_drop_stale_session_replay(&context, &established));
-    }
-
-    #[test]
-    fn stale_replay_guard_keeps_without_local_established_at() {
-        let established = HashMap::new();
-        let context = stream_context("bob", 0, 0, Some("1000-0"));
-
-        assert!(!should_drop_stale_session_replay(&context, &established));
-    }
-
-    #[test]
-    fn stale_replay_guard_keeps_newer_replay_sensitive_message() {
-        let mut established = HashMap::new();
-        established.insert("bob-device".to_string(), 2000);
-
-        let context = stream_context("bob", 0, 0, Some("3000-0"));
-
-        assert!(!should_drop_stale_session_replay(&context, &established));
-    }
-
-    #[test]
-    fn stale_replay_guard_keys_on_the_device_not_the_account() {
-        let mut established = HashMap::new();
-        established.insert("bob".to_string(), 2000);
-
-        let context = stream_context("bob", 0, 0, Some("1000-0"));
-
-        assert!(!should_drop_stale_session_replay(&context, &established));
-    }
-
-    #[tokio::test]
-    async fn stream_message_command_terminally_drops_stale_msg_zero() {
-        let mut task = test_task();
-        task.known_contacts.insert("bob".into());
-        task.session_established_at_ms
-            .insert("bob-device".into(), 2_000);
-
-        let (event, context) = stale_message("bob", "stale-msg0", 0, 0);
-        task.handle_stream_message(event, context).await;
-
-        assert_eq!(
-            task.storage.load_stream_cursor().unwrap().as_deref(),
-            Some("1000-0")
-        );
-        assert_eq!(
-            task.orchestrator.pending_message_count("bob-device"),
-            0,
-            "stale msgNum=0 must not enter core pending init queue"
-        );
-    }
-
-    #[tokio::test]
-    async fn stream_message_command_terminally_drops_stale_reset_with_invalid_wire_payload() {
-        let mut task = test_task();
-        task.known_contacts.insert("bob".into());
-        task.session_established_at_ms
-            .insert("bob-device".into(), 2_000);
-
-        let (event, context) =
-            stale_message("bob", "stale-reset", ContentType::SessionReset as u8, 0);
-        task.handle_stream_message(event, context).await;
-
-        assert_eq!(
-            task.storage.load_stream_cursor().unwrap().as_deref(),
-            Some("1000-0")
-        );
-        assert_eq!(
-            task.orchestrator.pending_message_count("bob-device"),
-            0,
-            "stale reset control must not archive/heal the active actor session"
-        );
     }
 
     #[test]
@@ -3777,49 +3585,6 @@ mod tests {
         .await;
 
         assert!(internal_rx.try_recv().is_err());
-    }
-
-    fn stream_context(
-        contact_id: &str,
-        content_type: u8,
-        msg_num: u32,
-        stream_cursor: Option<&str>,
-    ) -> StreamMessageContext {
-        StreamMessageContext {
-            contact_id: contact_id.to_string(),
-            device: format!("{contact_id}-device"),
-            message_id: "message-1".to_string(),
-            stream_cursor: stream_cursor.map(str::to_string),
-            content_type,
-            msg_num,
-        }
-    }
-
-    fn stale_message(
-        contact_id: &str,
-        message_id: &str,
-        content_type: u8,
-        msg_num: u32,
-    ) -> (IncomingEvent, StreamMessageContext) {
-        let device = format!("{contact_id}-device");
-        (
-            IncomingEvent::MessageReceived {
-                message_id: message_id.to_string(),
-                from: device.clone(),
-                data: b"not-a-wire-payload".to_vec(),
-                sender_certificate: None,
-                content_type,
-                envelope_session: None,
-            },
-            StreamMessageContext {
-                contact_id: contact_id.to_string(),
-                device,
-                message_id: message_id.to_string(),
-                stream_cursor: Some("1000-0".to_string()),
-                content_type,
-                msg_num,
-            },
-        )
     }
 
     const OWN_ACCOUNT: &str = "753f79af-ede4-432c-9fcd-41deb5a35f0e";
@@ -4249,5 +4014,168 @@ mod block_tests {
         let mut all = task.sweep_targets(CAROL);
         all.sort();
         assert_eq!(all, [BOB], "unblocked, they are scheduled again");
+    }
+}
+
+/// Two devices open a session to each other at once — each by sending — and the one that wrote
+/// first is heard by the other after it opened its own (todo/284).
+#[cfg(test)]
+mod crossing_open_tests {
+    use super::*;
+    use construct_core::crypto::handshake::x3dh::X3DHPublicKeyBundle;
+    use construct_core::crypto::sealed_sender::{SenderCertificate, build_cert_sign_payload};
+    use construct_core::crypto::{
+        client_api::ClassicClient, suites::classic::ClassicSuiteProvider,
+    };
+    use construct_core::orchestration::orchestrator::{KyberBundleKeys, SessionBundle};
+    use ed25519_dalek::{Signer, SigningKey};
+
+    const BOB: &str = "2f1d6c1e-6c39-4f8e-9a51-0d7d3c7a9b10";
+    const MESSAGE: &str = "6ba7b810-9dad-11d1-80b4-00c04fd430c8";
+
+    /// Hybrid identity and a committed Kyber signed prekey: what a device publishes.
+    fn publish_keys(o: &mut Orchestrator) {
+        o.ensure_hybrid_signature_key().expect("hybrid key");
+        o.begin_kyber_spk_rotation().expect("kyber spk");
+        assert!(o.commit_kyber_spk_rotation());
+    }
+
+    /// What the key service serves for `peer`, with a one-time Kyber key.
+    fn bundle_of(peer: &mut Orchestrator) -> (X3DHPublicKeyBundle, KyberBundleKeys) {
+        let x3dh = peer.get_registration_bundle_fields().expect("bundle");
+        let hybrid = peer.hybrid_signature_public_key().expect("hybrid key");
+        let binding = peer
+            .sign_bundle_bytes(&Orchestrator::build_hybrid_identity_bind_message(&hybrid))
+            .expect("binding");
+        let spk = peer.current_kyber_spk_upload().unwrap().expect("kyber spk");
+        let otpk = peer.generate_kyber_one_time_prekeys(1).unwrap().remove(0);
+        let kyber = KyberBundleKeys {
+            pre_key_id: Some(spk.key_id),
+            pre_key_public: Some(spk.public_key),
+            pre_key_created_at: Some(spk.created_at),
+            pre_key_signature: Some(spk.signature),
+            pre_key_hybrid_signature: Some(spk.hybrid_signature),
+            one_time_prekey_id: Some(otpk.key_id),
+            one_time_prekey_public: Some(otpk.public_key),
+            one_time_prekey_created_at: Some(otpk.created_at),
+            one_time_prekey_signature: Some(otpk.signature),
+            one_time_prekey_hybrid_signature: Some(otpk.hybrid_signature),
+            hybrid_identity_key: Some(hybrid),
+            hybrid_identity_signature: Some(binding),
+        };
+        (x3dh, kyber)
+    }
+
+    /// Bob: a device named by the id its identity key derives to, and that key.
+    fn bob() -> (Orchestrator, String, Vec<u8>) {
+        let mut o = Orchestrator::new(
+            ClassicClient::<ClassicSuiteProvider>::new().expect("client"),
+            "pending".into(),
+        );
+        publish_keys(&mut o);
+        let identity = o.get_registration_bundle_fields().unwrap().identity_public;
+        let id = construct_core::device_id::derive_device_id(&identity);
+        o.set_my_user_id(id.clone());
+        (o, id, identity)
+    }
+
+    /// The certificate a server holding `server` issues for Bob's device.
+    fn certificate(server: &SigningKey, identity: &[u8], device: &str) -> SenderCertificate {
+        let now = now_ms() / 1000;
+        let (issued_at, expires_at) = (now - 60, now + 86_400);
+        let payload =
+            build_cert_sign_payload(BOB, "example.org", identity, device, issued_at, expires_at);
+        SenderCertificate {
+            user_id: BOB.into(),
+            domain: "example.org".into(),
+            identity_key: identity.to_vec(),
+            device_id: device.into(),
+            issued_at,
+            expires_at,
+            signature: server.sign(&payload).to_bytes().to_vec(),
+            server_kid: Vec::new(),
+            server_signature_hybrid: Vec::new(),
+        }
+    }
+
+    /// Bob writes first. Before his message reaches us, we open our own session to his device —
+    /// a send of ours that crossed his. His message carries the handshake header; the core opens
+    /// his state beside ours (`two_sides_opening_at_once_converge_on_one_state` in the core), and
+    /// the message is read. Its stream cursor is older than our open, as it always is here.
+    #[tokio::test]
+    async fn the_first_message_of_a_peer_who_opened_at_the_same_time_is_read() {
+        let (mut task, _rx) = tests::test_task_sending();
+        // Held, so the receipt to Bob is sealed without asking the server for one: no test here
+        // reaches the network, which other tests route through a tunnel of their own.
+        task.certificate = Some(crate::grpc::SenderCertificate {
+            bytes: Vec::new(),
+            expires_at: i64::MAX,
+            token_key: Vec::new(),
+        });
+        publish_keys(&mut task.orchestrator);
+        let server = SigningKey::from_bytes(&[9u8; 32]);
+        task.orchestrator
+            .set_trusted_server_keys(vec![server.verifying_key().as_bytes().to_vec()]);
+
+        let (mut bob, bob_device, bob_identity) = bob();
+        assert!(
+            task.peers
+                .record(&task.storage, BOB, &bob_device, &bob_identity)
+        );
+        task.known_contacts.insert(BOB.into());
+
+        // Bob opens to us and writes.
+        let (x3dh, kyber) = bundle_of(&mut task.orchestrator);
+        bob.init_session_with_bundle("device-a", x3dh, kyber, false)
+            .expect("bob opens");
+        let wire = bob
+            .encrypt_bytes_for("device-a", &crate::knst::encode_text("hello", MESSAGE))
+            .expect("bob writes");
+
+        // We open to Bob before his message arrives.
+        let (x3dh, kyber) = bundle_of(&mut bob);
+        task.open_session(crate::grpc::FetchedPreKeyBundle {
+            bundle: SessionBundle { x3dh, kyber },
+            device_id: bob_device.clone(),
+            certificate: None,
+        })
+        .await
+        .expect("we open");
+
+        let delivery = || {
+            (
+                IncomingEvent::MessageReceived {
+                    message_id: "bob-m0".into(),
+                    from: bob_device.clone(),
+                    data: wire.clone(),
+                    sender_certificate: Some(Box::new(certificate(
+                        &server,
+                        &bob_identity,
+                        &bob_device,
+                    ))),
+                    content_type: 0,
+                    envelope_session: None,
+                },
+                StreamMessageContext {
+                    contact_id: BOB.into(),
+                    message_id: "bob-m0".into(),
+                    stream_cursor: Some("1000-0".into()),
+                },
+            )
+        };
+        let (event, context) = delivery();
+        task.handle_stream_message(event, context).await;
+        assert_eq!(
+            task.storage.get_messages(BOB, 10).unwrap().len(),
+            1,
+            "Bob's first message is read, not dropped"
+        );
+
+        // The same delivery again — what the guard was for, in August, when a replay could tear
+        // down a session — is the core's duplicate: kept once, nothing torn down.
+        let (event, context) = delivery();
+        task.handle_stream_message(event, context).await;
+        assert_eq!(task.storage.get_messages(BOB, 10).unwrap().len(), 1);
+        assert!(task.orchestrator.has_active_session(&bob_device));
     }
 }
