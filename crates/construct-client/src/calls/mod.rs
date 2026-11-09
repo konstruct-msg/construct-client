@@ -40,6 +40,8 @@ pub enum Outcome {
     Busy,
     NoAnswer,
     Failed,
+    /// Another of our devices took the call: not a missed call, no history entry.
+    AnsweredElsewhere,
 }
 
 /// The call as the UI sees it: no device ids, no key material.
@@ -64,6 +66,11 @@ pub struct Call {
     pub peer_device: Option<String>,
     pub offered_devices: Vec<String>,
     pub started_at_ms: i64,
+    /// When the call went live (an answer arrived, or we answered); the timer and the history
+    /// duration count from here.
+    pub connected_at_ms: Option<i64>,
+    /// The history row was already written.
+    pub recorded: bool,
 }
 
 /// A signal the manager decided to send, and where it goes: one device (the one that answered,
@@ -73,6 +80,18 @@ pub struct SignalToSend {
     pub peer: String,
     pub signal: WebRtcSignal,
     pub to_device: Option<String>,
+}
+
+/// What the store needs when a call ends, except `peer_name` (the orchestrator fills it from its
+/// contacts) and the end time (now). `status` is `CallStore.Status`, `direction` its `Direction`.
+#[derive(Debug)]
+pub struct HistoryRecord {
+    pub id: String,
+    pub peer_user_id: String,
+    pub direction: i16,
+    pub status: i16,
+    pub started_at_ms: i64,
+    pub duration_seconds: i32,
 }
 
 /// One 1:1 call at a time; a second call while one is held answers busy (stage A keeps it
@@ -102,7 +121,10 @@ impl Manager {
     }
 
     pub fn is_busy(&self) -> bool {
-        self.active.is_some()
+        // A call whose outcome the person has not dismissed yet does not block a new one.
+        self.active
+            .as_ref()
+            .is_some_and(|c| !matches!(c.phase, Phase::Over(_)))
     }
 
     /// Begin an outgoing call to `peer`. Returns the offer to send.
@@ -123,6 +145,8 @@ impl Manager {
             peer_device: None,
             offered_devices: Vec::new(),
             started_at_ms: now_ms(),
+            connected_at_ms: None,
+            recorded: false,
         };
         let signal = offer(
             &call.call_id,
@@ -158,6 +182,8 @@ impl Manager {
             peer_device: Some(sender_device),
             offered_devices: Vec::new(),
             started_at_ms: now_ms(),
+            connected_at_ms: None,
+            recorded: false,
         });
     }
 
@@ -206,6 +232,7 @@ impl Manager {
                     }];
                 }
                 call.peer_device = Some(sender_device.to_string());
+                call.connected_at_ms = Some(now_ms());
                 call.phase = Phase::Live;
                 Vec::new()
             }
@@ -234,6 +261,7 @@ impl Manager {
         if call.direction != Direction::Incoming {
             return Vec::new();
         }
+        call.connected_at_ms = Some(now_ms());
         call.phase = Phase::Live;
         let signal = answer(&call.call_id, my_device, my_user, String::new());
         vec![SignalToSend {
@@ -243,28 +271,63 @@ impl Manager {
         }]
     }
 
-    /// The person declined. Returns the hangup, and drops the call.
+    /// The person declined. Returns the hangup; the call stays in `Over(Declined)` until
+    /// `dismiss`, so the person sees the outcome.
     pub fn decline(&mut self, my_device: &str) -> Vec<SignalToSend> {
-        let Some(call) = self.active.take() else {
+        let Some(call) = &mut self.active else {
             return Vec::new();
         };
+        if call.direction != Direction::Incoming {
+            return Vec::new();
+        }
+        call.phase = Phase::Over(Outcome::Declined);
         vec![SignalToSend {
             peer: call.peer.clone(),
             signal: hangup(&call.call_id, my_device, HangupReason::Declined),
-            to_device: call.peer_device,
+            to_device: call.peer_device.clone(),
         }]
     }
 
-    /// The person (or the app) ended the call. Returns the hangup, and drops the call.
+    /// The person (or the app) ended the call. Returns the hangup; the call stays in
+    /// `Over(Ended)` until `dismiss`.
     pub fn end(&mut self, my_device: &str) -> Vec<SignalToSend> {
-        let Some(call) = self.active.take() else {
+        let Some(call) = &mut self.active else {
             return Vec::new();
         };
+        call.phase = Phase::Over(Outcome::Ended);
         vec![SignalToSend {
             peer: call.peer.clone(),
             signal: hangup(&call.call_id, my_device, HangupReason::Normal),
-            to_device: call.peer_device,
+            to_device: call.peer_device.clone(),
         }]
+    }
+
+    /// The person closed the ended call's outcome.
+    pub fn dismiss(&mut self) {
+        self.active = None;
+    }
+
+    /// The history row for a call that just ended and was not yet recorded. `None` when there is
+    /// no call, it has not ended, it was already recorded, or it must not be recorded (taken on
+    /// another of our devices).
+    pub fn take_history_record(&mut self, now_ms: i64) -> Option<HistoryRecord> {
+        let call = self.active.as_mut()?;
+        if call.recorded || !matches!(call.phase, Phase::Over(_)) {
+            return None;
+        }
+        call.recorded = true;
+        let status = history_status(call)?;
+        Some(HistoryRecord {
+            id: call.call_id.clone(),
+            peer_user_id: call.peer.clone(),
+            direction: history_direction(call),
+            status,
+            started_at_ms: call.started_at_ms,
+            duration_seconds: call
+                .connected_at_ms
+                .map(|since| ((now_ms - since) / 1000).max(0) as i32)
+                .unwrap_or(0),
+        })
     }
 }
 
@@ -274,7 +337,50 @@ fn outcome_of(reason: i32) -> Outcome {
         HangupReason::Busy => Outcome::Busy,
         HangupReason::Timeout => Outcome::NoAnswer,
         HangupReason::ConnectionFailed => Outcome::Failed,
+        HangupReason::AcceptedElsewhere => Outcome::AnsweredElsewhere,
         _ => Outcome::Ended,
+    }
+}
+
+/// The store's `CallStore.Status` code (completed 0, missed 1, declined 2, failed 3), as iOS
+/// maps a call end (`CallManager.endActiveCall`). `None`: do not record.
+fn history_status(call: &Call) -> Option<i16> {
+    let answered = call.connected_at_ms.is_some();
+    let incoming = call.direction == Direction::Incoming;
+    let code = match &call.phase {
+        Phase::Over(Outcome::Ended) => {
+            if answered {
+                0
+            } else {
+                1
+            }
+        }
+        Phase::Over(Outcome::Declined) => {
+            if incoming {
+                2
+            } else {
+                1
+            }
+        }
+        Phase::Over(Outcome::Busy | Outcome::NoAnswer) => 1,
+        Phase::Over(Outcome::Failed) => {
+            if answered {
+                0
+            } else {
+                3
+            }
+        }
+        Phase::Over(Outcome::AnsweredElsewhere) => return None,
+        _ => return None,
+    };
+    Some(code)
+}
+
+/// The store's `CallRecord.Direction` code (outgoing 0, incoming 1).
+fn history_direction(call: &Call) -> i16 {
+    match call.direction {
+        Direction::Outgoing => 0,
+        Direction::Incoming => 1,
     }
 }
 
@@ -472,5 +578,75 @@ mod tests {
         let busy_sig = busy("c1", "peer-device");
         m.on_signal(&busy_sig, "peer-device");
         assert_eq!(m.active().unwrap().phase, Phase::Over(Outcome::Busy));
+    }
+
+    #[test]
+    fn declining_keeps_the_outcome_until_dismiss_and_does_not_block_a_new_call() {
+        let mut m = Manager::new();
+        m.begin_incoming(
+            "c1".into(),
+            "peer".into(),
+            "peer-device".into(),
+            CallType::Audio,
+        );
+        let out = m.decline("me");
+        assert_eq!(out.len(), 1);
+        assert!(matches!(out[0].signal.signal, Some(S::Hangup(_))));
+        assert_eq!(m.active().unwrap().phase, Phase::Over(Outcome::Declined));
+        assert!(!m.is_busy(), "an ended call does not block a new one");
+
+        m.dismiss();
+        assert!(m.active().is_none());
+    }
+
+    #[test]
+    fn a_call_taken_elsewhere_writes_no_history() {
+        let mut m = Manager::new();
+        begin_outgoing(&mut m);
+        let h = hangup("c1", "peer-device", HangupReason::AcceptedElsewhere);
+        m.on_signal(&h, "peer-device");
+        assert_eq!(
+            m.active().unwrap().phase,
+            Phase::Over(Outcome::AnsweredElsewhere)
+        );
+        assert!(m.take_history_record(now_ms()).is_none());
+    }
+
+    #[test]
+    fn history_status_maps_the_outcomes_as_ios_does() {
+        // Incoming, declined by us → declined (2), direction incoming (1).
+        let mut m = Manager::new();
+        m.begin_incoming(
+            "c1".into(),
+            "peer".into(),
+            "peer-device".into(),
+            CallType::Audio,
+        );
+        m.decline("me");
+        assert_eq!(history_status(m.active().unwrap()), Some(2));
+        assert_eq!(history_direction(m.active().unwrap()), 1);
+
+        // Outgoing, the peer declined → missed (1), direction outgoing (0).
+        let mut m = Manager::new();
+        begin_outgoing(&mut m);
+        let h = hangup("c1", "peer-device", HangupReason::Declined);
+        m.on_signal(&h, "peer-device");
+        assert_eq!(history_status(m.active().unwrap()), Some(1));
+        assert_eq!(history_direction(m.active().unwrap()), 0);
+
+        // Connected and ended normally → completed (0); never connected → missed (1).
+        let mut m = Manager::new();
+        begin_outgoing(&mut m);
+        let a = answer("c1", "peer-device", "peer", String::new());
+        m.on_signal(&a, "peer-device");
+        let h = hangup("c1", "peer-device", HangupReason::Normal);
+        m.on_signal(&h, "peer-device");
+        assert_eq!(history_status(m.active().unwrap()), Some(0));
+
+        let mut m = Manager::new();
+        begin_outgoing(&mut m);
+        let h = hangup("c1", "peer-device", HangupReason::Normal);
+        m.on_signal(&h, "peer-device");
+        assert_eq!(history_status(m.active().unwrap()), Some(1));
     }
 }

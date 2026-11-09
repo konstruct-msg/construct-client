@@ -28,4 +28,10 @@ impl Client {
             orch.end_call();
         }
     }
+
+    pub(super) fn dismiss_call(&self) {
+        if let Some(ref orch) = self.orch_handle {
+            orch.dismiss_call();
+        }
+    }
 }

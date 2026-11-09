@@ -828,6 +828,26 @@ impl LocalStore {
         Ok(self.store.contact(user_id)?.map(view_contact))
     }
 
+    /// Insert or replace a call-log row.
+    pub fn upsert_call(&self, record: &construct_store::CallRecord) -> Result<()> {
+        Ok(self.store.upsert_call(record)?)
+    }
+
+    /// The call log, newest first, at most `limit` rows.
+    pub fn calls(&self, limit: u32) -> Result<Vec<construct_store::CallRecord>> {
+        Ok(self.store.calls(limit)?)
+    }
+
+    /// Remove one row; false when there was no such row.
+    pub fn delete_call(&self, id: &str) -> Result<bool> {
+        Ok(self.store.delete_call(id)?)
+    }
+
+    /// Clear the whole call log; how many rows it held.
+    pub fn delete_all_calls(&self) -> Result<u32> {
+        Ok(self.store.delete_all_calls()?)
+    }
+
     /// Whether `id` is blocked here. Asked of every message that arrives. An unknown id, or a
     /// store that cannot be read, is not blocked: a block is the person's own suppression, not a
     /// boundary whose failed lookup should drop what is meant for them (iOS `BlockedContacts`).

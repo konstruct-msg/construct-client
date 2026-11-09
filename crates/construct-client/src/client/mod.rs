@@ -256,6 +256,8 @@ pub enum ClientCommand {
     DeclineCall,
     /// The person (or the app) ended the held call.
     EndCall,
+    /// The person closed the ended call's outcome.
+    DismissCall,
 }
 
 /// What the client tells a front end.
@@ -678,6 +680,7 @@ impl Client {
             ClientCommand::AcceptCall => self.accept_call(),
             ClientCommand::DeclineCall => self.decline_call(),
             ClientCommand::EndCall => self.end_call(),
+            ClientCommand::DismissCall => self.dismiss_call(),
         }
     }
 

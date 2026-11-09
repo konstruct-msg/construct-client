@@ -103,6 +103,11 @@ impl OrchestratorHandle {
         let _ = self.cmd_tx.send(OrchestratorCommand::EndCall);
     }
 
+    /// The person closed the ended call's outcome.
+    pub fn dismiss_call(&self) {
+        let _ = self.cmd_tx.send(OrchestratorCommand::DismissCall);
+    }
+
     /// Mark an account as locally known, so its deliveries enter the core.
     pub fn remember_contact(&self, contact_id: String) {
         let _ = self
@@ -365,6 +370,8 @@ enum OrchestratorCommand {
     DeclineCall,
     /// The person (or the app) ended the held call.
     EndCall,
+    /// The person closed the ended call's outcome.
+    DismissCall,
     /// Send one `WebRtcSignal` E2EE: to `to_device`, or every device of `peer` when `None`.
     SendCallSignal {
         peer: String,
@@ -1015,6 +1022,10 @@ impl Task {
                 self.send_call_signals(signals).await;
                 self.emit_call_state();
             }
+            OrchestratorCommand::DismissCall => {
+                self.calls.dismiss();
+                self.emit_call_state();
+            }
             OrchestratorCommand::SendCallSignal {
                 peer,
                 signal,
@@ -1239,12 +1250,42 @@ impl Task {
     }
 
     /// Push the call's current snapshot to the front end, or `None` when it ended.
-    fn emit_call_state(&self) {
+    fn emit_call_state(&mut self) {
+        self.record_call_history();
         let _ = self
             .internal_tx
             .send(crate::client::ClientEvent::Bridge(BridgeEvent::CallState {
                 call: self.calls.state(),
             }));
+    }
+
+    /// Write the ended call's row once, as iOS `CallHistoryService.record` does. The name comes
+    /// from our contacts; a call taken on another device writes nothing.
+    fn record_call_history(&mut self) {
+        let now = now_ms();
+        let Some(record) = self.calls.take_history_record(now) else {
+            return;
+        };
+        let peer_name = self
+            .storage
+            .get_contact_by_id(&record.peer_user_id)
+            .ok()
+            .flatten()
+            .map(|c| c.display_name)
+            .unwrap_or_default();
+        let stored = construct_store::CallRecord {
+            id: record.id,
+            peer_user_id: record.peer_user_id,
+            peer_name,
+            direction: record.direction,
+            status: record.status,
+            started_at: Some(record.started_at_ms),
+            ended_at: Some(now),
+            duration_seconds: record.duration_seconds,
+        };
+        if let Err(e) = self.storage.upsert_call(&stored) {
+            tracing::warn!(error = %e, "call history row not written");
+        }
     }
 
     /// Wait, off the task, for the directory to serve the keys of `device_id`: a device being
