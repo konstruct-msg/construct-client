@@ -95,7 +95,8 @@ fn base64url(s: &str) -> Option<Vec<u8>> {
 }
 
 /// The bytes an entry point's coordinates are signed as: compact JSON, keys sorted, slashes
-/// unescaped (`VeilEntryPointSignature.canonicalTuple`).
+/// unescaped (`VeilEntryPointSignature.canonicalTuple`). JSON by rule 6's exception: an external
+/// format, the bytes the signer signed; the config link it comes in is JSON for the same reason.
 pub fn canonical_tuple(relay: &str, sni: &str, spki: &str, exp: i64) -> Vec<u8> {
     let mut m = BTreeMap::new();
     m.insert("exp", serde_json::Value::from(exp));

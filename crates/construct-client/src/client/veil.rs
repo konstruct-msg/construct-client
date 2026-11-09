@@ -25,6 +25,8 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use construct_core::cfe::CfeMessageType;
+
 use super::{Client, ClientEvent};
 use crate::grpc::route::{self, Route};
 use crate::local_store::LocalStore;
@@ -159,10 +161,11 @@ fn veil_pk(sk: &[u8; 32]) -> [u8; 32] {
 
 pub(super) fn fronts(store: &LocalStore) -> Vec<Front> {
     let fronts: Vec<Front> = store
-        .secure_load(KEY_FRONTS)
-        .ok()
-        .flatten()
-        .and_then(|v| serde_json::from_slice(&v).ok())
+        .load_state(KEY_FRONTS, CfeMessageType::ClientVeilFronts)
+        .unwrap_or_else(|e| {
+            tracing::warn!("VEIL fronts do not read, dropped: {e:#}");
+            None
+        })
         .unwrap_or_default();
     register(&fronts);
     fronts
@@ -180,13 +183,8 @@ fn merge(store: &LocalStore, new: Vec<Front>) -> Vec<Front> {
         }
     }
     all.retain(|f| f.usable_at(now));
-    match serde_json::to_vec(&all) {
-        Ok(v) => {
-            if let Err(e) = store.secure_save(KEY_FRONTS, &v) {
-                tracing::warn!("VEIL fronts not kept: {e}");
-            }
-        }
-        Err(e) => tracing::warn!("VEIL fronts not encoded: {e}"),
+    if let Err(e) = store.save_state(KEY_FRONTS, CfeMessageType::ClientVeilFronts, &all) {
+        tracing::warn!("VEIL fronts not kept: {e:#}");
     }
     all
 }

@@ -138,6 +138,7 @@ struct UiPrefs {
     theme: ThemeMode,
 }
 
+/// JSON by rule 6's exception: `ui.json` is a preference file a person may edit by hand.
 fn prefs_path() -> anyhow::Result<std::path::PathBuf> {
     Ok(construct_client::config::config_dir()?.join("ui.json"))
 }

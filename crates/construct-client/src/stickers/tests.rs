@@ -173,6 +173,30 @@ fn a_picture_is_read_back_only_as_what_it_claims() {
     assert_eq!(lib.image(&beyond), None);
 }
 
+/// The picker's state is CFE (rule 6); what a build before 2026-11-09 kept as `state.json` is
+/// read once and replaced. Mutation that reddens it: drop the `state.json` fallback in
+/// `with_state`, or write the state as JSON again.
+#[test]
+fn the_state_of_an_earlier_build_is_read_once_and_kept_as_cfe() {
+    let lib = library("legacy-state");
+    lib.seed_bundled(&keys());
+    let listed = lib.listed();
+    assert!(!listed.is_empty());
+    let cfe_path = lib.dir.join("state.cfe");
+    let json_path = lib.dir.join("state.json");
+    let state: State = cfe::decode_as(
+        &std::fs::read(&cfe_path).unwrap(),
+        CfeMessageType::ClientStickerState,
+    )
+    .unwrap();
+    std::fs::write(&json_path, serde_json::to_vec(&state).unwrap()).unwrap();
+    std::fs::remove_file(&cfe_path).unwrap();
+
+    assert_eq!(lib.listed(), listed, "read from the earlier build's file");
+    assert!(cfe_path.exists(), "kept as CFE from then on");
+    assert!(!json_path.exists(), "the JSON is gone");
+}
+
 /// Recent stickers: newest first, one entry each, only from packs still offered.
 #[test]
 fn recent_stickers_are_newest_first_and_sendable() {
