@@ -258,6 +258,14 @@ pub enum ClientCommand {
     EndCall,
     /// The person closed the ended call's outcome.
     DismissCall,
+    /// Read the call log; [`ClientEvent::CallHistory`] follows.
+    LoadCallHistory,
+    /// Remove one call-log row; the log follows.
+    DeleteCall {
+        id: String,
+    },
+    /// Clear the whole call log; the log follows.
+    ClearCalls,
 }
 
 /// What the client tells a front end.
@@ -375,6 +383,9 @@ pub enum ClientEvent {
     /// above the chat list until [`ClientCommand::CloseMailboxGap`]; `None` when there is none
     /// (`crate::mailbox_gap`). Sent after each start and whenever it changes.
     MailboxGap(Option<crate::mailbox_gap::Interval>),
+    /// The call log, newest first. Sent on [`ClientCommand::LoadCallHistory`] and after each
+    /// change to it.
+    CallHistory(Vec<construct_store::CallRecord>),
 }
 
 /// The account as a front end shows it. No key material.
@@ -681,6 +692,9 @@ impl Client {
             ClientCommand::DeclineCall => self.decline_call(),
             ClientCommand::EndCall => self.end_call(),
             ClientCommand::DismissCall => self.dismiss_call(),
+            ClientCommand::LoadCallHistory => self.load_call_history(),
+            ClientCommand::DeleteCall { id } => self.delete_call(id),
+            ClientCommand::ClearCalls => self.clear_calls(),
         }
     }
 
