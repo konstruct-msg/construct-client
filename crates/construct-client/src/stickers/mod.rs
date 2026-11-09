@@ -15,7 +15,7 @@
 //! ```text
 //! stickers/manifests/<pack id hex>.pb   verified manifests; written last, so present = complete
 //! stickers/blobs/<sha256 hex>.webp      the pictures, checked before they are written
-//! stickers/state.json                   packs offered in the picker, recent stickers, seeded packs
+//! stickers/state.cfe                    packs offered in the picker, recent stickers, seeded packs (CFE)
 //! ```
 
 mod bundled;
@@ -24,6 +24,7 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+use construct_core::cfe::{self, CfeMessageType};
 use prost::Message;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -299,7 +300,7 @@ struct State {
 #[derive(Clone)]
 pub struct Library {
     dir: PathBuf,
-    /// `state.json` is read, changed and written under this.
+    /// `state.cfe` is read, changed and written under this.
     state: Arc<Mutex<()>>,
 }
 
@@ -361,18 +362,30 @@ impl Library {
 
     fn with_state<T>(&self, change: impl FnOnce(&mut State) -> T) -> T {
         let _held = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        let path = self.dir.join("state.json");
-        let mut state: State = std::fs::read(&path)
-            .ok()
-            .and_then(|b| serde_json::from_slice(&b).ok())
-            .unwrap_or_default();
-        let out = change(&mut state);
-        match serde_json::to_vec(&state) {
+        // CFE, like every persisted state (rule 6). `state.json` is what a build before
+        // 2026-11-09 wrote: read once, until `local_store::LEGACY_JSON_UNTIL`, and removed.
+        let path = self.dir.join("state.cfe");
+        let legacy = self.dir.join("state.json");
+        let mut state: State = match std::fs::read(&path) {
             Ok(bytes) => {
-                if let Err(e) = write_atomically(&path, &bytes) {
-                    tracing::warn!("stickers: state not written: {e}");
-                }
+                cfe::decode_as(&bytes, CfeMessageType::ClientStickerState).unwrap_or_else(|e| {
+                    tracing::warn!("stickers: state does not read, starting over: {e}");
+                    State::default()
+                })
             }
+            Err(_) => std::fs::read(&legacy)
+                .ok()
+                .and_then(|b| serde_json::from_slice(&b).ok())
+                .unwrap_or_default(),
+        };
+        let out = change(&mut state);
+        match cfe::encode(CfeMessageType::ClientStickerState, &state) {
+            Ok(bytes) => match write_atomically(&path, &bytes) {
+                Ok(()) => {
+                    let _ = std::fs::remove_file(&legacy);
+                }
+                Err(e) => tracing::warn!("stickers: state not written: {e}"),
+            },
             Err(e) => tracing::warn!("stickers: state not encoded: {e}"),
         }
         out

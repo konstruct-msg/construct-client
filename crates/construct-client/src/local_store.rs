@@ -7,13 +7,16 @@
 
 use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{Context, Result, anyhow};
+use construct_core::cfe::{self, CfeMessageType};
+use construct_core::rule_state;
 use construct_store::{
     Chat, Contact, IssuedInvite, Message, OwnProfile, PeerDevice, PendingChunk, Reaction, Store,
     delivery, payload,
 };
 
 pub use crate::content::{Attachment, MediaInfo, Quote};
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 // ── What the screens read ─────────────────────────────────────────────────────
@@ -126,6 +129,12 @@ pub struct OwnProfileView {
 const STREAM_CURSOR_KEY: &str = "stream_cursor";
 const MAILBOX_GAP_KEY: &str = "mailbox_gap.v1";
 const BLOCK_WISHES_KEY: &str = "block_sync.pending.v1";
+
+/// Until 2027-01-31 (Unix seconds) a state an earlier build kept as JSON is read once and
+/// rewritten as CFE (`load_state`, rule 6 of construct-docs `decisions/rules-from-the-first-year.md`).
+/// After it the JSON reading goes: `the_json_reading_has_an_end` fails until it does (rule 11).
+#[cfg_attr(not(test), allow(dead_code))]
+const LEGACY_JSON_UNTIL: u64 = 1_801_353_600;
 
 #[derive(Clone)]
 pub struct LocalStore {
@@ -454,25 +463,69 @@ impl LocalStore {
         self.secure_delete(STREAM_CURSOR_KEY)
     }
 
+    // ── State kept as CFE (rule 6) ─────────────────────────────────────────────
+
+    /// A state kept under `key` as a CFE envelope of `ty`; `None` when nothing is kept. A value an
+    /// earlier build kept as JSON is read once and rewritten as CFE, until `LEGACY_JSON_UNTIL`.
+    pub fn load_state<T: Serialize + DeserializeOwned>(
+        &self,
+        key: &str,
+        ty: CfeMessageType,
+    ) -> Result<Option<T>> {
+        let Some(kept) = self.secure_load(key)? else {
+            return Ok(None);
+        };
+        if cfe::looks_like_legacy_json(&kept) {
+            let value: T = serde_json::from_slice(&kept)
+                .with_context(|| format!("{key}: JSON from an earlier build does not read"))?;
+            self.save_state(key, ty, &value)?;
+            tracing::info!("{key}: JSON from an earlier build rewritten as CFE");
+            return Ok(Some(value));
+        }
+        cfe::decode_as(&kept, ty)
+            .map(Some)
+            .map_err(|e| anyhow!("{key}: {e}"))
+    }
+
+    /// Keep `value` under `key` as a CFE envelope of `ty`.
+    pub fn save_state<T: Serialize>(&self, key: &str, ty: CfeMessageType, value: &T) -> Result<()> {
+        let bytes = cfe::encode(ty, value).map_err(|e| anyhow!("{key}: {e}"))?;
+        self.secure_save(key, &bytes)
+    }
+
     // ── Messages the server trimmed before we collected them (crate::mailbox_gap) ──
 
-    /// The notice as kept; an unreadable one is dropped, as a notice nobody can show.
+    /// The notice as kept. The rule and its format are the core's (`rule_state`): what does not
+    /// read starts the notice empty. JSON from an earlier build is rewritten once.
     pub fn mailbox_gap(&self) -> crate::mailbox_gap::Notice {
-        match self.secure_load(MAILBOX_GAP_KEY) {
-            Ok(Some(kept)) => serde_json::from_slice(&kept).unwrap_or_else(|e| {
-                tracing::warn!("{MAILBOX_GAP_KEY} does not parse, dropped: {e}");
-                Default::default()
-            }),
-            Ok(None) => Default::default(),
+        let kept = match self.secure_load(MAILBOX_GAP_KEY) {
+            Ok(Some(kept)) => kept,
+            Ok(None) => return Default::default(),
             Err(e) => {
                 tracing::warn!("{MAILBOX_GAP_KEY} not read: {e:#}");
-                Default::default()
+                return Default::default();
             }
+        };
+        if cfe::looks_like_legacy_json(&kept) {
+            let notice: crate::mailbox_gap::Notice =
+                serde_json::from_slice(&kept).unwrap_or_else(|e| {
+                    tracing::warn!(
+                        "{MAILBOX_GAP_KEY}: JSON from an earlier build does not read, dropped: {e}"
+                    );
+                    Default::default()
+                });
+            if let Err(e) = self.set_mailbox_gap(&notice) {
+                tracing::warn!("{MAILBOX_GAP_KEY} not rewritten as CFE: {e:#}");
+            }
+            return notice;
         }
+        rule_state::decode_mailbox_gap(&kept)
     }
 
     pub fn set_mailbox_gap(&self, notice: &crate::mailbox_gap::Notice) -> Result<()> {
-        self.secure_save(MAILBOX_GAP_KEY, &serde_json::to_vec(notice)?)
+        let bytes = rule_state::encode_mailbox_gap(notice)
+            .map_err(|e| anyhow!("{MAILBOX_GAP_KEY}: {e}"))?;
+        self.secure_save(MAILBOX_GAP_KEY, &bytes)
     }
 
     // ── Messages ──────────────────────────────────────────────────────────────
@@ -870,24 +923,19 @@ impl LocalStore {
     /// Who one blocks says who one knows, so it is kept with the account. An unreadable record is
     /// dropped: the server's list is read back after it.
     pub fn block_wishes(&self) -> crate::block_sync::Wishes {
-        match self.secure_load(BLOCK_WISHES_KEY) {
-            Ok(Some(kept)) => serde_json::from_slice(&kept).unwrap_or_else(|e| {
-                tracing::warn!("{BLOCK_WISHES_KEY} does not parse, dropped: {e}");
-                Default::default()
-            }),
-            Ok(None) => Default::default(),
-            Err(e) => {
-                tracing::warn!("{BLOCK_WISHES_KEY} not read: {e:#}");
-                Default::default()
-            }
-        }
+        self.load_state(BLOCK_WISHES_KEY, CfeMessageType::ClientBlockWishes)
+            .unwrap_or_else(|e| {
+                tracing::warn!("{BLOCK_WISHES_KEY} does not read, dropped: {e:#}");
+                None
+            })
+            .unwrap_or_default()
     }
 
     pub fn set_block_wishes(&self, wishes: &crate::block_sync::Wishes) -> Result<()> {
         if wishes.is_empty() {
             return self.secure_delete(BLOCK_WISHES_KEY);
         }
-        self.secure_save(BLOCK_WISHES_KEY, &serde_json::to_vec(wishes)?)
+        self.save_state(BLOCK_WISHES_KEY, CfeMessageType::ClientBlockWishes, wishes)
     }
 
     /// Delete a contact with its chat, messages and devices.
@@ -1144,6 +1192,78 @@ mod tests {
         assert!(!kept.record(report), "closed survives the store");
         s.secure_save(MAILBOX_GAP_KEY, b"{not json").unwrap();
         assert_eq!(s.mailbox_gap(), Default::default(), "unreadable is dropped");
+    }
+
+    /// Persisted state is CFE of its own type (rule 6), not JSON.
+    /// Mutation that reddens it: write `serde_json::to_vec` in `save_state` or `set_mailbox_gap`.
+    #[test]
+    fn state_is_kept_as_cfe_of_its_own_type() {
+        use crate::block_sync::Intent;
+        use crate::mailbox_gap::Report;
+        let s = LocalStore::open_in_memory().unwrap();
+        let mut notice = crate::mailbox_gap::Notice::default();
+        notice.record(Report {
+            after_cursor: "100-0".into(),
+            resumes_at: String::new(),
+        });
+        s.set_mailbox_gap(&notice).unwrap();
+        let wishes = [(
+            "bob".to_string(),
+            Intent {
+                blocked: true,
+                reason: None,
+            },
+        )]
+        .into_iter()
+        .collect();
+        s.set_block_wishes(&wishes).unwrap();
+        let kind = |key: &str| {
+            cfe::decode(&s.secure_load(key).unwrap().unwrap())
+                .unwrap()
+                .msg_type
+        };
+        assert_eq!(kind(MAILBOX_GAP_KEY), CfeMessageType::MailboxGapNotice);
+        assert_eq!(kind(BLOCK_WISHES_KEY), CfeMessageType::ClientBlockWishes);
+    }
+
+    /// What an earlier build kept as JSON reads, and is CFE from then on.
+    /// Mutation that reddens it: drop the `looks_like_legacy_json` branch in `load_state`.
+    #[test]
+    fn json_from_an_earlier_build_is_read_and_rewritten_as_cfe() {
+        let s = LocalStore::open_in_memory().unwrap();
+        s.secure_save(
+            MAILBOX_GAP_KEY,
+            br#"{"open":[{"after_cursor":"100-0","resumes_at":""}],"closed":[]}"#,
+        )
+        .unwrap();
+        s.secure_save(
+            BLOCK_WISHES_KEY,
+            br#"{"bob":{"blocked":true,"reason":null}}"#,
+        )
+        .unwrap();
+        assert!(
+            s.mailbox_gap().interval().is_some(),
+            "the open report survives"
+        );
+        assert!(s.block_wishes()["bob"].blocked, "the wish survives");
+        for key in [MAILBOX_GAP_KEY, BLOCK_WISHES_KEY] {
+            let kept = s.secure_load(key).unwrap().unwrap();
+            assert!(cfe::decode(&kept).is_ok(), "{key} is CFE now");
+        }
+    }
+
+    /// Rule 11: the JSON reading is temporary, and this fails on the day it should be gone.
+    #[test]
+    fn the_json_reading_has_an_end() {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        assert!(
+            now < LEGACY_JSON_UNTIL,
+            "2027-01-31 has passed: remove the JSON reading in LocalStore::load_state and \
+             mailbox_gap, the stickers' state.json and this test"
+        );
     }
 
     /// The flag is the account's own: kept when the contact's name changes, off for anyone with no

@@ -1,6 +1,7 @@
 //! Getting in and out: restore, unlock, register, link, the passphrase for a new account, the
 //! outcome of an authentication, and logout.
 
+use construct_core::cfe::CfeMessageType;
 use tokio::sync::mpsc;
 
 use super::{Client, ClientEvent, Inbox};
@@ -91,12 +92,10 @@ impl Client {
     /// Take `store` as this account's and read its session.
     fn adopt_store(&mut self, store: construct_store::Store) -> Result<Session, String> {
         let store = crate::local_store::LocalStore::new(store, "");
-        let session = store
-            .secure_load(SESSION_KEY)
-            .map_err(|e| format!("{e:#}"))?
+        let session: Session = store
+            .load_state(SESSION_KEY, CfeMessageType::ClientAuthSession)
+            .map_err(|e| format!("session unreadable: {e:#}"))?
             .ok_or("the store holds no session")?;
-        let session: Session =
-            serde_json::from_slice(&session).map_err(|e| format!("session unreadable: {e}"))?;
         self.store = Some(store.for_account(&session.user_id));
         // Before anything is sent: with VEIL on, nothing leaves outside the tunnel.
         self.start_veil();
@@ -208,9 +207,8 @@ impl Client {
     /// Write the session into the store.
     pub(super) fn save_session(&self, session: &Session) -> Result<(), String> {
         let store = self.store.as_ref().ok_or("no store open")?;
-        let bytes = serde_json::to_vec(session).map_err(|e| e.to_string())?;
         store
-            .secure_save(SESSION_KEY, &bytes)
+            .save_state(SESSION_KEY, CfeMessageType::ClientAuthSession, session)
             .map_err(|e| format!("{e:#}"))
     }
 

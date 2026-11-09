@@ -441,6 +441,7 @@ pub fn link_cursor(access_token: &str) -> Option<String> {
     let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(payload.trim_end_matches('='))
         .ok()?;
+    // JSON by rule 6's exception: the token's payload is the server's format, read, never kept.
     let iat = serde_json::from_slice::<serde_json::Value>(&bytes)
         .ok()?
         .get("iat")?

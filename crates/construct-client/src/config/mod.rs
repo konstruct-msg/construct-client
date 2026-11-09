@@ -277,6 +277,8 @@ pub fn session_path() -> Result<PathBuf> {
 
 // ── Persistence ────────────────────────────────────────────────────────────────
 
+/// JSON, by rule 6's exception: `config.json` is a file a person edits by hand (server address,
+/// paths), not state the client keeps for itself.
 pub fn load_config() -> Result<Config> {
     let path = config_path()?;
     if !path.exists() {
@@ -293,6 +295,8 @@ pub fn save_config(cfg: &Config) -> Result<()> {
     Ok(())
 }
 
+/// JSON, by rule 6's exception: the format of a session file from before the local store, read
+/// once to move it in (`detect_session`); nothing writes it any more.
 pub fn load_session() -> Result<Option<Session>> {
     let path = session_path()?;
     if !path.exists() {
