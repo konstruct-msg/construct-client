@@ -65,19 +65,19 @@ impl Client {
     }
 
     pub(super) fn delete_call(&self, id: String) {
-        if let Some(ref store) = self.store {
-            if let Err(e) = store.delete_call(&id) {
-                tracing::warn!(error = %e, "call row not deleted");
-            }
+        if let Some(ref store) = self.store
+            && let Err(e) = store.delete_call(&id)
+        {
+            tracing::warn!(error = %e, "call row not deleted");
         }
         self.load_call_history();
     }
 
     pub(super) fn clear_calls(&self) {
-        if let Some(ref store) = self.store {
-            if let Err(e) = store.delete_all_calls() {
-                tracing::warn!(error = %e, "call log not cleared");
-            }
+        if let Some(ref store) = self.store
+            && let Err(e) = store.delete_all_calls()
+        {
+            tracing::warn!(error = %e, "call log not cleared");
         }
         self.load_call_history();
     }
