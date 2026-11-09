@@ -52,6 +52,8 @@ pub struct CallState {
     pub direction: Direction,
     pub phase: Phase,
     pub call_type: CallType,
+    /// When the call went live (Unix ms); the timer ticks from here.
+    pub connected_at_ms: Option<i64>,
 }
 
 /// A call the orchestrator holds. `peer` is an account id; `peer_device` is the device that
@@ -117,6 +119,7 @@ impl Manager {
             direction: call.direction,
             phase: call.phase.clone(),
             call_type: call.call_type,
+            connected_at_ms: call.connected_at_ms,
         })
     }
 
