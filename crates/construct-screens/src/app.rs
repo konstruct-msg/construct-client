@@ -475,6 +475,8 @@ impl App {
                     .into()
             }
             ClientEvent::MailboxGap(None) => {}
+            // The terminal has no calls tab yet; the call screen is the desktop webview's.
+            ClientEvent::CallHistory(_) => {}
         }
     }
 
