@@ -7,9 +7,12 @@
 //! "first answer wins" rule among a contact's devices included.
 
 use crate::proto::signaling::v1::{
-    CallAnswer, CallBusy, CallHangup, CallOffer, CallRinging, CallType, HangupReason, IceCandidate,
+    CallAnswer, CallBusy, CallHangup, CallOffer, CallRinging, HangupReason, IceCandidate,
     WebRtcSignal, web_rtc_signal,
 };
+
+/// The call kind, re-exported so front ends can read it without naming the proto module.
+pub use crate::proto::signaling::v1::CallType;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Direction {
@@ -93,6 +96,20 @@ pub struct HistoryRecord {
     pub direction: i16,
     pub status: i16,
     pub started_at_ms: i64,
+    pub duration_seconds: i32,
+}
+
+/// One row of the call log, as a front end reads it. The store's numeric codes are already named.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HistoryRow {
+    pub id: String,
+    pub peer_user_id: String,
+    pub peer_name: String,
+    /// `"outgoing"` or `"incoming"`.
+    pub direction: &'static str,
+    /// `"completed"`, `"missed"`, `"declined"` or `"failed"`.
+    pub status: &'static str,
+    pub started_at: Option<i64>,
     pub duration_seconds: i32,
 }
 

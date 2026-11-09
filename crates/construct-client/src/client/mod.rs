@@ -385,7 +385,7 @@ pub enum ClientEvent {
     MailboxGap(Option<crate::mailbox_gap::Interval>),
     /// The call log, newest first. Sent on [`ClientCommand::LoadCallHistory`] and after each
     /// change to it.
-    CallHistory(Vec<construct_store::CallRecord>),
+    CallHistory(Vec<crate::calls::HistoryRow>),
 }
 
 /// The account as a front end shows it. No key material.

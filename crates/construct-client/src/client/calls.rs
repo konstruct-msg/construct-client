@@ -41,7 +41,26 @@ impl Client {
             .store
             .as_ref()
             .and_then(|store| store.calls(200).ok())
-            .unwrap_or_default();
+            .unwrap_or_default()
+            .into_iter()
+            .map(|record| crate::calls::HistoryRow {
+                id: record.id,
+                peer_user_id: record.peer_user_id,
+                peer_name: record.peer_name,
+                direction: match record.direction {
+                    0 => "outgoing",
+                    _ => "incoming",
+                },
+                status: match record.status {
+                    0 => "completed",
+                    1 => "missed",
+                    2 => "declined",
+                    _ => "failed",
+                },
+                started_at: record.started_at,
+                duration_seconds: record.duration_seconds,
+            })
+            .collect();
         self.emit(crate::client::ClientEvent::CallHistory(calls));
     }
 
