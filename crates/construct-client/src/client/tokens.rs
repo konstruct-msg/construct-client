@@ -76,6 +76,7 @@ impl Client {
         let inbox = self.inbox.clone();
         let grpc = self.grpc.clone();
         tokio::spawn(async move {
+            let before = crate::grpc::route::current();
             let msg = match crate::auth::authenticate_saved_session(session, &grpc).await {
                 Ok(result) => {
                     let full = result
@@ -93,7 +94,11 @@ impl Client {
                         username: None,
                     }))
                 }
-                Err(e) => super::auth::auth_failure(&e, format!("Device re-auth failed: {e}")),
+                Err(e) => {
+                    let direct =
+                        super::auth::direct_throughout(before, crate::grpc::route::current());
+                    super::auth::auth_failure(&e, direct, format!("Device re-auth failed: {e}"))
+                }
             };
             let _ = inbox.send(Inbox::Auth(msg));
         });

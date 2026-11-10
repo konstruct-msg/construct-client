@@ -286,7 +286,7 @@ fn classify(e: &crate::grpc::GrpcError) -> Outcome {
         GrpcError::Status { code: 14, message } if message.contains("not configured") => {
             Outcome::Disabled
         }
-        GrpcError::Unauthenticated(_) => Outcome::Unauthenticated,
+        GrpcError::Unauthenticated { .. } => Outcome::Unauthenticated,
         other => Outcome::Transport(other.to_string()),
     }
 }
