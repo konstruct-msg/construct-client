@@ -21,16 +21,28 @@ pub(crate) enum AuthMsg {
 }
 
 /// A failed sign-in, as the inbox takes it: a removed device apart from every other failure.
-pub(super) fn auth_failure(e: &anyhow::Error, reason: String) -> AuthMsg {
+/// `over_direct_tls`: the call went out and came back on a TLS connection to our server, with no
+/// route change between (`direct_throughout`); through VEIL a relay could forge the refusal.
+pub(super) fn auth_failure(e: &anyhow::Error, over_direct_tls: bool, reason: String) -> AuthMsg {
     let removed = e
         .chain()
         .filter_map(|c| c.downcast_ref::<crate::grpc::GrpcError>())
-        .any(crate::grpc::GrpcError::is_device_removed);
+        .any(|g| g.erases_device(over_direct_tls));
     if removed {
         AuthMsg::Removed
     } else {
         AuthMsg::Failure(reason)
     }
+}
+
+/// Whether a call made between the route readings `before` and `after` went direct the whole time:
+/// TLS to our server, and no route change (the generation) while it ran. As iOS and Android: a
+/// switch to VEIL mid-call counts as VEIL.
+pub(super) fn direct_throughout(
+    before: (crate::grpc::route::Route, u64),
+    after: (crate::grpc::route::Route, u64),
+) -> bool {
+    before.0 == crate::grpc::route::Route::Direct && before == after
 }
 
 /// `try_restore_session` found nothing on disk.
@@ -225,7 +237,8 @@ impl Client {
         tokio::spawn(async move {
             let mut wait = AUTH_RETRY_FIRST;
             let mut told = false;
-            let attempt = loop {
+            let (attempt, before) = loop {
+                let before = crate::grpc::route::current();
                 match crate::auth::authenticate_saved_session(session.clone(), &grpc).await {
                     Err(e) if is_path_failure(&e) => {
                         tracing::warn!("sign-in: no connection, trying again in {wait:?}: {e:#}");
@@ -238,7 +251,7 @@ impl Client {
                         tokio::time::sleep(wait).await;
                         wait = (wait * 2).min(AUTH_RETRY_MAX);
                     }
-                    other => break other,
+                    other => break (other, before),
                 }
             };
             let msg = match attempt {
@@ -258,7 +271,10 @@ impl Client {
                         username: None,
                     }))
                 }
-                Err(e) => auth_failure(&e, format!("{e:#}")),
+                Err(e) => {
+                    let direct = direct_throughout(before, crate::grpc::route::current());
+                    auth_failure(&e, direct, format!("{e:#}"))
+                }
             };
             let _ = inbox.send(Inbox::Auth(msg));
         });
@@ -698,17 +714,47 @@ mod tests {
 
     #[test]
     fn a_removed_device_is_told_apart_under_its_context() {
-        let removed = anyhow::Error::new(crate::grpc::GrpcError::status(16, "Device is inactive"))
-            .context("authenticate");
+        let removed = || {
+            anyhow::Error::new(crate::grpc::GrpcError::refused(
+                "Device is inactive",
+                Some("1".into()),
+            ))
+            .context("authenticate")
+        };
         assert!(matches!(
-            auth_failure(&removed, "x".into()),
+            auth_failure(&removed(), true, "x".into()),
             AuthMsg::Removed
         ));
-        let other = anyhow::Error::new(crate::grpc::GrpcError::status(16, "Device not found"))
-            .context("authenticate");
+        assert!(
+            matches!(
+                auth_failure(&removed(), false, "x".into()),
+                AuthMsg::Failure(_)
+            ),
+            "through VEIL it is not believed"
+        );
+        // Todo 292: the text alone wiped the device; it no longer does.
+        let text_only =
+            anyhow::Error::new(crate::grpc::GrpcError::refused("Device is inactive", None))
+                .context("authenticate");
         assert!(matches!(
-            auth_failure(&other, "x".into()),
+            auth_failure(&text_only, true, "x".into()),
             AuthMsg::Failure(_)
         ));
+    }
+
+    /// Mutations that redden it: accept a VEIL route; ignore a route change mid-call.
+    #[test]
+    fn only_a_direct_route_throughout_is_direct() {
+        use crate::grpc::route::Route;
+        assert!(direct_throughout((Route::Direct, 3), (Route::Direct, 3)));
+        assert!(
+            !direct_throughout((Route::Direct, 3), (Route::Direct, 4)),
+            "changed mid-call"
+        );
+        assert!(!direct_throughout(
+            (Route::Veil { port: 1 }, 3),
+            (Route::Veil { port: 1 }, 3)
+        ));
+        assert!(!direct_throughout((Route::Closed, 3), (Route::Closed, 3)));
     }
 }

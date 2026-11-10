@@ -268,7 +268,12 @@ pub(crate) fn check_grpc_status(headers: &HeaderMap) -> Result<(), GrpcError> {
             .unwrap_or(""),
     );
     if code == 16 {
-        return Err(GrpcError::unauthenticated(msg));
+        // Why it refused this device is a number, never the text (`DeviceRefusal`).
+        let refusal = headers
+            .get(construct_core::rule_state::device_refusal::METADATA_KEY)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned);
+        return Err(GrpcError::refused(msg, refusal));
     }
     if code == 7 {
         return Err(GrpcError::permission_denied(msg));
@@ -382,6 +387,27 @@ async fn do_unary(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The refusal number travels in its own trailer and is kept beside the text.
+    /// Mutation that reddens it: drop the header read in `check_grpc_status`.
+    #[test]
+    fn an_unauthenticated_status_keeps_its_refusal_number() {
+        let mut headers = HeaderMap::new();
+        headers.insert("grpc-status", "16".parse().unwrap());
+        headers.insert("grpc-message", "Device%20is%20inactive".parse().unwrap());
+        headers.insert("construct-device-refusal", "1".parse().unwrap());
+        let e = check_grpc_status(&headers).unwrap_err();
+        assert_eq!(
+            e.device_refusal(),
+            construct_core::rule_state::device_refusal::Refusal::Removed
+        );
+        headers.remove("construct-device-refusal");
+        assert_eq!(
+            check_grpc_status(&headers).unwrap_err().device_refusal(),
+            construct_core::rule_state::device_refusal::Refusal::Unspecified,
+            "the text alone"
+        );
+    }
 
     #[tokio::test]
     async fn clones_share_token() {

@@ -107,7 +107,7 @@ pub(crate) fn report(report: Report, since: u64) {
 pub(crate) fn classify(e: &super::GrpcError) -> Option<RpcFailure> {
     use super::GrpcError as E;
     Some(match e {
-        E::Unauthenticated(_) => RpcFailure::AuthRejected,
+        E::Unauthenticated { .. } => RpcFailure::AuthRejected,
         E::PermissionDenied(_) | E::Status { .. } => RpcFailure::ApplicationError,
         E::Tls(_) => RpcFailure::TransportUnknown,
         E::Transport(m) if m.contains("VEIL is on") => return None,
@@ -167,7 +167,7 @@ mod tests {
             Some(RpcFailure::TransientCancellation)
         );
         assert_eq!(
-            classify(&GrpcError::Unauthenticated("x".into())),
+            classify(&GrpcError::unauthenticated("x")),
             Some(RpcFailure::AuthRejected)
         );
         assert_eq!(
