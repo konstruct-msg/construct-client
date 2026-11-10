@@ -748,12 +748,13 @@ dependencies = [
 
 [[package]]
 name = "construct-core"
-version = "0.65.0"
+version = "0.68.0"
 dependencies = [
  "aes-gcm",
  "argon2",
  "bip39",
  "chacha20poly1305",
+ "construct-rules",
  "construct-server-trust",
  "construct-store",
  "crc32fast",
@@ -777,6 +778,14 @@ dependencies = [
  "uniffi",
  "x25519-dalek",
  "zeroize",
+]
+
+[[package]]
+name = "construct-rules"
+version = "0.2.0"
+dependencies = [
+ "serde",
+ "sha2",
 ]
 
 [[package]]
