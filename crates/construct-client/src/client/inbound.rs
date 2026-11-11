@@ -8,7 +8,7 @@ use super::{ClientEvent, Inbox};
 use crate::{
     bridge::BridgeEvent,
     orchestrator_task::OrchestratorHandle,
-    streaming::{CursorTracker, StreamEvent},
+    streaming::{CursorTracker, StreamEvent, stream_entry_id},
 };
 use construct_core::orchestration::actions::IncomingEvent;
 
@@ -23,15 +23,23 @@ pub(super) fn spawn_relay(
     tokio::spawn(async move {
         while let Some(event) = stream_rx.recv().await {
             match event {
+                // Every frame takes its place in line here, in the order it arrived: an entry
+                // tracked later by another task could otherwise be passed by one tracked first.
                 StreamEvent::Message {
                     envelope,
                     stream_cursor,
-                } => orch.stream_envelope(envelope, stream_cursor),
+                } => {
+                    if let Some(id) = stream_entry_id(&envelope, stream_cursor.as_deref()) {
+                        cursor.track(&id, stream_cursor.as_deref());
+                    }
+                    orch.stream_envelope(envelope, stream_cursor);
+                }
+                // The server's ack of a send keeps nothing on this device.
                 StreamEvent::Ack {
                     message_id,
                     stream_cursor,
                 } => {
-                    cursor.note(&message_id, stream_cursor);
+                    cursor.track_resolved(stream_cursor.as_deref());
                     let _ = orch_tx.send(IncomingEvent::AckReceived { message_id });
                 }
                 StreamEvent::Heartbeat {

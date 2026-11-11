@@ -570,6 +570,8 @@ struct Task {
     grpc: GrpcClient,
     sealed_tx: mpsc::UnboundedSender<Outbound>,
     cursor: CursorTracker,
+    /// Stream entries this device could not keep: unresolved, so the server delivers them again.
+    held_entries: HashSet<String>,
     identity: LocalIdentity,
     self_tx: mpsc::UnboundedSender<IncomingEvent>,
     /// Commands back to this task, from its own sub-tasks.
@@ -633,6 +635,7 @@ impl Task {
             grpc,
             sealed_tx,
             cursor,
+            held_entries: HashSet::new(),
             identity,
             self_tx,
             self_cmd,
@@ -1420,7 +1423,7 @@ impl Task {
             } else {
                 tracing::warn!(%message_id, content_type = envelope.content_type, "unsealed delivery dropped");
             }
-            self.cursor.commit_direct(&self.storage, stream_cursor);
+            self.resolve_entry(envelope, stream_cursor.as_deref());
             return;
         };
         let opened = sealing::open_sealed_inner(
@@ -1508,7 +1511,7 @@ impl Task {
             }
         };
         let Some((event, account, device)) = routed else {
-            self.cursor.commit_direct(&self.storage, stream_cursor);
+            self.resolve_entry(envelope, stream_cursor.as_deref());
             return;
         };
         // What the payload is — its number, whether it parses, whether it opens a state — is the
@@ -1541,8 +1544,39 @@ impl Task {
         // that wrote first while we opened to it is two sides opening at once, which the core
         // converges (sessions renew by sending), and a redelivery of one already read is the
         // core's `Duplicate` (todo/284).
-        self.cursor.note(&context.message_id, context.stream_cursor);
+        // Tracked by the relay on arrival. Resolved once this pass is done — handled, applied,
+        // given up, refused — as iOS `routeIncomingMessage` does, unless it could not be kept
+        // here (delivered again) or the core still holds a message of that device behind a
+        // session (`OpenReceiving` waiting for a server key, our own open in flight): that one is
+        // resolved when the core hands it out. Holding on any queued message of the device is
+        // wider than needed; what it costs is a stall until the next connection, never a loss.
+        let entry = if context.message_id.is_empty() {
+            context.stream_cursor.clone()
+        } else {
+            Some(context.message_id.clone())
+        };
+        let device = match &event {
+            IncomingEvent::MessageReceived { from, .. } => Some(from.clone()),
+            _ => None,
+        };
         self.process(event).await;
+        let held = entry
+            .as_ref()
+            .is_some_and(|entry| self.held_entries.remove(entry));
+        let queued = device.is_some_and(|d| self.orchestrator.pending_message_count(&d) > 0);
+        if let Some(entry) = entry
+            && !held
+            && !queued
+        {
+            self.cursor.resolve(&entry);
+        }
+    }
+
+    /// A delivery dropped before it reached the core: nothing to keep, its entry is resolved.
+    fn resolve_entry(&self, envelope: &Envelope, stream_cursor: Option<&str>) {
+        if let Some(entry) = crate::streaming::stream_entry_id(envelope, stream_cursor) {
+            self.cursor.resolve(&entry);
+        }
     }
 
     // ── Sending ───────────────────────────────────────────────────────────────
@@ -2706,6 +2740,15 @@ impl Task {
                 } else if let Some(error) = &opened.last_error {
                     self.ui_error(format!("[SESSION_OPEN] {error}"));
                 }
+                // Given up by the core — proven unopenable, or dropped with the queue: nothing
+                // will read them, so their entries stop holding the cursor (iOS `releaseCoreQueued`).
+                for id in opened
+                    .tried_message_ids
+                    .iter()
+                    .chain(&opened.dropped_message_ids)
+                {
+                    self.cursor.resolve(id);
+                }
                 for action in opened.actions {
                     Box::pin(self.dispatch(action, follow_ups)).await;
                 }
@@ -2753,9 +2796,11 @@ impl Task {
                         message_id = %message_id,
                         "SECURITY[block_drop]: message from a blocked contact suppressed"
                     );
-                    self.cursor.commit(&self.storage, &message_id);
+                    self.cursor.resolve(&message_id);
                     return;
                 }
+                // This attempt decides: one not kept before may be kept now.
+                self.held_entries.remove(&message_id);
                 self.adopt_writer(&account);
                 tracing::info!(
                     device = %contact_id,
@@ -2768,12 +2813,10 @@ impl Task {
                     crate::knst::Inbound::Chunk(chunk) => {
                         match self.storage.hold_chunk(&account, &chunk, &message_id) {
                             Ok(Some(whole)) => crate::knst::decode_assembled(chunk.id, &whole),
-                            Ok(None) => {
-                                self.cursor.commit(&self.storage, &message_id);
-                                crate::knst::Inbound::Silent
-                            }
+                            Ok(None) => crate::knst::Inbound::Silent,
                             Err(e) => {
                                 tracing::warn!(%message_id, error = %e, "chunk not held");
+                                self.held_entries.insert(message_id.clone());
                                 crate::knst::Inbound::Silent
                             }
                         }
@@ -2792,10 +2835,12 @@ impl Task {
                     let id = id.unwrap_or_else(|| message_id.clone());
                     // Not kept: the cursor stays, so the server delivers it again.
                     let from = Sender::Peer(&account);
-                    if let Ok(event) =
-                        place_inbound(&self.storage, from, &id, content, &payload, now_ms())
-                    {
-                        self.cursor.commit(&self.storage, &message_id);
+                    let placed =
+                        place_inbound(&self.storage, from, &id, content, &payload, now_ms());
+                    if placed.is_err() {
+                        self.held_entries.insert(message_id.clone());
+                    }
+                    if let Ok(event) = placed {
                         // We heard from them: our card to their devices that lack it.
                         follow_ups.extend(self.card_for(&account));
                         self.fetch_on_arrival(event.as_ref(), &payload);
@@ -2806,22 +2851,30 @@ impl Task {
                         }
                     }
                 }
+                // Kept, applied or silent: its entry is done — this pass's, or one the core held
+                // behind a session and handed out now. One not kept stays for the server to repeat.
+                if !self.held_entries.contains(&message_id) {
+                    self.cursor.resolve(&message_id);
+                }
             }
 
             Action::CallSignalDecrypted {
                 contact_id,
+                message_id,
                 proto_bytes,
-                ..
             } => {
                 self.call_signal_decrypted(contact_id, proto_bytes);
+                self.cursor.resolve(&message_id);
             }
 
             Action::ControlFrameDecrypted {
                 contact_id,
+                message_id,
                 content_type,
                 body,
-                ..
             } => {
+                // Applied or refused, it is done; one the core held is handed out here.
+                self.cursor.resolve(&message_id);
                 // As their messages are: a blocked contact's receipts, profile and cards are
                 // not applied. A card would hand them a key of ours the block retired.
                 if self.storage.is_blocked(&self.account_of(&contact_id)) {
@@ -2845,6 +2898,7 @@ impl Task {
                 }
             }
 
+            // The entry holds the cursor while the core keeps it (`handle_stream_message`).
             Action::MessageQueuedPendingInit { .. } => {}
 
             // ── Persistence ─────────────────────────────────────────────────────
@@ -2863,14 +2917,10 @@ impl Task {
                     self.save_orchestrator_state();
                 }
             }
-            Action::DuplicateDropped { message_id } => {
-                self.cursor.commit(&self.storage, &message_id)
-            }
+            Action::DuplicateDropped { message_id } => self.cursor.resolve(&message_id),
             // A payload the core cannot parse (or a retired suite): nothing will ever read it, so
             // it is recorded and passed like a duplicate. The core sends the NotifyError beside it.
-            Action::MalformedDropped { message_id } => {
-                self.cursor.commit(&self.storage, &message_id)
-            }
+            Action::MalformedDropped { message_id } => self.cursor.resolve(&message_id),
 
             Action::PersistAck {
                 message_id,
@@ -3463,6 +3513,8 @@ mod tests {
             ..Default::default()
         };
 
+        // Tracked on arrival, as the relay does.
+        task.cursor.track("m1", Some("5000-0"));
         task.handle_envelope(&envelope, Some("5000-0".into())).await;
 
         assert_eq!(
@@ -3964,7 +4016,7 @@ mod block_tests {
     }
 
     async fn hears_text(task: &mut Task, device: &str) -> Vec<IncomingEvent> {
-        task.cursor.note("m1", Some("5000-0".into()));
+        task.cursor.track("m1", Some("5000-0"));
         let mut follow_ups = Vec::new();
         task.dispatch(
             Action::MessageDecrypted {
@@ -4218,5 +4270,267 @@ mod crossing_open_tests {
         task.handle_stream_message(event, context).await;
         assert_eq!(task.storage.get_messages(BOB, 10).unwrap().len(), 1);
         assert!(task.orchestrator.has_active_session(&bob_device));
+    }
+
+    /// A task that knows Bob and holds a certificate to seal with; it trusts the test server's
+    /// key only when `trusted`.
+    fn task_knowing_bob(trusted: bool) -> (Task, Orchestrator, String, Vec<u8>, SigningKey) {
+        let (mut task, _rx) = tests::test_task_sending();
+        task.certificate = Some(crate::grpc::SenderCertificate {
+            bytes: Vec::new(),
+            expires_at: i64::MAX,
+            token_key: Vec::new(),
+        });
+        publish_keys(&mut task.orchestrator);
+        let server = SigningKey::from_bytes(&[9u8; 32]);
+        task.orchestrator.set_trusted_server_keys(if trusted {
+            vec![server.verifying_key().as_bytes().to_vec()]
+        } else {
+            Vec::new()
+        });
+        let (bob, bob_device, bob_identity) = bob();
+        assert!(
+            task.peers
+                .record(&task.storage, BOB, &bob_device, &bob_identity)
+        );
+        task.known_contacts.insert(BOB.into());
+        (task, bob, bob_device, bob_identity, server)
+    }
+
+    fn delivery_from_bob(
+        id: &str,
+        wire: &[u8],
+        server: &SigningKey,
+        bob_device: &str,
+        bob_identity: &[u8],
+        cursor: &str,
+    ) -> (IncomingEvent, StreamMessageContext) {
+        (
+            IncomingEvent::MessageReceived {
+                message_id: id.into(),
+                from: bob_device.into(),
+                data: wire.to_vec(),
+                sender_certificate: Some(Box::new(certificate(server, bob_identity, bob_device))),
+                content_type: 0,
+                envelope_session: None,
+            },
+            StreamMessageContext {
+                contact_id: BOB.into(),
+                message_id: id.into(),
+                stream_cursor: Some(cursor.into()),
+            },
+        )
+    }
+
+    /// Bob writes twice to a device that has never heard from him.
+    fn bob_writes_twice(task: &mut Task, bob: &mut Orchestrator) -> (Vec<u8>, Vec<u8>) {
+        let (x3dh, kyber) = bundle_of(&mut task.orchestrator);
+        bob.init_session_with_bundle("device-a", x3dh, kyber, false)
+            .expect("bob opens");
+        let first = bob
+            .encrypt_bytes_for("device-a", &crate::knst::encode_text("hello", MESSAGE))
+            .expect("bob writes");
+        let second = bob
+            .encrypt_bytes_for(
+                "device-a",
+                &crate::knst::encode_text("again", "0b9e7f12-3c4d-4e5f-8a6b-7c8d9e0f1a2b"),
+            )
+            .expect("bob writes again");
+        (first, second)
+    }
+
+    /// Bob's first message arrives before this device trusts the key that signed his
+    /// certificate, and the core keeps it (`awaiting_server_key`). Until 2026-11-11 the cursor of
+    /// whatever finished next — here a receipt behind it — was stored, the server trimmed up to
+    /// it, and Bob's message lived only in memory: a restart lost it with no error. Now the cursor
+    /// waits. Once the key is trusted, his next message opens the session, the core hands out
+    /// both, and the cursor moves past all three.
+    #[tokio::test]
+    async fn a_message_the_core_holds_holds_the_cursor() {
+        let (mut task, mut bob, bob_device, bob_identity, server) = task_knowing_bob(false);
+        let (first, second) = bob_writes_twice(&mut task, &mut bob);
+
+        // Bob's message, then a receipt, each tracked as the relay tracks them on arrival.
+        task.cursor.track("bob-m0", Some("1000-0"));
+        task.cursor.track_resolved(Some("1001-0"));
+        let (event, context) = delivery_from_bob(
+            "bob-m0",
+            &first,
+            &server,
+            &bob_device,
+            &bob_identity,
+            "1000-0",
+        );
+        task.handle_stream_message(event, context).await;
+        assert!(
+            task.storage.get_messages(BOB, 10).unwrap().is_empty(),
+            "the core holds it until the server's key is trusted"
+        );
+        assert!(task.orchestrator.pending_message_count(&bob_device) > 0);
+        assert_eq!(
+            task.storage.load_stream_cursor().unwrap(),
+            None,
+            "nothing may be trimmed while only memory holds it"
+        );
+
+        task.orchestrator
+            .set_trusted_server_keys(vec![server.verifying_key().as_bytes().to_vec()]);
+        task.cursor.track("bob-m1", Some("1002-0"));
+        let (event, context) = delivery_from_bob(
+            "bob-m1",
+            &second,
+            &server,
+            &bob_device,
+            &bob_identity,
+            "1002-0",
+        );
+        task.handle_stream_message(event, context).await;
+        assert_eq!(task.storage.get_messages(BOB, 10).unwrap().len(), 2);
+        assert_eq!(
+            task.storage.load_stream_cursor().unwrap().as_deref(),
+            Some("1002-0"),
+            "the held message was handed out in the next pass and released there"
+        );
+    }
+
+    /// The same, but the key that is then trusted is not the one that signed Bob's certificates:
+    /// the core gives both messages up. Nothing will read them, so they stop holding the cursor.
+    #[tokio::test]
+    async fn messages_the_core_gives_up_let_the_cursor_pass() {
+        let (mut task, mut bob, bob_device, bob_identity, server) = task_knowing_bob(false);
+        let (first, second) = bob_writes_twice(&mut task, &mut bob);
+
+        task.cursor.track("bob-m0", Some("1000-0"));
+        let (event, context) = delivery_from_bob(
+            "bob-m0",
+            &first,
+            &server,
+            &bob_device,
+            &bob_identity,
+            "1000-0",
+        );
+        task.handle_stream_message(event, context).await;
+        assert_eq!(task.storage.load_stream_cursor().unwrap(), None);
+
+        let other = SigningKey::from_bytes(&[5u8; 32]);
+        task.orchestrator
+            .set_trusted_server_keys(vec![other.verifying_key().as_bytes().to_vec()]);
+        task.cursor.track("bob-m1", Some("1002-0"));
+        let (event, context) = delivery_from_bob(
+            "bob-m1",
+            &second,
+            &server,
+            &bob_device,
+            &bob_identity,
+            "1002-0",
+        );
+        task.handle_stream_message(event, context).await;
+        assert!(task.storage.get_messages(BOB, 10).unwrap().is_empty());
+        assert_eq!(task.orchestrator.pending_message_count(&bob_device), 0);
+        assert_eq!(
+            task.storage.load_stream_cursor().unwrap().as_deref(),
+            Some("1002-0")
+        );
+    }
+
+    /// A message read in its own pass moves the cursor past it; the same delivery on the next
+    /// connection is the core's duplicate and passes too, rather than holding the cursor.
+    #[tokio::test]
+    async fn a_read_message_and_its_repeat_both_let_the_cursor_pass() {
+        let (mut task, mut bob, bob_device, bob_identity, server) = task_knowing_bob(true);
+        let (x3dh, kyber) = bundle_of(&mut task.orchestrator);
+        bob.init_session_with_bundle("device-a", x3dh, kyber, false)
+            .expect("bob opens");
+        let wire = bob
+            .encrypt_bytes_for("device-a", &crate::knst::encode_text("hello", MESSAGE))
+            .expect("bob writes");
+
+        task.cursor.track("bob-m0", Some("1000-0"));
+        let (event, context) = delivery_from_bob(
+            "bob-m0",
+            &wire,
+            &server,
+            &bob_device,
+            &bob_identity,
+            "1000-0",
+        );
+        task.handle_stream_message(event, context).await;
+        assert_eq!(task.storage.get_messages(BOB, 10).unwrap().len(), 1);
+        assert_eq!(
+            task.storage.load_stream_cursor().unwrap().as_deref(),
+            Some("1000-0")
+        );
+
+        task.cursor.reset();
+        task.cursor.track("bob-m0", Some("1000-0"));
+        task.cursor.track("later", Some("1002-0"));
+        let (event, context) = delivery_from_bob(
+            "bob-m0",
+            &wire,
+            &server,
+            &bob_device,
+            &bob_identity,
+            "1000-0",
+        );
+        task.handle_stream_message(event, context).await;
+        assert_eq!(task.storage.get_messages(BOB, 10).unwrap().len(), 1);
+        task.cursor.resolve("later");
+        assert_eq!(
+            task.storage.load_stream_cursor().unwrap().as_deref(),
+            Some("1002-0"),
+            "the repeat did not hold the cursor"
+        );
+    }
+
+    /// A message nobody can read — no handshake header, not readable on any state — is answered
+    /// with a decryption error and nothing else names it. It is done with, and lets the cursor
+    /// pass; held, it would stop the cursor on every connection, as one head did on iOS for three
+    /// weeks in August.
+    #[tokio::test]
+    async fn an_unreadable_message_lets_the_cursor_pass() {
+        let (mut task, mut bob, bob_device, bob_identity, server) = task_knowing_bob(true);
+        let (first, _) = bob_writes_twice(&mut task, &mut bob);
+        let (event, context) = delivery_from_bob(
+            "bob-m0",
+            &first,
+            &server,
+            &bob_device,
+            &bob_identity,
+            "1000-0",
+        );
+        task.handle_stream_message(event, context).await;
+        assert_eq!(task.storage.get_messages(BOB, 10).unwrap().len(), 1);
+
+        // We answer, so Bob's next message carries no handshake header.
+        let reply = task
+            .orchestrator
+            .encrypt_bytes_for(&bob_device, &crate::knst::encode_text("hi", MESSAGE))
+            .expect("we answer");
+        bob.decrypt_bytes_for("device-a", &reply)
+            .expect("bob reads the answer");
+        let mut broken = bob
+            .encrypt_bytes_for(
+                "device-a",
+                &crate::knst::encode_text("lost", "1d2e3f40-5a6b-4c7d-8e9f-0a1b2c3d4e5f"),
+            )
+            .expect("bob writes");
+        let last = broken.len() - 1;
+        broken[last] ^= 0x01;
+
+        task.cursor.track("bob-m1", Some("1002-0"));
+        let (event, context) = delivery_from_bob(
+            "bob-m1",
+            &broken,
+            &server,
+            &bob_device,
+            &bob_identity,
+            "1002-0",
+        );
+        task.handle_stream_message(event, context).await;
+        assert_eq!(task.storage.get_messages(BOB, 10).unwrap().len(), 1);
+        assert_eq!(
+            task.storage.load_stream_cursor().unwrap().as_deref(),
+            Some("1002-0")
+        );
     }
 }

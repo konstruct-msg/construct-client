@@ -3,7 +3,6 @@
 //! Screens never see h3; they send [`StreamCmd`] and receive [`StreamEvent`].
 //! This worker reconnects the bidi stream on the shared [`GrpcClient`].
 
-use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -20,6 +19,7 @@ use crate::proto::services::v1::{
     Heartbeat, MessageStreamRequest, MessageStreamResponse, SubscribeRequest,
     message_stream_request, message_stream_response,
 };
+use construct_core::rule_state::stream_cursor;
 
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(25);
 
@@ -69,20 +69,36 @@ pub enum StreamEvent {
     MailboxGap(crate::mailbox_gap::Report),
 }
 
-/// Watermark shared by the stream worker (reconnect subscribe) and the
-/// orchestrator (advance after durable persist).
-#[derive(Clone, Default)]
+/// The stream resume cursor: shared by the relay (which tracks each frame in the order it
+/// arrives), the orchestrator (which resolves it once handled) and the worker (which resumes from
+/// the stored one). The rule is the core's (`construct_rules::stream_cursor`, as iOS and Android):
+/// the cursor never moves past an entry that has not reached a durable end, since the server
+/// trims its queue up to it. Until 2026-11-11 this kept a map from message to cursor and stored
+/// the cursor of whichever message finished last — past one still waiting for its session.
+#[derive(Clone)]
 pub struct CursorTracker {
+    storage: LocalStore,
     committed: Arc<Mutex<Option<String>>>,
-    pending: Arc<Mutex<HashMap<String, String>>>,
+    entries: Arc<Mutex<stream_cursor::Tracker>>,
+}
+
+/// The id a stream entry is tracked under: the envelope's message id, or its cursor when it has
+/// none (a group message). The relay and the orchestrator name an entry the same way.
+pub fn stream_entry_id(envelope: &Envelope, stream_cursor: Option<&str>) -> Option<String> {
+    let id = match &envelope.message_id_type {
+        Some(MessageIdType::MessageId(id)) if !id.is_empty() => id.as_str(),
+        _ => stream_cursor?,
+    };
+    (!id.is_empty()).then(|| id.to_string())
 }
 
 impl CursorTracker {
     pub fn load(storage: &LocalStore) -> Self {
         let committed = storage.load_stream_cursor().ok().flatten();
         Self {
+            storage: storage.clone(),
             committed: Arc::new(Mutex::new(committed)),
-            pending: Arc::new(Mutex::new(HashMap::new())),
+            entries: Arc::default(),
         }
     }
 
@@ -90,34 +106,42 @@ impl CursorTracker {
         self.committed.lock().map(|g| g.clone()).ok().flatten()
     }
 
-    pub fn note(&self, message_id: &str, cursor: Option<String>) {
-        let Some(cursor) = cursor.filter(|c| !c.is_empty()) else {
-            return;
-        };
-        if let Ok(mut pending) = self.pending.lock() {
-            pending.insert(message_id.to_string(), cursor);
+    fn entries(&self) -> std::sync::MutexGuard<'_, stream_cursor::Tracker> {
+        self.entries.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// A new connection: what had not moved the cursor is delivered again and tracked again.
+    pub fn reset(&self) {
+        self.entries().reset();
+    }
+
+    /// A frame that carries something to handle, in the order it arrived.
+    pub fn track(&self, entry_id: &str, cursor: Option<&str>) {
+        if let Some(cursor) = cursor {
+            self.entries().track(entry_id, cursor, now_ms());
         }
     }
 
-    pub fn commit(&self, storage: &LocalStore, message_id: &str) {
-        let cursor = self
-            .pending
-            .lock()
-            .ok()
-            .and_then(|mut pending| pending.remove(message_id));
-        self.persist(storage, cursor);
-    }
-
-    #[allow(dead_code)]
-    pub fn commit_direct(&self, storage: &LocalStore, cursor: Option<String>) {
-        self.persist(storage, cursor.filter(|c| !c.is_empty()));
-    }
-
-    fn persist(&self, storage: &LocalStore, cursor: Option<String>) {
+    /// A frame with nothing to keep (an ack): in line, already resolved.
+    pub fn track_resolved(&self, cursor: Option<&str>) {
         let Some(cursor) = cursor else {
             return;
         };
-        if storage.save_stream_cursor(&cursor).unwrap_or(false)
+        let moved = self.entries().track_resolved(cursor, now_ms());
+        self.persist(moved);
+    }
+
+    /// A tracked entry reached its end: kept, applied, or given up.
+    pub fn resolve(&self, entry_id: &str) {
+        let moved = self.entries().resolve(entry_id);
+        self.persist(moved);
+    }
+
+    fn persist(&self, cursor: Option<String>) {
+        let Some(cursor) = cursor else {
+            return;
+        };
+        if self.storage.save_stream_cursor(&cursor).unwrap_or(false)
             && let Ok(mut committed) = self.committed.lock()
         {
             *committed = Some(cursor);
@@ -168,6 +192,8 @@ async fn run_worker(
         if attempt > 0 {
             client.invalidate_h3().await;
         }
+        // A new connection resumes from the stored cursor; what had not moved it comes again.
+        cursor.reset();
         let since = cursor.committed();
         let disruptions = crate::grpc::route::disruptions();
         let (frame_tx, mut frame_rx) = mpsc::unbounded_channel();
