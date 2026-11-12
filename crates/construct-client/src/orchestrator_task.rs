@@ -43,6 +43,21 @@ use crate::streaming::CursorTracker;
 /// How long an account's device set is trusted before it is asked again.
 const DEVICES_RECHECK: std::time::Duration = std::time::Duration::from_secs(10 * 60);
 
+/// Reuse only a successful directory read. Own-account reads may have no *other*
+/// devices; remote empty sets retain the previous retry behavior. Completion stamps
+/// for empty own sets are recorded only when active_devices explicitly names self alone.
+fn reuse_device_directory(
+    own_account: bool,
+    has_devices: bool,
+    missing_session: bool,
+    checked: Option<tokio::time::Instant>,
+    now: tokio::time::Instant,
+) -> bool {
+    (has_devices || own_account)
+        && !missing_session
+        && checked.is_some_and(|at| now.duration_since(at) < DEVICES_RECHECK)
+}
+
 /// How long a device being linked has to publish its keys before it is vouched for, and how
 /// often the directory is asked (iOS `DeviceCertificateIssuer`).
 const VOUCH_DEADLINE: std::time::Duration = std::time::Duration::from_secs(15 * 60);
@@ -58,6 +73,19 @@ const CERTIFICATE_REFRESH_AHEAD_SECS: i64 = 5 * 60;
 pub struct OrchestratorHandle {
     pub tx: mpsc::UnboundedSender<IncomingEvent>,
     cmd_tx: mpsc::UnboundedSender<OrchestratorCommand>,
+}
+
+/// One local linking operation. Drop invalidates again on success, failure, cancellation
+/// or a lost response; while alive an old self-only snapshot cannot hide a new sibling.
+#[must_use = "keep the guard alive until the linking operation ends"]
+pub(crate) struct OwnDeviceChange {
+    commands: mpsc::UnboundedSender<OrchestratorCommand>,
+}
+
+impl Drop for OwnDeviceChange {
+    fn drop(&mut self) {
+        let _ = self.commands.send(OrchestratorCommand::OwnDevicesChanged);
+    }
 }
 
 impl OrchestratorHandle {
@@ -121,6 +149,15 @@ impl OrchestratorHandle {
             envelope,
             stream_cursor,
         });
+    }
+
+    /// Cover the entire link attempt, including legacy links with no fingerprint and
+    /// uncertain outcomes. This is RPC execution bookkeeping, not a new cache timeout.
+    pub(crate) fn changing_own_devices(&self) -> OwnDeviceChange {
+        let _ = self.cmd_tx.send(OrchestratorCommand::OwnDevicesChanging);
+        OwnDeviceChange {
+            commands: self.cmd_tx.clone(),
+        }
     }
 
     /// Vouch for `device_id`, a device just linked to this account, once the directory serves
@@ -335,6 +372,10 @@ enum OrchestratorCommand {
         content_type: u8,
         payload: Vec<u8>,
     },
+    /// An own-account link is in flight; never trust an old empty snapshot meanwhile.
+    OwnDevicesChanging,
+    /// One link attempt ended (including failure/cancellation); invalidate again.
+    OwnDevicesChanged,
     /// Vouch for a device being linked to this account once the directory serves its keys.
     Vouch {
         device_id: String,
@@ -586,6 +627,7 @@ struct Task {
     pending_certificates: HashMap<String, (String, Vec<u8>)>,
     /// When each account's device set was last asked of the server.
     devices_checked: HashMap<String, tokio::time::Instant>,
+    own_device_changes: usize,
     /// The client that never holds a token: avatars a profile names are fetched on it.
     anonymous: Option<GrpcClient>,
     /// Where attachments fetched on arrival go.
@@ -645,6 +687,7 @@ impl Task {
             certificate: None,
             pending_certificates: HashMap::new(),
             devices_checked: HashMap::new(),
+            own_device_changes: 0,
             anonymous: None,
             media: None,
             wallet,
@@ -985,15 +1028,32 @@ impl Task {
                 content_type,
                 payload,
             } => self.send_control(peer, content_type, payload).await,
+            OrchestratorCommand::OwnDevicesChanging => {
+                self.own_device_changes += 1;
+                self.devices_checked.remove(&self.identity.user_id);
+            }
+            OrchestratorCommand::OwnDevicesChanged => {
+                self.own_device_changes = self
+                    .own_device_changes
+                    .checked_sub(1)
+                    .expect("own-device changes are paired by the operation guard");
+                self.devices_checked.remove(&self.identity.user_id);
+            }
             OrchestratorCommand::Vouch {
                 device_id,
                 evidence,
-            } => self.await_subject_keys(device_id, evidence),
+            } => {
+                self.devices_checked.remove(&self.identity.user_id);
+                self.await_subject_keys(device_id, evidence);
+            }
             OrchestratorCommand::VouchKeys {
                 device_id,
                 evidence,
                 keys,
-            } => self.vouch(device_id, &evidence, &keys),
+            } => {
+                self.devices_checked.remove(&self.identity.user_id);
+                self.vouch(device_id, &evidence, &keys);
+            }
             OrchestratorCommand::TokensIssued(result) => self.tokens_issued(result),
             OrchestratorCommand::SealedSettled {
                 device,
@@ -1666,18 +1726,24 @@ impl Task {
         let missing = known.iter().any(|d| {
             *d != self.identity.device_id && !self.orchestrator.has_session_for_sending(d)
         });
-        let stale = self
-            .devices_checked
-            .get(account)
-            .is_none_or(|at| at.elapsed() >= DEVICES_RECHECK);
-        if !known.is_empty() && !missing && !stale {
+        if !(account == self.identity.user_id && self.own_device_changes != 0)
+            && reuse_device_directory(
+                account == self.identity.user_id,
+                !known.is_empty(),
+                missing,
+                self.devices_checked.get(account).copied(),
+                tokio::time::Instant::now(),
+            )
+        {
             return Ok(Vec::new());
         }
-        self.devices_checked
-            .insert(account.to_string(), tokio::time::Instant::now());
         let listed = crate::grpc::get_pre_key_bundles(&self.grpc, account, Vec::new(), false)
             .await
             .map_err(|e| format!("GetPreKeyBundles: {e}"))?;
+        // An empty active_devices means unknown on older servers, not "only self".
+        // An active sibling without published/valid keys must keep prompting a read.
+        let self_only = account == self.identity.user_id
+            && listed.active_devices.as_slice() == [self.identity.device_id.as_str()];
         let listed_ids: Vec<String> = listed.bundles.iter().map(|b| b.device_id.clone()).collect();
         // Judged against the devices trusted before this answer is recorded below. Not our own
         // account, and not one seen for the first time (nothing to vouch from).
@@ -1710,9 +1776,14 @@ impl Task {
         if !dropped.is_empty() {
             tracing::info!(%account, ?dropped, "devices no longer active");
         }
-        let need: Vec<String> = self
-            .peers
-            .devices_of(account)
+        let devices = self.peers.devices_of(account);
+        if self_only || !devices.is_empty() {
+            self.devices_checked
+                .insert(account.to_string(), tokio::time::Instant::now());
+        } else {
+            self.devices_checked.remove(account);
+        }
+        let need: Vec<String> = devices
             .into_iter()
             .filter(|d| {
                 *d != self.identity.device_id && !self.orchestrator.has_session_for_sending(d)
@@ -3235,6 +3306,9 @@ fn contact_updated(
         ));
     }
 }
+
+#[cfg(test)]
+mod directory_tests;
 
 #[cfg(test)]
 mod tests {
