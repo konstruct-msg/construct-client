@@ -53,10 +53,20 @@ fn a_window_is_seven_days_of_the_cores_tags() {
             "the tag a contact derives for us"
         );
     }
-    assert!(should_publish(None, 100));
-    assert!(!should_publish(Some(100), 100));
-    assert!(should_publish(Some(99), 100));
-    assert!(should_publish(Some(101), 100), "a clock that went back");
+    let m = |epoch| marker(&state, "me", epoch);
+    assert!(should_publish(None, &m(100)));
+    assert!(!should_publish(Some(&m(100)), &m(100)));
+    assert!(should_publish(Some(&m(99)), &m(100)));
+    assert!(
+        should_publish(Some(&m(101)), &m(100)),
+        "a clock that went back"
+    );
+    // The marker names the key and the account too (todo 300).
+    assert!(should_publish(
+        Some(&m(100)),
+        &marker(&key(2, 9), "me", 100)
+    ));
+    assert!(should_publish(Some(&m(100)), &marker(&state, "other", 100)));
 }
 
 /// A changed key goes out again: to our devices, and to the server.
@@ -68,13 +78,13 @@ fn adopting_a_key_forgets_who_had_the_old_one() {
     assert!(store.adopt(&key(1, 1)));
     store.mark_sent(&["d1".into(), "d2".into()]);
     store.mark_sent(&["d2".into()]);
-    store.set_published_epoch(100);
+    assert!(store.mark_published(&key(1, 1), "me", 100));
     assert_eq!(store.sent_to(), ["d1", "d2"]);
-    assert_eq!(store.published_epoch(), Some(100));
+    assert_eq!(store.published(), Some(marker(&key(1, 1), "me", 100)));
     assert!(store.adopt(&key(2, 2)));
     assert_eq!(store.own(), Held::Key(key(2, 2)));
     assert!(store.sent_to().is_empty());
-    assert_eq!(store.published_epoch(), None);
+    assert_eq!(store.published(), None);
 }
 
 /// Our card carries the key and its generation; a card with no key is no key.
@@ -190,11 +200,23 @@ fn the_server_opens_the_tag_the_contact_published() {
 /// A card names a key the server holds: published, and still inside the window.
 #[test]
 fn the_server_holds_a_key_for_a_week_from_its_publish() {
-    assert!(!server_holds(None, 100));
-    assert!(server_holds(Some(100), 100));
-    assert!(server_holds(Some(100), 106));
-    assert!(!server_holds(Some(100), 107), "the window ran out");
-    assert!(!server_holds(Some(101), 100), "a marker from the future");
+    let k = key(1, 1);
+    let at = |epoch| Some(marker(&k, "me", epoch));
+    assert!(!server_holds(None, &k, "me", 100));
+    assert!(server_holds(at(100).as_ref(), &k, "me", 100));
+    assert!(server_holds(at(100).as_ref(), &k, "me", 106));
+    assert!(
+        !server_holds(at(100).as_ref(), &k, "me", 107),
+        "the window ran out"
+    );
+    assert!(
+        !server_holds(at(101).as_ref(), &k, "me", 100),
+        "a marker from the future"
+    );
+    assert!(
+        !server_holds(at(100).as_ref(), &key(2, 2), "me", 100),
+        "another key"
+    );
 }
 
 #[test]
@@ -216,11 +238,11 @@ fn a_publish_marks_only_the_key_still_ours() {
     let local = crate::local_store::LocalStore::open_in_memory().unwrap();
     let store = Store(&local);
     store.adopt(&key(1, 1));
-    assert!(store.mark_published(&key(1, 1), 100));
-    assert_eq!(store.published_epoch(), Some(100));
+    assert!(store.mark_published(&key(1, 1), "me", 100));
+    assert_eq!(store.published().map(|p| p.epoch), Some(100));
     store.adopt(&key(2, 2));
-    assert!(!store.mark_published(&key(1, 1), 100));
-    assert_eq!(store.published_epoch(), None);
+    assert!(!store.mark_published(&key(1, 1), "me", 100));
+    assert_eq!(store.published(), None);
 }
 
 /// The lazy card waits for the publish of the current key.
@@ -228,13 +250,35 @@ fn a_publish_marks_only_the_key_still_ours() {
 fn a_card_waits_for_the_publish() {
     let local = crate::local_store::LocalStore::open_in_memory().unwrap();
     let store = Store(&local);
-    assert_eq!(store.card_key(100), None, "no key");
+    assert_eq!(store.card_key("me", 100), None, "no key");
     store.adopt(&key(0, 1));
-    store.set_published_epoch(100);
-    assert_eq!(store.card_key(100), None, "a key of no generation");
+    assert!(store.mark_published(&key(0, 1), "me", 100));
+    assert_eq!(store.card_key("me", 100), None, "a key of no generation");
     store.adopt(&key(2, 2));
-    assert_eq!(store.card_key(100), None, "not published since it changed");
-    store.set_published_epoch(100);
-    assert_eq!(store.card_key(100), Some(key(2, 2)));
-    assert_eq!(store.card_key(107), None, "its window ran out");
+    assert_eq!(
+        store.card_key("me", 100),
+        None,
+        "not published since it changed"
+    );
+    assert!(store.mark_published(&key(2, 2), "me", 100));
+    assert_eq!(store.card_key("me", 100), Some(key(2, 2)));
+    assert_eq!(store.card_key("me", 107), None, "its window ran out");
+    assert_eq!(
+        store.card_key("other", 100),
+        None,
+        "another account's marker"
+    );
+}
+
+/// The epoch-only marker from before 2026-11-12 is not read — it cannot say which key — and goes
+/// on the first look: one publish. Mutation that reddens it: read it as the marker, or keep it.
+#[test]
+fn the_epoch_only_marker_is_dropped() {
+    let local = crate::local_store::LocalStore::open_in_memory().unwrap();
+    local
+        .secure_save("intake_published_epoch", &100u64.to_be_bytes())
+        .unwrap();
+    let store = Store(&local);
+    assert_eq!(store.published(), None);
+    assert_eq!(local.secure_load("intake_published_epoch").unwrap(), None);
 }
