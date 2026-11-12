@@ -2275,10 +2275,14 @@ impl Task {
     /// tokens, not delivery: they pay, as before.
     async fn publish_intake(&mut self) {
         let epoch = crate::intake::epoch_now();
-        if !crate::intake::should_publish(
-            crate::intake::Store(&self.storage).published_epoch(),
-            epoch,
-        ) {
+        // Asked without the network: the key this device holds names what is due.
+        let store = crate::intake::Store(&self.storage);
+        if let crate::intake::Held::Key(held) = store.own()
+            && !crate::intake::should_publish(
+                store.published().as_ref(),
+                &crate::intake::marker(&held, &self.identity.user_id, epoch),
+            )
+        {
             return;
         }
         let Some(own) = self.own_intake_key().await else {
@@ -2306,7 +2310,11 @@ impl Task {
         match crate::grpc::publish_intake_tags(&self.grpc, &tags, own.generation).await {
             Ok((_, current)) if current > own.generation => Published::Stale { current },
             Ok((accepted, _)) => {
-                if !crate::intake::Store(&self.storage).mark_published(own, epoch) {
+                if !crate::intake::Store(&self.storage).mark_published(
+                    own,
+                    &self.identity.user_id,
+                    epoch,
+                ) {
                     tracing::info!("intake tags published for a key since replaced — not marked");
                     return Published::Failed;
                 }
@@ -2346,7 +2354,11 @@ impl Task {
         let mut published = self.publish_key(&key, epoch).await;
         // A sibling rotated in the same minute: once above it — an address, not a retry budget.
         if let Published::Stale { current } = published {
-            let Some(again) = self.adopt_minted(current) else {
+            // Once, and only above what was minted (the core's rule).
+            let Some(again) =
+                construct_core::rule_state::intake::re_mint_above(key.generation, current, false)
+                    .and_then(|above| self.adopt_minted(above))
+            else {
                 return;
             };
             key = again;
@@ -2359,17 +2371,14 @@ impl Task {
             );
         }
         self.offer_own_intake_key(&key).await;
-        let contacts = self.sweep_targets(removed);
+        let schedule = self.card_schedule(removed);
         tracing::info!(
             generation = key.generation,
-            contacts = contacts.len(),
+            contacts = schedule.len(),
             "intake key rotated — cards spread over the hour"
         );
-        for account in contacts {
-            let delay = std::time::Duration::from_secs(rand::Rng::gen_range(
-                &mut rand::thread_rng(),
-                0..crate::intake::SWEEP_SPREAD.as_secs(),
-            ));
+        for (account, delay_ms) in schedule {
+            let delay = std::time::Duration::from_millis(delay_ms);
             let back = self.self_cmd.clone();
             let generation = key.generation;
             tokio::spawn(async move {
@@ -2382,15 +2391,25 @@ impl Task {
         }
     }
 
-    /// Who is scheduled a card after a rotation: every contact but the one dropped, the blocked
-    /// and ourselves. Blocking is asked again at each send (`may_get_our_card`); this is only who
-    /// is scheduled.
-    fn sweep_targets(&self, removed: &str) -> Vec<String> {
-        self.known_contacts
+    /// Who is scheduled a card after a rotation, and when: every contact but the one dropped, the
+    /// blocked and ourselves, each at its own moment within the hour (the core's schedule, drawn
+    /// from 32 random bytes). Blocking is asked again at each send (`may_get_our_card`); this is
+    /// only who is scheduled.
+    fn card_schedule(&self, removed: &str) -> Vec<(String, u64)> {
+        let contacts: Vec<String> = self.known_contacts.iter().cloned().collect();
+        let blocked: Vec<String> = contacts
             .iter()
-            .filter(|a| *a != removed && self.may_get_our_card(a))
+            .filter(|a| self.storage.is_blocked(a))
             .cloned()
-            .collect()
+            .collect();
+        let seed: [u8; 32] = rand::random();
+        construct_core::rule_state::intake::card_schedule(
+            &contacts,
+            removed,
+            &blocked,
+            &self.identity.user_id,
+            &seed,
+        )
     }
 
     /// Whether `account` is given our card: not us, and not someone the person blocked — a card
@@ -2532,7 +2551,7 @@ impl Task {
         let store = crate::intake::Store(&self.storage);
         // A card names only a key the server holds: one before its publish lands would be refused
         // (NOT_ACCEPTED) and rested for the day. It goes with the first message after.
-        let Some(own) = store.card_key(crate::intake::epoch_now()) else {
+        let Some(own) = store.card_key(&self.identity.user_id, crate::intake::epoch_now()) else {
             return Vec::new();
         };
         let sent = store.sent_to();
@@ -3927,7 +3946,11 @@ mod intake_tests {
         let store = crate::intake::Store(&task.storage);
         store.adopt(&their_key(3));
         store.mark_sent(&["d1".into()]);
-        store.set_published_epoch(crate::intake::epoch_now());
+        assert!(store.mark_published(
+            &their_key(3),
+            &task.identity.user_id,
+            crate::intake::epoch_now()
+        ));
         assert!(task.rotated_key(None).is_some());
         let store = crate::intake::Store(&task.storage);
         let crate::intake::Held::Key(now) = store.own() else {
@@ -3936,8 +3959,11 @@ mod intake_tests {
         assert_eq!(now.generation, 4);
         assert_ne!(now.key, their_key(3).key);
         assert!(store.sent_to().is_empty());
-        assert_eq!(store.published_epoch(), None, "the publish did not land");
-        assert_eq!(store.card_key(crate::intake::epoch_now()), None);
+        assert_eq!(store.published(), None, "the publish did not land");
+        assert_eq!(
+            store.card_key(&task.identity.user_id, crate::intake::epoch_now()),
+            None
+        );
     }
 
     /// A contact's card is kept by their account; one under our own id outside SENDER_SYNC is not.
@@ -4100,13 +4126,30 @@ mod block_tests {
         assert!(!task.may_get_our_card(BOB));
         assert!(task.may_get_our_card(CAROL));
         assert!(!task.may_get_our_card(&own));
-        assert_eq!(task.sweep_targets("someone-removed"), [CAROL]);
-        assert_eq!(task.sweep_targets(CAROL), Vec::<String>::new());
+        let who = |task: &Task, removed: &str| {
+            let mut who: Vec<String> = task
+                .card_schedule(removed)
+                .into_iter()
+                .map(|(a, _)| a)
+                .collect();
+            who.sort();
+            who
+        };
+        assert_eq!(who(&task, "someone-removed"), [CAROL]);
+        assert_eq!(who(&task, CAROL), Vec::<String>::new());
+        assert!(
+            task.card_schedule("someone-removed")
+                .iter()
+                .all(|(_, d)| *d < 3_600_000),
+            "within the hour"
+        );
 
         task.storage.set_blocked(BOB, false).unwrap();
-        let mut all = task.sweep_targets(CAROL);
-        all.sort();
-        assert_eq!(all, [BOB], "unblocked, they are scheduled again");
+        assert_eq!(
+            who(&task, CAROL),
+            [BOB],
+            "unblocked, they are scheduled again"
+        );
     }
 }
 

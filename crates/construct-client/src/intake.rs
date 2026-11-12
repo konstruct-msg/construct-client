@@ -13,44 +13,36 @@
 //! goes to each of their devices once (when we first hear from or write to it), and again after
 //! our key changes.
 //!
-//! The rule two clients must compute alike — which of two keys to keep, a new generation — is the
-//! core's (`construct_core::intake`); what is here is when to ask and what to keep.
+//! The rules every client must compute alike are the core's: which of two keys to keep and a new
+//! generation (`construct_core::intake`), and since 2026-11-12 the decisions — when to publish,
+//! whether the server holds our key, what to do with our own, a rotation's schedule, the verdict,
+//! the key record (construct-rules `intake`, todo 300). What is here is when to ask and what to keep.
 
 use construct_core::intake::{IntakeKeyState, intake_epoch, intake_tag};
 
-/// Epochs published from today: a device silent for a week still receives tag-paid traffic.
-pub const WINDOW: u64 = 7;
-/// How often a running process asks whether to publish; the RPC goes once an epoch.
-pub const RECHECK: std::time::Duration = std::time::Duration::from_secs(3600);
-/// After a rotation each contact's card goes at its own random moment within this: one envelope
-/// each, never a burst the server could line up with the publish.
-pub const SWEEP_SPREAD: std::time::Duration = std::time::Duration::from_secs(3600);
+use construct_core::rule_state::intake as rule;
+pub use construct_core::rule_state::intake::Published;
+
+/// How often a running process asks whether to publish; the RPC goes once an epoch, key and
+/// account (the core's `RECHECK_MS`).
+pub const RECHECK: std::time::Duration = std::time::Duration::from_millis(rule::RECHECK_MS);
 
 const OWN_KEY: &str = "intake_own_key";
-const PUBLISHED_EPOCH: &str = "intake_published_epoch";
+/// What the last publish covered: account, epoch and key, the core's CFE (`IntakePublished`).
+const PUBLISHED: &str = "intake_published.v2";
+/// Until 2026-11-12 the epoch alone. Not read — it cannot say which key — and dropped: one publish.
+const LEGACY_PUBLISHED_EPOCH: &str = "intake_published_epoch";
 const SENT_TO: &str = "intake_sent_to";
 const PEER_KEY: &str = "intake_peer_";
 
 /// A key as kept: the generation (big-endian) then the 32-byte key, as iOS keeps it
 /// (`IntakeKeyRecord`); a bare 32-byte key is generation 0, a per-device key from before.
 pub fn encode(state: &IntakeKeyState) -> Vec<u8> {
-    let mut out = state.generation.to_be_bytes().to_vec();
-    out.extend_from_slice(&state.key);
-    out
+    rule::encode_key_record(state.generation, &state.key)
 }
 
 pub fn decode(bytes: &[u8]) -> Option<IntakeKeyState> {
-    match bytes.len() {
-        32 => Some(IntakeKeyState {
-            generation: 0,
-            key: bytes.to_vec(),
-        }),
-        36 => Some(IntakeKeyState {
-            generation: u32::from_be_bytes(bytes[..4].try_into().ok()?),
-            key: bytes[4..].to_vec(),
-        }),
-        _ => None,
-    }
+    rule::decode_key_record(bytes).map(|(generation, key)| IntakeKeyState { generation, key })
 }
 
 /// What reading our key from the store said.
@@ -80,47 +72,65 @@ pub enum Next {
 }
 
 pub fn next(held: Option<&IntakeKeyState>, server_generation: u32, server_live: bool) -> Next {
-    if let Some(held) = held
-        && held.generation > 0
-    {
-        return Next::Use(held.clone());
+    // The core's decision (construct-rules `intake::own_key`); this attaches the held key.
+    match rule::own_key(held.map(|k| k.generation), server_generation, server_live) {
+        rule::OwnKey::Use => held.map_or(
+            Next::Mint {
+                above: server_generation,
+            },
+            |k| Next::Use(k.clone()),
+        ),
+        rule::OwnKey::Promote => held.map_or(
+            Next::Mint {
+                above: server_generation,
+            },
+            |k| {
+                Next::Promote(IntakeKeyState {
+                    generation: 1,
+                    key: k.key.clone(),
+                })
+            },
+        ),
+        rule::OwnKey::Mint { above } => Next::Mint { above },
+        rule::OwnKey::Wait => Next::Wait,
     }
-    let live = server_generation > 0 && server_live;
-    match held {
-        Some(held) if server_generation == 0 => Next::Promote(IntakeKeyState {
-            generation: 1,
-            key: held.key.clone(),
-        }),
-        _ if live => Next::Wait,
-        _ => Next::Mint {
-            above: server_generation,
-        },
+}
+
+/// What a publish of `key` for `account` in `epoch` covers.
+pub fn marker(key: &IntakeKeyState, account: &str, epoch: u64) -> Published {
+    Published {
+        account_id: account.to_string(),
+        epoch,
+        key_id: rule::key_id(&key.key),
     }
 }
 
-/// Whether to publish in `current`, having last published in `last`. A clock that went back is
-/// no reason to skip.
-pub fn should_publish(last: Option<u64>, current: u64) -> bool {
-    last != Some(current)
+/// Whether to publish: once per epoch per account and key (the core's rule; until 2026-11-12 the
+/// epoch only, the marker cleared when the key changed).
+pub fn should_publish(last: Option<&Published>, due: &Published) -> bool {
+    rule::should_publish(last, due)
 }
 
-/// Whether the server holds the tags of the key published in `marker`, in `current`: a card
-/// names only such a key (iOS `IntakePublishing.serverHolds`). The marker is cleared whenever our
-/// key changes, so it always speaks of the current one.
-pub fn server_holds(marker: Option<u64>, current: u64) -> bool {
-    marker.is_some_and(|m| current >= m && current - m < WINDOW)
+/// Whether the server holds the tags of `key` for `account` in `current`: a card names only such
+/// a key (iOS `IntakePublishing.serverHolds`).
+pub fn server_holds(
+    last: Option<&Published>,
+    key: &IntakeKeyState,
+    account: &str,
+    current: u64,
+) -> bool {
+    rule::server_holds(last, account, &rule::key_id(&key.key), current)
 }
 
-/// The generation a rotation mints above: past both ours and the server's, so the new key
-/// replaces the account's set. A server that could not be asked counts as 0 — the rotation still
-/// happens, as the old key must not stay ours.
+/// The generation a rotation mints above: past both ours and the server's (None: not asked).
 pub fn rotation_floor(held: Option<&IntakeKeyState>, server: Option<u32>) -> u32 {
-    held.map_or(0, |k| k.generation).max(server.unwrap_or(0))
+    rule::mint_above(held.map(|k| k.generation), server)
 }
 
 /// The tags of `key` for `account`, from `epoch` on, as `PublishIntakeTags` takes them.
 pub fn window(key: &IntakeKeyState, account: &str, epoch: u64) -> Vec<(u64, Vec<u8>)> {
-    (epoch..epoch + WINDOW)
+    rule::window(epoch)
+        .into_iter()
         .filter_map(|e| intake_tag(&key.key, account, e).ok().map(|tag| (e, tag)))
         .collect()
 }
@@ -156,33 +166,42 @@ impl Store<'_> {
             return false;
         }
         let _ = self.0.secure_delete(SENT_TO);
-        let _ = self.0.secure_delete(PUBLISHED_EPOCH);
+        let _ = self.0.secure_delete(PUBLISHED);
         true
     }
 
-    pub fn published_epoch(&self) -> Option<u64> {
-        let bytes = self.0.secure_load(PUBLISHED_EPOCH).ok()??;
-        Some(u64::from_be_bytes(bytes.try_into().ok()?))
+    /// What the last publish covered; the epoch-only marker from before is dropped on the way.
+    pub fn published(&self) -> Option<Published> {
+        let _ = self.0.secure_delete(LEGACY_PUBLISHED_EPOCH);
+        construct_core::rule_state::decode_intake_published(&self.0.secure_load(PUBLISHED).ok()??)
     }
 
-    pub fn set_published_epoch(&self, epoch: u64) {
-        let _ = self.0.secure_save(PUBLISHED_EPOCH, &epoch.to_be_bytes());
-    }
-
-    /// Mark `published` as published in `epoch` — only while it is still our key: a publish that
-    /// lands after a newer key was adopted says nothing of the newer one. Whether it was marked.
-    pub fn mark_published(&self, published: &IntakeKeyState, epoch: u64) -> bool {
+    /// Mark `published` as published for `account` in `epoch` — only while it is still our key: a
+    /// publish that lands after a newer key was adopted says nothing of the newer one. Whether it
+    /// was marked.
+    pub fn mark_published(&self, published: &IntakeKeyState, account: &str, epoch: u64) -> bool {
         if self.own() != Held::Key(published.clone()) {
             return false;
         }
-        self.set_published_epoch(epoch);
-        true
+        match construct_core::rule_state::encode_intake_published(&marker(
+            published, account, epoch,
+        )) {
+            Ok(bytes) => self.0.secure_save(PUBLISHED, &bytes).is_ok(),
+            Err(e) => {
+                tracing::warn!(error = ?e, "intake publish marker not encoded");
+                false
+            }
+        }
     }
 
-    /// Our key as a card may name it in `epoch`: one of a generation, whose tags the server holds.
-    pub fn card_key(&self, epoch: u64) -> Option<IntakeKeyState> {
+    /// Our key as a card may name it for `account` in `epoch`: one of a generation, whose tags the
+    /// server holds.
+    pub fn card_key(&self, account: &str, epoch: u64) -> Option<IntakeKeyState> {
         match self.own() {
-            Held::Key(key) if key.generation > 0 && server_holds(self.published_epoch(), epoch) => {
+            Held::Key(key)
+                if key.generation > 0
+                    && server_holds(self.published().as_ref(), &key, account, epoch) =>
+            {
                 Some(key)
             }
             _ => None,
@@ -278,7 +297,7 @@ impl Suspended {
 /// "Unchecked" is the server failing to look (its tag store down) — acting on it would make every
 /// sender drop working keys during an outage.
 pub fn suspends(verdict: i32) -> bool {
-    verdict == crate::proto::services::v1::IntakeVerdict::NotAccepted as i32
+    rule::verdict_suspends_key(verdict)
 }
 
 /// The tag to present on an envelope to `account` in `epoch`, sealed to the server's `server_key`
