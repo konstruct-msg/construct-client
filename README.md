@@ -17,4 +17,13 @@ cargo test --workspace
 HOME=/tmp/probe-a cargo run -p construct-client --example probe -- --username tui_test_x --wait 60   # headless client for interop checks
 ```
 
+For bounded interop traffic between **separate test accounts**, the headless probe also accepts
+`--add <test-account-id> --send <text> --send-count 30 --send-interval-ms 1000 --wait 90`.
+Counts are limited to 1–1,000 and spacing to 100–60,000 ms, with no catch-up burst. Multi-send
+texts receive `probe_seq=NNNN`; `LOAD_ENQUEUE sequence=N` is emitted before each client command.
+Verify the receiver's decrypted `RECEIVED` text **and message IDs**, not just sender `QUEUED`.
+This is client/E2E traffic (including crypto, receipts and directory lookups), not server-only
+latency or a capacity claim. Admission failures stop a load run; never disable production gates
+or switch to identified sends to make a benchmark pass. Keep each account's HOME and logs private.
+
 Licensed under MPL-2.0.

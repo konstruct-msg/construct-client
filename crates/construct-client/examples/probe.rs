@@ -14,6 +14,11 @@
 //! or just its `id`) become a device of this account — what the phone does when it scans the
 //! code — and vouches for it when the code carries `fp`.
 //!
+//! `--send-count N --send-interval-ms MS`: send a bounded series through the real client,
+//! at most 1,000 messages and at least 100 ms apart. Each burst text gets `probe_seq=NNNN`;
+//! LOAD_ENQUEUE names the sequence immediately before handing it to the client. No catch-up
+//! burst after a slow iteration. Default single-message behavior/text stays unchanged.
+//!
 //! `--answer <text>`: to the first message that arrives, reply with `text`, react 👍, then edit
 //! the reply — the message actions, end to end.
 //!
@@ -75,6 +80,8 @@ struct Args {
     add: Option<String>,
     find: Option<String>,
     send: Option<String>,
+    send_count: u32,
+    send_interval_ms: u64,
     link: bool,
     approve: Option<String>,
     invite: bool,
@@ -112,6 +119,8 @@ fn parse_args() -> Args {
         add: None,
         find: None,
         send: None,
+        send_count: 1,
+        send_interval_ms: 1_000,
         link: false,
         approve: None,
         invite: false,
@@ -150,6 +159,14 @@ fn parse_args() -> Args {
             "--add" => args.add = Some(value()),
             "--find" => args.find = Some(value()),
             "--send" => args.send = Some(value()),
+            "--send-count" => {
+                args.send_count = value().parse().expect("--send-count takes an integer")
+            }
+            "--send-interval-ms" => {
+                args.send_interval_ms = value()
+                    .parse()
+                    .expect("--send-interval-ms takes milliseconds");
+            }
             "--link" => args.link = true,
             "--approve" => args.approve = Some(value()),
             "--invite" => args.invite = true,
@@ -181,7 +198,42 @@ fn parse_args() -> Args {
             other => panic!("unknown flag {other}"),
         }
     }
+    validate_burst(args.send_count, args.send_interval_ms).expect("bounded send arguments");
+    assert!(
+        args.send_count == 1
+            || (args.send.is_some() && (args.add.is_some() || args.find.is_some())),
+        "--send-count requires --send and --add/--find"
+    );
     args
+}
+
+fn validate_burst(count: u32, interval_ms: u64) -> Result<(), &'static str> {
+    if !(1..=1_000).contains(&count) {
+        return Err("send count must be 1..=1000");
+    }
+    if !(100..=60_000).contains(&interval_ms) {
+        return Err("send interval must be 100..=60000 ms");
+    }
+    Ok(())
+}
+
+struct Burst {
+    peer_id: String,
+    stem: String,
+    remaining: u32,
+    next: u32,
+}
+
+impl Burst {
+    fn next_text(&mut self) -> Option<(u32, String)> {
+        if self.remaining == 0 {
+            return None;
+        }
+        let sequence = self.next;
+        self.next += 1;
+        self.remaining -= 1;
+        Some((sequence, format!("{} probe_seq={sequence:04}", self.stem)))
+    }
 }
 
 #[tokio::main]
@@ -216,9 +268,29 @@ async fn main() {
     let mut sent: Option<String> = None;
     let mut answering = false;
     let mut to_edit: Option<(String, String)> = None;
+    let mut burst: Option<Burst> = None;
+    let send_due = tokio::time::sleep(std::time::Duration::ZERO);
+    tokio::pin!(send_due);
     loop {
         let event = tokio::select! {
             _ = &mut deadline, if started => break,
+            _ = &mut send_due, if burst.is_some() => {
+                let plan = burst.as_mut().expect("guarded burst");
+                if let Some((sequence, text)) = plan.next_text() {
+                    println!("LOAD_ENQUEUE sequence={sequence}");
+                    client.send(ClientCommand::SendText {
+                        contact_id: plan.peer_id.clone(),
+                        text,
+                    });
+                    // Schedule relative to this enqueue, never catch up missed ticks.
+                    send_due.as_mut().reset(tokio::time::Instant::now()
+                        + std::time::Duration::from_millis(args.send_interval_ms));
+                } else {
+                    println!("LOAD_ENQUEUE_DONE");
+                    burst = None;
+                }
+                continue;
+            }
             event = rx.recv() => match event { Some(e) => e, None => break },
         };
         match event {
@@ -374,10 +446,20 @@ async fn main() {
             ClientEvent::ContactAdded { user_id, username } => {
                 println!("ADDED {username} user_id={user_id}");
                 if let Some(text) = sent.is_none().then(|| args.send.clone()).flatten() {
-                    client.send(ClientCommand::SendText {
-                        contact_id: user_id.clone(),
-                        text,
-                    });
+                    if args.send_count == 1 {
+                        client.send(ClientCommand::SendText {
+                            contact_id: user_id.clone(),
+                            text,
+                        });
+                    } else {
+                        burst = Some(Burst {
+                            peer_id: user_id.clone(),
+                            stem: text,
+                            remaining: args.send_count,
+                            next: 1,
+                        });
+                        send_due.as_mut().reset(tokio::time::Instant::now());
+                    }
                     sent = Some(user_id.clone());
                 }
                 if let Some(path) = args.file.take() {
@@ -545,5 +627,43 @@ async fn main() {
             }
             _ => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod load_tests {
+    use super::*;
+
+    #[test]
+    fn burst_bounds_are_explicit_and_finite() {
+        for count in [1, 2, 1_000] {
+            for interval in [100, 1_000, 60_000] {
+                assert_eq!(validate_burst(count, interval), Ok(()));
+            }
+        }
+        for count in [0, 1_001, u32::MAX] {
+            assert!(validate_burst(count, 100).is_err());
+        }
+        for interval in [0, 99, 60_001, u64::MAX] {
+            assert!(validate_burst(2, interval).is_err());
+        }
+    }
+
+    #[test]
+    fn burst_sequence_is_unique_and_stops_at_the_requested_count() {
+        let mut burst = Burst {
+            peer_id: "test-peer".into(),
+            stem: "test-payload".into(),
+            remaining: 3,
+            next: 1,
+        };
+        for sequence in 1..=3 {
+            assert_eq!(
+                burst.next_text(),
+                Some((sequence, format!("test-payload probe_seq={sequence:04}")))
+            );
+        }
+        assert_eq!(burst.next_text(), None);
+        assert_eq!(burst.next_text(), None);
     }
 }
