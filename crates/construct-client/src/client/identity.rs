@@ -54,7 +54,7 @@ impl Client {
         let path = format!(
             "{}/construct_identity_{}.txt",
             std::env::var("HOME").unwrap_or_else(|_| ".".into()),
-            &self.user_id,
+            self.user_id,
         );
         let notice = match std::fs::write(
             &path,

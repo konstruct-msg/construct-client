@@ -4,7 +4,7 @@ description = "The Konstruct screens, drawn with Ratatui: one interface for the 
 license = "MPL-2.0"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.96"
+rust-version = "1.100"
 repository = "https://github.com/konstruct-msg/construct-client"
 
 [features]

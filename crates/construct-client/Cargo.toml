@@ -4,7 +4,7 @@ description = "The Konstruct client layer: account, keys, contacts, the message 
 license = "MPL-2.0"
 version = "0.2.0"
 edition = "2024"
-rust-version = "1.96"
+rust-version = "1.100"
 repository = "https://github.com/konstruct-msg/construct-tui"
 
 [features]
