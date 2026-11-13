@@ -4,7 +4,7 @@ description = "Spike: FFI to a pinned libwebrtc prebuilt (webrtc-sdk line). Firs
 license = "MPL-2.0"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.96"
+rust-version = "1.100"
 publish = false
 
 # No runtime dependencies yet: the first step is a guard test that reads the pinned
