@@ -498,7 +498,11 @@ impl Client {
         let events = self.events.clone();
         let grpc = self.grpc.clone();
         let orchestrator = self.orch_handle.clone();
+        let directory_change = orchestrator
+            .as_ref()
+            .map(|handle| handle.changing_own_devices());
         tokio::spawn(async move {
+            let _directory_change = directory_change;
             let short = &device_id[..8.min(device_id.len())];
             let notice = match crate::grpc::approve_join_request(&grpc, &device_id).await {
                 Ok(()) => {

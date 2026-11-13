@@ -26,7 +26,9 @@ impl Client {
         let hybrid = self.our_hybrid_key.clone();
         let grpc = self.grpc.clone();
         let (events, inbox) = (self.events.clone(), self.inbox.clone());
+        let directory_change = orchestrator.changing_own_devices();
         let task = tokio::spawn(async move {
+            let _directory_change = directory_change;
             let ended = offer(
                 &grpc,
                 &events,
