@@ -1122,7 +1122,9 @@ impl Task {
         match response.response {
             Some(R::Signal(signal)) => {
                 let sender_device = signal.sender_device_id.clone();
-                let signals = self.calls.on_signal(&signal, &sender_device);
+                let signals =
+                    self.calls
+                        .on_signal(&signal, &sender_device, &self.identity.device_id);
                 self.send_call_signals(signals).await;
                 self.emit_call_state();
             }
@@ -1193,6 +1195,20 @@ impl Task {
         signal: crate::proto::signaling::v1::WebRtcSignal,
         to_device: Option<String>,
     ) {
+        self.send_call_signal_e2ee(peer.clone(), &signal, to_device)
+            .await;
+        if goes_on_stream(&signal) {
+            self.presence_on_stream(peer, signal);
+        }
+    }
+
+    /// The E2EE half of [`Self::send_call_signal`]: framed, then encrypted on each device's ratchet.
+    async fn send_call_signal_e2ee(
+        &mut self,
+        peer: String,
+        signal: &crate::proto::signaling::v1::WebRtcSignal,
+        to_device: Option<String>,
+    ) {
         let message_id = uuid::Uuid::new_v4().to_string();
         let framed = crate::knst::frame_whole(
             &signal.encode_to_vec(),
@@ -1229,16 +1245,6 @@ impl Task {
             // (a ringing answer) and dispatch would recurse into this method.
             let _ = self.self_tx.send(event);
         }
-        // Hangup and busy are presence too: the stream frees the server's occupancy and tells
-        // the peer's other devices. Offer/answer/ICE never go near the stream.
-        if matches!(
-            &signal.signal,
-            Some(crate::proto::signaling::v1::web_rtc_signal::Signal::Hangup(
-                _
-            )) | Some(crate::proto::signaling::v1::web_rtc_signal::Signal::Busy(_))
-        ) {
-            self.presence_on_stream(peer, signal);
-        }
     }
 
     /// A presence signal on the Signal stream, to every device of `peer`. The E2EE send is the
@@ -1249,10 +1255,19 @@ impl Task {
             .send(OrchestratorCommand::SignalStreamPresence { peer, signal });
     }
 
+    /// Send each signal E2EE to its device. A hangup that goes to several devices (ours, before
+    /// anyone answered) reaches the stream once: the stream names the call, not a device.
     async fn send_call_signals(&mut self, signals: Vec<crate::calls::SignalToSend>) {
+        let mut presence = None;
         for to_send in signals {
-            self.send_call_signal(to_send.peer, to_send.signal, to_send.to_device)
+            if presence.is_none() && goes_on_stream(&to_send.signal) {
+                presence = Some((to_send.peer.clone(), to_send.signal.clone()));
+            }
+            self.send_call_signal_e2ee(to_send.peer, &to_send.signal, to_send.to_device)
                 .await;
+        }
+        if let Some((peer, signal)) = presence {
+            self.presence_on_stream(peer, signal);
         }
     }
 
@@ -1272,26 +1287,41 @@ impl Task {
         let sender_device = contact_id;
         let account = self.account_of(&sender_device);
         use crate::proto::signaling::v1::web_rtc_signal::Signal as S;
-        if let Some(S::Offer(offer)) = &signal.signal {
-            if self.calls.is_busy() {
-                // A call is already held: answer busy (stage A, on the E2EE path).
-                let busy = crate::calls::busy(&signal.call_id, &self.identity.device_id);
-                self.enqueue_call_signal(account, busy, Some(sender_device));
-                return;
-            }
+        if let Some(S::Offer(offer)) = &signal.signal
+            && self
+                .calls
+                .active()
+                .is_none_or(|c| c.call_id != signal.call_id)
+        {
             let call_type = crate::proto::signaling::v1::CallType::try_from(offer.call_type)
                 .unwrap_or(crate::proto::signaling::v1::CallType::Audio);
-            self.calls.begin_incoming(
+            match self.calls.on_offer(
                 signal.call_id.clone(),
                 account.clone(),
                 sender_device.clone(),
                 call_type,
-            );
+                &self.identity.user_id,
+            ) {
+                crate::calls::OfferDisposition::Ring => {}
+                crate::calls::OfferDisposition::Busy => {
+                    // A call is already held: answer busy (stage A, on the E2EE path).
+                    let busy = crate::calls::busy(&signal.call_id, &self.identity.device_id);
+                    self.enqueue_call_signal(account, busy, Some(sender_device));
+                    return;
+                }
+                crate::calls::OfferDisposition::KeepOurs => {
+                    tracing::info!("glare: keeping our outgoing call, ignoring their offer");
+                    return;
+                }
+            }
             // Ring back on the E2EE path (stream presence is the follow-up step).
             let ringing = crate::calls::ringing(&signal.call_id, &self.identity.device_id);
             self.enqueue_call_signal(account, ringing, Some(sender_device));
         } else {
-            for to_send in self.calls.on_signal(&signal, &sender_device) {
+            for to_send in self
+                .calls
+                .on_signal(&signal, &sender_device, &self.identity.device_id)
+            {
                 self.enqueue_call_signal(to_send.peer, to_send.signal, to_send.to_device);
             }
         }
@@ -3307,12 +3337,46 @@ fn contact_updated(
     }
 }
 
+/// Whether a call signal also goes on the Signal stream: a hangup or a busy frees the server's
+/// occupancy and tells the peer's other devices. Never a release ("accepted elsewhere"): the
+/// server ends the whole call on any hangup it sees, so a release there would end the call for
+/// the device that took it. Offer, answer and ICE never go near the stream.
+fn goes_on_stream(signal: &crate::proto::signaling::v1::WebRtcSignal) -> bool {
+    use crate::proto::signaling::v1::{HangupReason, web_rtc_signal::Signal as S};
+    match &signal.signal {
+        Some(S::Hangup(h)) => h.reason != HangupReason::AcceptedElsewhere as i32,
+        Some(S::Busy(_)) => true,
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod directory_tests;
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Mutations: put a release on the stream (the server would end the call for the device that
+    /// took it); drop a normal hangup or a busy from it (the server would keep us "in a call").
+    #[test]
+    fn a_release_never_goes_on_the_stream_and_a_hangup_or_busy_does() {
+        use crate::proto::signaling::v1::HangupReason;
+        let release = crate::calls::hangup("c", "me", HangupReason::AcceptedElsewhere);
+        assert!(!goes_on_stream(&release));
+        assert!(goes_on_stream(&crate::calls::hangup(
+            "c",
+            "me",
+            HangupReason::Normal
+        )));
+        assert!(goes_on_stream(&crate::calls::hangup(
+            "c",
+            "me",
+            HangupReason::Declined
+        )));
+        assert!(goes_on_stream(&crate::calls::busy("c", "me")));
+        assert!(!goes_on_stream(&crate::calls::ringing("c", "me")));
+    }
 
     // ── What a payload does once decrypted ─────────────────────────────────────
 
