@@ -936,4 +936,61 @@ mod tests {
         );
         assert_eq!(m.active().unwrap().phase, Phase::Incoming);
     }
+
+    /// Mutation: act on a signal of a call that is over (or of another call while it is live).
+    #[test]
+    fn a_signal_after_the_end_or_for_another_call_changes_nothing() {
+        let mut m = Manager::new();
+        begin_outgoing(&mut m);
+        m.on_signal(&answer("c1", "pd", "peer", String::new()), "pd", "me");
+        m.on_signal(&hangup("c9", "pd", HangupReason::Normal), "pd", "me");
+        assert_eq!(
+            m.active().unwrap().phase,
+            Phase::Live,
+            "another call's hangup"
+        );
+        m.on_signal(&hangup("c1", "pd", HangupReason::Normal), "pd", "me");
+        m.on_signal(&hangup("c1", "pd", HangupReason::Declined), "pd", "me");
+        assert_eq!(
+            m.active().unwrap().phase,
+            Phase::Over(Outcome::Ended),
+            "a late second hangup"
+        );
+    }
+
+    /// Mutation: let a ringing signal move an incoming call.
+    #[test]
+    fn ringing_moves_only_an_outgoing_call_that_is_calling() {
+        let mut m = Manager::new();
+        m.begin_incoming("c1".into(), "peer".into(), "pd".into(), CallType::Audio);
+        m.on_signal(&ringing("c1", "pd"), "pd", "me");
+        assert_eq!(m.active().unwrap().phase, Phase::Incoming);
+    }
+
+    /// Mutation: decline an outgoing call as if it rang on us.
+    #[test]
+    fn declining_is_for_an_incoming_call_only() {
+        let mut m = Manager::new();
+        begin_outgoing(&mut m);
+        assert!(m.decline("me").is_empty());
+        assert_eq!(m.active().unwrap().phase, Phase::Calling);
+    }
+
+    /// Mutations: never write the row; write it twice; write it before the call ended.
+    #[test]
+    fn an_ended_call_writes_its_row_once_with_its_length() {
+        let mut m = Manager::new();
+        begin_outgoing(&mut m);
+        m.on_signal(&answer("c1", "pd", "peer", String::new()), "pd", "me");
+        assert!(m.take_history_record(now_ms()).is_none(), "not over yet");
+        let answered = m.active().unwrap().connected_at_ms.unwrap();
+        m.on_signal(&hangup("c1", "pd", HangupReason::Normal), "pd", "me");
+        let row = m.take_history_record(answered + 61_500).expect("a row");
+        assert_eq!((row.id.as_str(), row.peer_user_id.as_str()), ("c1", "peer"));
+        assert_eq!(
+            (row.direction, row.status, row.duration_seconds),
+            (0, 0, 61)
+        );
+        assert!(m.take_history_record(now_ms()).is_none(), "written once");
+    }
 }
