@@ -413,6 +413,8 @@ enum OrchestratorCommand {
     EndCall,
     /// The person closed the ended call's outcome.
     DismissCall,
+    /// The call machine's next deadline passed (an unanswered call).
+    CallDeadline,
     /// Send one `WebRtcSignal` on its paths: E2EE to its device (or every device of its peer
     /// when it names none), and the Signal stream.
     SendCallSignal(crate::calls::SignalToSend),
@@ -640,6 +642,8 @@ struct Task {
     cards_in_flight: HashSet<(String, String)>,
     /// The 1:1 call, if one is held (stage A: signaling only, no media).
     calls: crate::calls::Manager,
+    /// The one timer of the call machine, at its next deadline (`CallDeadline` when it fires).
+    call_deadline: Option<tokio::task::JoinHandle<()>>,
     /// The auxiliary Signal stream, when it opened: wakeup and presence (never SDP).
     signal_stream: Option<crate::grpc::SignalStream>,
 }
@@ -693,6 +697,7 @@ impl Task {
             intake_suspended: crate::intake::Suspended::default(),
             cards_in_flight: HashSet::new(),
             calls: crate::calls::Manager::new(),
+            call_deadline: None,
             signal_stream: None,
         }
     }
@@ -1082,6 +1087,11 @@ impl Task {
                 self.send_call_signals(signals).await;
                 self.emit_call_state();
             }
+            OrchestratorCommand::CallDeadline => {
+                let signals = self.calls.tick(now_ms(), &self.identity.device_id);
+                self.send_call_signals(signals).await;
+                self.emit_call_state();
+            }
             OrchestratorCommand::DismissCall => {
                 self.calls.dismiss();
                 self.emit_call_state();
@@ -1166,13 +1176,16 @@ impl Task {
             return;
         }
         let call_id = uuid::Uuid::new_v4().to_string();
-        let offer = self.calls.begin_outgoing(
+        let Some(offer) = self.calls.begin_outgoing(
             call_id.clone(),
             peer.clone(),
             call_type,
             &self.identity.device_id,
             &self.identity.user_id,
-        );
+        ) else {
+            self.ui_error("[BUSY] a call is already in progress".to_string());
+            return;
+        };
         // Wake the callee if the server can; the offer itself never goes through this RPC.
         // caller_name is empty, as iOS sends it: the callee names the caller by their contacts.
         if let Err(e) = crate::grpc::initiate_call(&self.grpc, &call_id, &peer, call_type, "").await
@@ -1340,14 +1353,32 @@ impl Task {
             .send(OrchestratorCommand::SendCallSignal(to_send));
     }
 
-    /// Push the call's current snapshot to the front end, or `None` when it ended.
+    /// Push the call's current snapshot to the front end, or `None` when it ended. Every change
+    /// to the call passes here, so the machine's timer is re-armed here too.
     fn emit_call_state(&mut self) {
+        self.arm_call_deadline();
         self.record_call_history();
         let _ = self
             .internal_tx
             .send(crate::client::ClientEvent::Bridge(BridgeEvent::CallState {
                 call: self.calls.state(),
             }));
+    }
+
+    /// One timer at the call machine's next deadline; it sends `CallDeadline` when it fires.
+    fn arm_call_deadline(&mut self) {
+        if let Some(previous) = self.call_deadline.take() {
+            previous.abort();
+        }
+        let Some(at) = self.calls.next_deadline() else {
+            return;
+        };
+        let wait = std::time::Duration::from_millis(u64::try_from(at - now_ms()).unwrap_or(0));
+        let tx = self.self_cmd.clone();
+        self.call_deadline = Some(tokio::spawn(async move {
+            tokio::time::sleep(wait).await;
+            let _ = tx.send(OrchestratorCommand::CallDeadline);
+        }));
     }
 
     /// Write the ended call's row once, as iOS `CallHistoryService.record` does. The name comes
