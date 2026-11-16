@@ -83,13 +83,22 @@ pub struct Call {
 }
 
 /// A signal the manager decided to send, and where it goes: one device (the one that answered,
-/// or a device being released), or every device of `peer` with a session (`None`).
+/// or a device being released), or every device of `peer` with a session (`None`); and on which
+/// paths (`route`). A hangup's paths are the rule's (`rule::hangup_route`); every other signal
+/// travels end to end only.
 #[derive(Debug)]
 pub struct SignalToSend {
     pub peer: String,
     pub signal: WebRtcSignal,
     pub to_device: Option<String>,
+    pub route: rule::HangupRoute,
 }
+
+/// End to end only: offer, answer, ringing.
+const E2EE_ONLY: rule::HangupRoute = rule::HangupRoute {
+    e2ee: true,
+    stream: false,
+};
 
 /// What the store needs when a call ends, except `peer_name` (the orchestrator fills it from its
 /// contacts) and the end time (now). `status` is `CallStore.Status`, `direction` its `Direction`.
@@ -117,15 +126,19 @@ pub struct HistoryRow {
     pub duration_seconds: i32,
 }
 
-/// What to do with an offer that arrived.
+/// What to do with an offer that arrived, from the core's rule (`rule::on_offer`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OfferDisposition {
-    /// Ring: the call is now held, incoming.
+    /// Ring: the call is now held, incoming. Also glare where theirs wins: our outgoing call gave
+    /// way to it.
     Ring,
     /// A call is already held: answer busy to the offering device.
     Busy,
-    /// Glare, and ours wins (`rule::glare`): ignore their offer; they will answer ours.
+    /// Glare, and ours wins: ignore their offer; they will answer ours.
     KeepOurs,
+    /// The offer is for the call already held — held until the answer, or a renegotiation.
+    /// Nothing to ring and nothing to send: stage A carries no SDP to apply.
+    HeldCall,
 }
 
 /// One 1:1 call at a time; a second call while one is held answers busy (stage A keeps it
@@ -195,14 +208,19 @@ impl Manager {
             peer: call.peer.clone(),
             signal,
             to_device: None,
+            route: E2EE_ONLY,
         };
         self.active = Some(call);
         to_send
     }
 
-    /// An offer for `call_id` arrived from `sender_device` of `peer`. Both sides dialling each
-    /// other at once is glare: the rule keeps the larger account id's call, and the smaller one
-    /// gives its own up and rings for theirs. Any other held call makes this one busy.
+    /// An offer for `call_id` arrived from `sender_device` of `peer`. What it means is the core's
+    /// rule (`rule::on_offer`), as on iOS and Android: both sides dialling each other at once is
+    /// glare — the larger account id keeps its call, the smaller one gives its own up and rings
+    /// for theirs; any other held call makes this one busy.
+    ///
+    /// No memory of ended call ids here: an ended call stays held (`Phase::Over`) until
+    /// dismissed, and a late signal of it reaches `on_signal`, which drops it.
     pub fn on_offer(
         &mut self,
         call_id: String,
@@ -211,21 +229,36 @@ impl Manager {
         call_type: CallType,
         my_user: &str,
     ) -> OfferDisposition {
-        if let Some(call) = &self.active
-            && !matches!(call.phase, Phase::Over(_))
-        {
-            let glare = call.direction == Direction::Outgoing && call.peer == peer;
-            if !glare {
-                return OfferDisposition::Busy;
+        match rule::on_offer(false, self.held(&call_id, &peer), my_user, &peer) {
+            rule::OfferAction::Busy => OfferDisposition::Busy,
+            rule::OfferAction::KeepOurs => OfferDisposition::KeepOurs,
+            rule::OfferAction::HoldUntilAnswered
+            | rule::OfferAction::ResumeAnswer
+            | rule::OfferAction::Renegotiate
+            | rule::OfferAction::IgnoreEnded => OfferDisposition::HeldCall,
+            // Ours gives way: their offer replaces it. The peer ignores our offer (it keeps its
+            // own call), so nothing is sent for the call we drop.
+            rule::OfferAction::Ring | rule::OfferAction::ReplaceOutgoing => {
+                self.begin_incoming(call_id, peer, sender_device, call_type);
+                OfferDisposition::Ring
             }
-            if rule::glare(my_user, &peer) == rule::Glare::KeepOurs {
-                return OfferDisposition::KeepOurs;
-            }
-            // Ours yields: their offer replaces it, as on iOS and Android. The peer ignores our
-            // offer (it keeps its own call), so nothing is sent for the call we drop.
         }
-        self.begin_incoming(call_id, peer, sender_device, call_type);
-        OfferDisposition::Ring
+    }
+
+    /// The held call as the offer rule reads it. A call that is over holds nothing.
+    fn held(&self, call_id: &str, offerer: &str) -> Option<rule::HeldCall> {
+        let call = self.active.as_ref()?;
+        if matches!(call.phase, Phase::Over(_)) {
+            return None;
+        }
+        Some(rule::HeldCall {
+            same_call: call.call_id == call_id,
+            direction: rule_direction(call.direction),
+            with_offerer: call.peer == offerer,
+            answered: call.connected_at_ms.is_some(),
+            // Stage A answers nothing before its offer: a call starts here from its offer.
+            awaiting_offer_after_answer: false,
+        })
     }
 
     /// An offer arrived from `sender_device` of `peer`. Returns nothing to send yet — the person
@@ -344,6 +377,7 @@ impl Manager {
             peer: call.peer.clone(),
             signal,
             to_device: call.peer_device.clone(),
+            route: E2EE_ONLY,
         }]
     }
 
@@ -373,12 +407,14 @@ impl Manager {
         let targets = rule::targets(call.peer_device.as_deref(), &call.offered_devices, None);
         finish(call, rule::EndReason::Hangup(reason));
         let wire = hangup(&call.call_id, my_device, proto_reason(reason));
+        let route = rule::hangup_route(rule::HangupSide::Local, reason);
         if targets.is_empty() {
             // No device known yet (the offer is still going out): every device with a session.
             return vec![SignalToSend {
                 peer: call.peer.clone(),
                 signal: wire,
                 to_device: None,
+                route,
             }];
         }
         targets
@@ -387,6 +423,7 @@ impl Manager {
                 peer: call.peer.clone(),
                 signal: wire.clone(),
                 to_device: Some(device),
+                route,
             })
             .collect()
     }
@@ -426,6 +463,10 @@ fn release(call: &Call, devices: &[String], my_device: &str) -> Vec<SignalToSend
             peer: call.peer.clone(),
             signal: hangup(&call.call_id, my_device, HangupReason::AcceptedElsewhere),
             to_device: Some(device.clone()),
+            route: rule::hangup_route(
+                rule::HangupSide::Local,
+                rule::HangupReason::AcceptedElsewhere,
+            ),
         })
         .collect()
 }
@@ -457,7 +498,19 @@ fn remote_hangup(
         }
         rule::HangupDisposition::End { release: others } => {
             finish(call, rule::EndReason::Hangup(reason));
-            release(call, &others, my_device)
+            let mut out = release(call, &others, my_device);
+            // The peer told us; the server has not heard, and without it keeps us "in a call"
+            // and refuses the peer's call-back as busy (iOS AC92380B). The rule says which paths.
+            let route = rule::hangup_route(rule::HangupSide::Remote, reason);
+            if route.e2ee || route.stream {
+                out.push(SignalToSend {
+                    peer: call.peer.clone(),
+                    signal: hangup(&call.call_id, my_device, proto_reason(reason)),
+                    to_device: None,
+                    route,
+                });
+            }
+            out
         }
     }
 }
@@ -592,6 +645,27 @@ pub fn ringing(call_id: &str, device_id: &str) -> WebRtcSignal {
     }
 }
 
+/// Ringing back to the device that offered: end to end only.
+pub fn ring_back(peer: String, device: String, call_id: &str, my_device: &str) -> SignalToSend {
+    SignalToSend {
+        peer,
+        signal: ringing(call_id, my_device),
+        to_device: Some(device),
+        route: E2EE_ONLY,
+    }
+}
+
+/// Busy back to the device that offered a second call: ours, so it goes as a local hangup of
+/// reason busy does (`rule::hangup_route`) — the peer hears it and the server frees the call.
+pub fn refuse_busy(peer: String, device: String, call_id: &str, my_device: &str) -> SignalToSend {
+    SignalToSend {
+        peer,
+        signal: busy(call_id, my_device),
+        to_device: Some(device),
+        route: rule::hangup_route(rule::HangupSide::Local, rule::HangupReason::Busy),
+    }
+}
+
 pub fn busy(call_id: &str, device_id: &str) -> WebRtcSignal {
     WebRtcSignal {
         call_id: call_id.to_owned(),
@@ -675,6 +749,8 @@ mod tests {
         };
         assert_eq!(h.reason, HangupReason::AcceptedElsewhere as i32);
         assert_eq!(out[0].to_device.as_deref(), Some("device-2"));
+        // Never on the stream: the server would end the call for the device that took it.
+        assert_eq!(out[0].route, E2EE_ONLY);
         assert_eq!(m.active().unwrap().peer_device.as_deref(), Some("device-1"));
     }
 
@@ -700,8 +776,97 @@ mod tests {
         let mut m = Manager::new();
         begin_outgoing(&mut m);
         let hangup_sig = hangup("c1", "peer-device", HangupReason::Declined);
-        assert!(m.on_signal(&hangup_sig, "peer-device", "me").is_empty());
+        m.on_signal(&hangup_sig, "peer-device", "me");
         assert_eq!(m.active().unwrap().phase, Phase::Over(Outcome::Declined));
+    }
+
+    /// iOS AC92380B: the peer's hangup reached us end to end and not the server, which kept us
+    /// "in a call" and refused the peer's call-back as busy. It goes to the stream, and not back
+    /// to the peer, who already knows.
+    ///
+    /// Mutations: drop the stream hangup after a received one; send it end to end too.
+    #[test]
+    fn a_received_hangup_tells_the_server_and_not_the_peer() {
+        let mut m = Manager::new();
+        begin_outgoing(&mut m);
+        let hangup_sig = hangup("c1", "peer-device", HangupReason::Declined);
+        let out = m.on_signal(&hangup_sig, "peer-device", "me");
+        assert_eq!(out.len(), 1);
+        assert_eq!(
+            out[0].route,
+            rule::HangupRoute {
+                e2ee: false,
+                stream: true
+            }
+        );
+        let Some(S::Hangup(h)) = &out[0].signal.signal else {
+            panic!("expected a hangup, got {:?}", out[0].signal.signal);
+        };
+        assert_eq!(h.reason, HangupReason::Declined as i32);
+    }
+
+    /// Ours goes both ways: the peer hears it, the server frees us.
+    ///
+    /// Mutation: `end` routes its hangup as a received one.
+    #[test]
+    fn our_hangup_goes_to_the_peer_and_the_server() {
+        let mut m = Manager::new();
+        begin_outgoing(&mut m);
+        let out = m.end("me");
+        assert!(!out.is_empty());
+        for to_send in &out {
+            assert_eq!(
+                to_send.route,
+                rule::HangupRoute {
+                    e2ee: true,
+                    stream: true
+                }
+            );
+        }
+    }
+
+    /// Busy back to a second caller goes as our hangup does; ringing back only end to end.
+    ///
+    /// Mutations: `refuse_busy` end to end only; `ring_back` on the stream.
+    #[test]
+    fn busy_back_frees_the_server_and_ringing_back_does_not_touch_it() {
+        let busy = refuse_busy("peer".into(), "d".into(), "c1", "me");
+        assert_eq!(
+            busy.route,
+            rule::HangupRoute {
+                e2ee: true,
+                stream: true
+            }
+        );
+        let ring = ring_back("peer".into(), "d".into(), "c1", "me");
+        assert_eq!(ring.route, E2EE_ONLY);
+        assert!(matches!(ring.signal.signal, Some(S::Ringing(_))));
+    }
+
+    /// An offer for the call already ringing is that call's, not a second caller: answering it
+    /// busy would end the call the person is about to take.
+    ///
+    /// Mutation: `held` never names the same call.
+    #[test]
+    fn an_offer_for_the_held_call_is_not_a_second_caller() {
+        let mut m = Manager::new();
+        m.begin_incoming(
+            "c1".into(),
+            "peer".into(),
+            "peer-device".into(),
+            CallType::Audio,
+        );
+        assert_eq!(
+            m.on_offer(
+                "c1".into(),
+                "peer".into(),
+                "peer-device".into(),
+                CallType::Audio,
+                "me"
+            ),
+            OfferDisposition::HeldCall
+        );
+        assert_eq!(m.active().unwrap().phase, Phase::Incoming);
     }
 
     #[test]

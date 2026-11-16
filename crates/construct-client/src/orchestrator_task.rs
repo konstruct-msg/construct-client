@@ -413,12 +413,9 @@ enum OrchestratorCommand {
     EndCall,
     /// The person closed the ended call's outcome.
     DismissCall,
-    /// Send one `WebRtcSignal` E2EE: to `to_device`, or every device of `peer` when `None`.
-    SendCallSignal {
-        peer: String,
-        signal: crate::proto::signaling::v1::WebRtcSignal,
-        to_device: Option<String>,
-    },
+    /// Send one `WebRtcSignal` on its paths: E2EE to its device (or every device of its peer
+    /// when it names none), and the Signal stream.
+    SendCallSignal(crate::calls::SignalToSend),
     /// The Signal stream opened (best-effort); held so it stays alive.
     SignalStreamOpened(crate::grpc::SignalStream),
     /// A message from the Signal stream: wakeup, presence, busy/offline.
@@ -1089,12 +1086,8 @@ impl Task {
                 self.calls.dismiss();
                 self.emit_call_state();
             }
-            OrchestratorCommand::SendCallSignal {
-                peer,
-                signal,
-                to_device,
-            } => {
-                self.send_call_signal(peer, signal, to_device).await;
+            OrchestratorCommand::SendCallSignal(to_send) => {
+                self.send_call_signal(to_send).await;
             }
             OrchestratorCommand::SignalStreamOpened(stream) => {
                 tracing::info!("Signal stream open");
@@ -1122,9 +1115,14 @@ impl Task {
         match response.response {
             Some(R::Signal(signal)) => {
                 let sender_device = signal.sender_device_id.clone();
-                let signals =
+                let mut signals =
                     self.calls
                         .on_signal(&signal, &sender_device, &self.identity.device_id);
+                // The server relayed this one, so it has heard: nothing goes back on the stream.
+                for to_send in &mut signals {
+                    to_send.route.stream = false;
+                }
+                signals.retain(|to_send| to_send.route.e2ee);
                 self.send_call_signals(signals).await;
                 self.emit_call_state();
             }
@@ -1181,24 +1179,20 @@ impl Task {
         {
             tracing::warn!(error = %e, "InitiateCall failed — the call proceeds on the E2EE path");
         }
-        self.send_call_signal(offer.peer, offer.signal, offer.to_device)
-            .await;
+        self.send_call_signal(offer).await;
         self.fetch_turn().await;
         self.emit_call_state();
     }
 
     /// Send one `WebRtcSignal` E2EE through the core: framed, then encrypted on each device's
     /// ratchet. `to_device` names one device; `None` fans out to every device with a session.
-    async fn send_call_signal(
-        &mut self,
-        peer: String,
-        signal: crate::proto::signaling::v1::WebRtcSignal,
-        to_device: Option<String>,
-    ) {
-        self.send_call_signal_e2ee(peer.clone(), &signal, to_device)
-            .await;
-        if goes_on_stream(&signal) {
-            self.presence_on_stream(peer, signal);
+    async fn send_call_signal(&mut self, to_send: crate::calls::SignalToSend) {
+        if to_send.route.e2ee {
+            self.send_call_signal_e2ee(to_send.peer.clone(), &to_send.signal, to_send.to_device)
+                .await;
+        }
+        if to_send.route.stream {
+            self.presence_on_stream(to_send.peer, to_send.signal);
         }
     }
 
@@ -1260,11 +1254,13 @@ impl Task {
     async fn send_call_signals(&mut self, signals: Vec<crate::calls::SignalToSend>) {
         let mut presence = None;
         for to_send in signals {
-            if presence.is_none() && goes_on_stream(&to_send.signal) {
+            if presence.is_none() && to_send.route.stream {
                 presence = Some((to_send.peer.clone(), to_send.signal.clone()));
             }
-            self.send_call_signal_e2ee(to_send.peer, &to_send.signal, to_send.to_device)
-                .await;
+            if to_send.route.e2ee {
+                self.send_call_signal_e2ee(to_send.peer, &to_send.signal, to_send.to_device)
+                    .await;
+            }
         }
         if let Some((peer, signal)) = presence {
             self.presence_on_stream(peer, signal);
@@ -1304,42 +1300,44 @@ impl Task {
             ) {
                 crate::calls::OfferDisposition::Ring => {}
                 crate::calls::OfferDisposition::Busy => {
-                    // A call is already held: answer busy (stage A, on the E2EE path).
-                    let busy = crate::calls::busy(&signal.call_id, &self.identity.device_id);
-                    self.enqueue_call_signal(account, busy, Some(sender_device));
+                    // A call is already held: answer busy.
+                    self.enqueue_call_signal(crate::calls::refuse_busy(
+                        account,
+                        sender_device,
+                        &signal.call_id,
+                        &self.identity.device_id,
+                    ));
                     return;
                 }
                 crate::calls::OfferDisposition::KeepOurs => {
                     tracing::info!("glare: keeping our outgoing call, ignoring their offer");
                     return;
                 }
+                crate::calls::OfferDisposition::HeldCall => return,
             }
             // Ring back on the E2EE path (stream presence is the follow-up step).
-            let ringing = crate::calls::ringing(&signal.call_id, &self.identity.device_id);
-            self.enqueue_call_signal(account, ringing, Some(sender_device));
+            self.enqueue_call_signal(crate::calls::ring_back(
+                account,
+                sender_device,
+                &signal.call_id,
+                &self.identity.device_id,
+            ));
         } else {
             for to_send in self
                 .calls
                 .on_signal(&signal, &sender_device, &self.identity.device_id)
             {
-                self.enqueue_call_signal(to_send.peer, to_send.signal, to_send.to_device);
+                self.enqueue_call_signal(to_send);
             }
         }
         self.emit_call_state();
     }
 
     /// Hand a signal to send back into the command loop, off the dispatch stack.
-    fn enqueue_call_signal(
-        &self,
-        peer: String,
-        signal: crate::proto::signaling::v1::WebRtcSignal,
-        to_device: Option<String>,
-    ) {
-        let _ = self.self_cmd.send(OrchestratorCommand::SendCallSignal {
-            peer,
-            signal,
-            to_device,
-        });
+    fn enqueue_call_signal(&self, to_send: crate::calls::SignalToSend) {
+        let _ = self
+            .self_cmd
+            .send(OrchestratorCommand::SendCallSignal(to_send));
     }
 
     /// Push the call's current snapshot to the front end, or `None` when it ended.
@@ -3337,46 +3335,12 @@ fn contact_updated(
     }
 }
 
-/// Whether a call signal also goes on the Signal stream: a hangup or a busy frees the server's
-/// occupancy and tells the peer's other devices. Never a release ("accepted elsewhere"): the
-/// server ends the whole call on any hangup it sees, so a release there would end the call for
-/// the device that took it. Offer, answer and ICE never go near the stream.
-fn goes_on_stream(signal: &crate::proto::signaling::v1::WebRtcSignal) -> bool {
-    use crate::proto::signaling::v1::{HangupReason, web_rtc_signal::Signal as S};
-    match &signal.signal {
-        Some(S::Hangup(h)) => h.reason != HangupReason::AcceptedElsewhere as i32,
-        Some(S::Busy(_)) => true,
-        _ => false,
-    }
-}
-
 #[cfg(test)]
 mod directory_tests;
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// Mutations: put a release on the stream (the server would end the call for the device that
-    /// took it); drop a normal hangup or a busy from it (the server would keep us "in a call").
-    #[test]
-    fn a_release_never_goes_on_the_stream_and_a_hangup_or_busy_does() {
-        use crate::proto::signaling::v1::HangupReason;
-        let release = crate::calls::hangup("c", "me", HangupReason::AcceptedElsewhere);
-        assert!(!goes_on_stream(&release));
-        assert!(goes_on_stream(&crate::calls::hangup(
-            "c",
-            "me",
-            HangupReason::Normal
-        )));
-        assert!(goes_on_stream(&crate::calls::hangup(
-            "c",
-            "me",
-            HangupReason::Declined
-        )));
-        assert!(goes_on_stream(&crate::calls::busy("c", "me")));
-        assert!(!goes_on_stream(&crate::calls::ringing("c", "me")));
-    }
 
     // ── What a payload does once decrypted ─────────────────────────────────────
 
