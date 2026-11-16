@@ -1138,4 +1138,29 @@ mod tests {
         assert_eq!(row(&mut m), (1, 1));
         assert!(!m.is_busy());
     }
+
+    /// What the screen reads is the machine's call: its phase and when it went live.
+    ///
+    /// Mutation: `state` returns nothing.
+    #[test]
+    fn the_screen_reads_the_machines_call() {
+        let mut m = Manager::new();
+        assert_eq!(m.state(), None);
+        begin_outgoing(&mut m);
+        let state = m.state().expect("a call");
+        assert_eq!(
+            (
+                state.call_id.as_str(),
+                state.peer_id.as_str(),
+                state.direction,
+                state.phase,
+                state.connected_at_ms
+            ),
+            ("c1", "peer", Direction::Outgoing, Phase::Calling, None)
+        );
+        m.on_signal(&answer("c1", "pd", "peer", String::new()), "pd", "me");
+        let state = m.state().expect("a call");
+        assert_eq!(state.phase, Phase::Live);
+        assert!(state.connected_at_ms.is_some());
+    }
 }
