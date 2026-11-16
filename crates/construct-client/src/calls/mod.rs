@@ -11,6 +11,7 @@ use crate::proto::signaling::v1::{
     CallAnswer, CallBusy, CallHangup, CallOffer, CallRinging, HangupReason, IceCandidate,
     WebRtcSignal, web_rtc_signal,
 };
+use construct_core::rule_state::call_machine as machine;
 use construct_core::rule_state::calls as rule;
 
 /// The call kind, re-exported so front ends can read it without naming the proto module.
@@ -61,8 +62,10 @@ pub struct CallState {
     pub connected_at_ms: Option<i64>,
 }
 
-/// A call the orchestrator holds. `peer` is an account id; `peer_device` is the device that
-/// answered (set by the first answer — later devices are released `ACCEPTED_ELSEWHERE`).
+/// The call as this client shows it: the one the machine holds, or the one that just ended,
+/// until the person closes its outcome (the machine forgets a call when it ends). `peer` is an
+/// account id. Devices, the answer, budgets and deadlines are the machine's
+/// ([`Manager::chosen_device`], [`Manager::offered_devices`]).
 #[derive(Debug, Clone)]
 pub struct Call {
     pub call_id: String,
@@ -70,16 +73,8 @@ pub struct Call {
     pub direction: Direction,
     pub phase: Phase,
     pub call_type: CallType,
-    pub peer_device: Option<String>,
-    pub offered_devices: Vec<String>,
-    pub started_at_ms: i64,
-    /// When the call went live (an answer arrived, or we answered); the timer and the history
-    /// duration count from here.
+    /// When the call went live (an answer arrived, or we answered); the timer counts from here.
     pub connected_at_ms: Option<i64>,
-    /// The history row was already written.
-    pub recorded: bool,
-    /// Why it ended, once it has: what the outcome and the history row are read from.
-    pub end_reason: Option<rule::EndReason>,
 }
 
 /// A signal the manager decided to send, and where it goes: one device (the one that answered,
@@ -141,20 +136,34 @@ pub enum OfferDisposition {
     HeldCall,
 }
 
-/// One 1:1 call at a time; a second call while one is held answers busy (stage A keeps it
-/// single and answers the E2EE busy signal).
+/// One 1:1 call at a time. The call's state is the core's call machine (construct-rules
+/// `call_machine`, todo 295 step 5), the same iOS and Android hold; this keeps what the screen
+/// shows and turns the machine's answers into signals.
 #[derive(Debug, Default)]
 pub struct Manager {
+    machine: machine::Calls,
     active: Option<Call>,
+    /// The history row of the call that just ended, not taken yet.
+    record: Option<HistoryRecord>,
 }
 
 impl Manager {
     pub fn new() -> Self {
-        Self { active: None }
+        Self::default()
     }
 
     pub fn active(&self) -> Option<&Call> {
         self.active.as_ref()
+    }
+
+    /// The device the call talks to, once chosen.
+    pub fn chosen_device(&self) -> Option<&str> {
+        self.machine.active()?.chosen.as_deref()
+    }
+
+    /// The devices our offer went to, until one answers.
+    pub fn offered_devices(&self) -> &[String] {
+        self.machine.active().map_or(&[], |c| c.offered.as_slice())
     }
 
     pub fn state(&self) -> Option<CallState> {
@@ -168,14 +177,49 @@ impl Manager {
         })
     }
 
+    /// A call is up. One whose outcome the person has not dismissed yet does not block a new one.
     pub fn is_busy(&self) -> bool {
-        // A call whose outcome the person has not dismissed yet does not block a new one.
-        self.active
-            .as_ref()
-            .is_some_and(|c| !matches!(c.phase, Phase::Over(_)))
+        self.machine.active().is_some()
     }
 
-    /// Begin an outgoing call to `peer`. Returns the offer to send.
+    /// Bring the screen's call in line with the machine's after a change.
+    fn sync(&mut self) {
+        let (Some(held), Some(call)) = (self.machine.active(), self.active.as_mut()) else {
+            return;
+        };
+        if held.call_id != call.call_id {
+            return;
+        }
+        call.phase = match held.phase {
+            machine::Phase::Incoming => Phase::Incoming,
+            machine::Phase::Dialing => Phase::Calling,
+            machine::Phase::Ringing => Phase::Ringing,
+            machine::Phase::Connecting => Phase::Connecting,
+            machine::Phase::Active => Phase::Live,
+        };
+        call.connected_at_ms = held.answered_at_ms;
+    }
+
+    /// The machine ended the call: the screen shows its outcome, and its history row waits.
+    fn ended(&mut self, ended: machine::Ended) {
+        if let Some(call) = self.active.as_mut().filter(|c| c.call_id == ended.call_id) {
+            call.phase = Phase::Over(outcome_of(&ended));
+        }
+        self.record = ended.history.map(|status| HistoryRecord {
+            id: ended.call_id.clone(),
+            peer_user_id: ended.peer_user_id.clone(),
+            direction: match ended.direction {
+                rule::Direction::Outgoing => 0,
+                rule::Direction::Incoming => 1,
+            },
+            status: i16::from(status.code()),
+            started_at_ms: ended.started_at_ms,
+            duration_seconds: i32::try_from(ended.duration_seconds).unwrap_or(i32::MAX),
+        });
+    }
+
+    /// Begin an outgoing call to `peer`. Returns the offer to send, or nothing when a call is
+    /// already up (the machine's `dial`; the orchestrator asks [`Manager::is_busy`] first).
     pub fn begin_outgoing(
         &mut self,
         call_id: String,
@@ -183,44 +227,32 @@ impl Manager {
         call_type: CallType,
         my_device: &str,
         my_user: &str,
-    ) -> SignalToSend {
-        let call = Call {
+    ) -> Option<SignalToSend> {
+        if self.machine.dial(&call_id, &peer, now_ms()) != machine::DialAction::Start {
+            return None;
+        }
+        let signal = offer(&call_id, my_device, my_user, call_type, String::new());
+        self.active = Some(Call {
             call_id,
-            peer,
+            peer: peer.clone(),
             direction: Direction::Outgoing,
             phase: Phase::Calling,
             call_type,
-            peer_device: None,
-            offered_devices: Vec::new(),
-            started_at_ms: now_ms(),
             connected_at_ms: None,
-            recorded: false,
-            end_reason: None,
-        };
-        let signal = offer(
-            &call.call_id,
-            my_device,
-            my_user,
-            call.call_type,
-            String::new(),
-        );
-        let to_send = SignalToSend {
-            peer: call.peer.clone(),
+        });
+        self.sync();
+        Some(SignalToSend {
+            peer,
             signal,
             to_device: None,
             route: E2EE_ONLY,
-        };
-        self.active = Some(call);
-        to_send
+        })
     }
 
-    /// An offer for `call_id` arrived from `sender_device` of `peer`. What it means is the core's
-    /// rule (`rule::on_offer`), as on iOS and Android: both sides dialling each other at once is
-    /// glare — the larger account id keeps its call, the smaller one gives its own up and rings
-    /// for theirs; any other held call makes this one busy.
-    ///
-    /// No memory of ended call ids here: an ended call stays held (`Phase::Over`) until
-    /// dismissed, and a late signal of it reaches `on_signal`, which drops it.
+    /// An offer for `call_id` arrived from `sender_device` of `peer`. What it means is the
+    /// machine's (`offer`), as on iOS and Android: an ended call's offer rings nothing; glare keeps
+    /// the larger account id's call, the smaller one gives its own up and rings for theirs; any
+    /// other held call makes this one busy. Stage A carries no SDP, so every offer is usable.
     pub fn on_offer(
         &mut self,
         call_id: String,
@@ -229,154 +261,167 @@ impl Manager {
         call_type: CallType,
         my_user: &str,
     ) -> OfferDisposition {
-        match rule::on_offer(false, self.held(&call_id, &peer), my_user, &peer) {
-            rule::OfferAction::Busy => OfferDisposition::Busy,
-            rule::OfferAction::KeepOurs => OfferDisposition::KeepOurs,
-            rule::OfferAction::HoldUntilAnswered
-            | rule::OfferAction::ResumeAnswer
-            | rule::OfferAction::Renegotiate
-            | rule::OfferAction::IgnoreEnded => OfferDisposition::HeldCall,
+        let step = self
+            .machine
+            .offer(&call_id, &peer, &sender_device, true, my_user, now_ms());
+        match step {
+            machine::OfferStep::Busy => OfferDisposition::Busy,
+            machine::OfferStep::KeepOurs => OfferDisposition::KeepOurs,
+            machine::OfferStep::Ignore
+            | machine::OfferStep::Hold
+            | machine::OfferStep::ResumeAnswer
+            | machine::OfferStep::Renegotiate => OfferDisposition::HeldCall,
+            machine::OfferStep::Fail(ended) => {
+                self.ended(ended);
+                OfferDisposition::HeldCall
+            }
             // Ours gives way: their offer replaces it. The peer ignores our offer (it keeps its
             // own call), so nothing is sent for the call we drop.
-            rule::OfferAction::Ring | rule::OfferAction::ReplaceOutgoing => {
-                self.begin_incoming(call_id, peer, sender_device, call_type);
+            machine::OfferStep::Ring | machine::OfferStep::ReplaceOutgoing { .. } => {
+                self.active = Some(Call {
+                    call_id,
+                    peer,
+                    direction: Direction::Incoming,
+                    phase: Phase::Incoming,
+                    call_type,
+                    connected_at_ms: None,
+                });
+                self.record = None;
+                self.sync();
                 OfferDisposition::Ring
             }
         }
     }
 
-    /// The held call as the offer rule reads it. A call that is over holds nothing.
-    fn held(&self, call_id: &str, offerer: &str) -> Option<rule::HeldCall> {
-        let call = self.active.as_ref()?;
-        if matches!(call.phase, Phase::Over(_)) {
-            return None;
-        }
-        Some(rule::HeldCall {
-            same_call: call.call_id == call_id,
-            direction: rule_direction(call.direction),
-            with_offerer: call.peer == offerer,
-            answered: call.connected_at_ms.is_some(),
-            // Stage A answers nothing before its offer: a call starts here from its offer.
-            awaiting_offer_after_answer: false,
-        })
-    }
-
-    /// An offer arrived from `sender_device` of `peer`. Returns nothing to send yet — the person
-    /// decides. Use [`Manager::on_offer`], which decides busy and glare first.
-    pub fn begin_incoming(
-        &mut self,
-        call_id: String,
-        peer: String,
-        sender_device: String,
-        call_type: CallType,
-    ) {
-        self.active = Some(Call {
-            call_id,
-            peer,
-            direction: Direction::Incoming,
-            phase: Phase::Incoming,
-            call_type,
-            peer_device: Some(sender_device),
-            offered_devices: Vec::new(),
-            started_at_ms: now_ms(),
-            connected_at_ms: None,
-            recorded: false,
-            end_reason: None,
-        });
-    }
-
     /// Record which devices the outgoing offer went to.
     pub fn note_offered(&mut self, devices: &[String]) {
-        if let Some(call) = &mut self.active {
-            call.offered_devices = devices.to_vec();
-        }
+        self.machine.offer_sent(devices.to_vec());
     }
 
     /// A signal arrived from `sender_device` (the device whose session opened it) for the held
-    /// call. Returns signals to send back: releases to devices the call no longer needs.
+    /// call. Returns signals to send back: releases to devices the call no longer needs, and the
+    /// received hangup repeated where the machine routes it.
     pub fn on_signal(
         &mut self,
         signal: &WebRtcSignal,
         sender_device: &str,
         my_device: &str,
     ) -> Vec<SignalToSend> {
-        let Some(call) = &mut self.active else {
+        let Some(peer) = self
+            .machine
+            .active()
+            .filter(|c| c.call_id == signal.call_id)
+            .map(|c| c.peer_user_id.clone())
+        else {
+            // A late signal of an ended call, or of a different call.
             return Vec::new();
         };
-        // A late signal of an ended call, or of a different call.
-        if signal.call_id != call.call_id || matches!(call.phase, Phase::Over(_)) {
-            return Vec::new();
-        }
         let Some(inner) = &signal.signal else {
             return Vec::new();
         };
         use web_rtc_signal::Signal as S;
-        match inner {
-            S::Answer(_) => {
-                if call.direction != Direction::Outgoing {
-                    return Vec::new();
+        let out = match inner {
+            S::Answer(_) => match self.machine.answer_from(&signal.call_id, sender_device) {
+                Some(rule::AnswerDisposition::ReleaseLate { device }) => {
+                    release(&peer, &signal.call_id, &[device], my_device)
                 }
-                match rule::on_answer(
-                    sender_device,
-                    call.peer_device.as_deref(),
-                    &call.offered_devices,
-                ) {
-                    rule::AnswerDisposition::ReleaseLate { device } => {
-                        release(call, &[device], my_device)
-                    }
-                    rule::AnswerDisposition::Accept {
-                        device,
-                        release: others,
-                    } => {
-                        let first = call.peer_device.is_none();
-                        call.peer_device = Some(device);
-                        call.offered_devices.clear();
-                        if first {
-                            call.connected_at_ms = Some(now_ms());
-                            call.phase = Phase::Live;
-                        }
-                        release(call, &others, my_device)
-                    }
+                Some(rule::AnswerDisposition::Accept {
+                    release: others, ..
+                }) => {
+                    // Stage A has no SDP to apply: the answer is the call answered.
+                    self.machine.answered(now_ms());
+                    release(&peer, &signal.call_id, &others, my_device)
                 }
-            }
-            S::Hangup(h) => remote_hangup(
-                call,
+                None => Vec::new(),
+            },
+            S::Hangup(h) => self.remote_hangup(
+                &peer,
+                &signal.call_id,
                 sender_device,
                 rule::HangupReason::from_wire(h.reason),
                 my_device,
             ),
-            S::Busy(_) => remote_hangup(call, sender_device, rule::HangupReason::Busy, my_device),
-            _ if !rule::admits(sender_device, call.peer_device.as_deref()) => Vec::new(),
+            S::Busy(_) => self.remote_hangup(
+                &peer,
+                &signal.call_id,
+                sender_device,
+                rule::HangupReason::Busy,
+                my_device,
+            ),
+            _ if !rule::admits(sender_device, self.chosen_device()) => Vec::new(),
             S::Ringing(_) => {
-                if call.direction == Direction::Outgoing && call.phase == Phase::Calling {
-                    call.phase = Phase::Ringing;
-                }
+                self.machine.ringing();
                 Vec::new()
             }
             // ICE, connected and media updates have no media to apply yet (stage B). An offer
-            // for the held call id is a renegotiation, which stage A has none of.
-            S::IceCandidate(_) | S::IceCandidates(_) | S::Connected(_) | S::MediaUpdate(_) => {
+            // for the held call id is the machine's (`on_offer`).
+            S::IceCandidate(_)
+            | S::IceCandidates(_)
+            | S::Connected(_)
+            | S::MediaUpdate(_)
+            | S::Offer(_) => Vec::new(),
+        };
+        self.sync();
+        out
+    }
+
+    /// A hangup (or a busy) from one of the peer's devices, as the machine routes it.
+    fn remote_hangup(
+        &mut self,
+        peer: &str,
+        call_id: &str,
+        from: &str,
+        reason: rule::HangupReason,
+        my_device: &str,
+    ) -> Vec<SignalToSend> {
+        match self.machine.hangup_from(call_id, from, reason, now_ms()) {
+            machine::RemoteHangupStep::Ignore | machine::RemoteHangupStep::DropDevice { .. } => {
                 Vec::new()
             }
-            S::Offer(_) => Vec::new(),
+            machine::RemoteHangupStep::End {
+                release: others,
+                reason,
+                route,
+                ended,
+            } => {
+                self.ended(ended);
+                let mut out = release(peer, call_id, &others, my_device);
+                // The peer told us; the server has not heard, and without it keeps us "in a call"
+                // and refuses the peer's call-back as busy (iOS AC92380B). Nowhere for "taken
+                // elsewhere". The machine says which paths.
+                if route.e2ee || route.stream {
+                    out.push(SignalToSend {
+                        peer: peer.to_owned(),
+                        signal: hangup(call_id, my_device, proto_reason(reason)),
+                        to_device: None,
+                        route,
+                    });
+                }
+                out
+            }
         }
     }
 
     /// The person answered the incoming call. Returns the answer to send back.
     pub fn accept(&mut self, my_device: &str, my_user: &str) -> Vec<SignalToSend> {
-        let Some(call) = &mut self.active else {
-            return Vec::new();
-        };
-        if call.direction != Direction::Incoming {
+        if self.machine.accept(now_ms()) == machine::AcceptStep::Ignore {
             return Vec::new();
         }
-        call.connected_at_ms = Some(now_ms());
-        call.phase = Phase::Live;
-        let signal = answer(&call.call_id, my_device, my_user, String::new());
+        let Some(held) = self.machine.active() else {
+            return Vec::new();
+        };
+        let (peer, call_id, device) = (
+            held.peer_user_id.clone(),
+            held.call_id.clone(),
+            held.chosen.clone(),
+        );
+        // Stage A has no offer to apply: the answer going out is the call answered.
+        self.machine.answered(now_ms());
+        self.sync();
         vec![SignalToSend {
-            peer: call.peer.clone(),
-            signal,
-            to_device: call.peer_device.clone(),
+            peer,
+            signal: answer(&call_id, my_device, my_user, String::new()),
+            to_device: device,
             route: E2EE_ONLY,
         }]
     }
@@ -391,77 +436,84 @@ impl Manager {
     }
 
     /// The person (or the app) ended the call: declined if it is incoming and still ringing,
-    /// a normal hangup otherwise (`rule::local_hangup_reason`). Returns the hangup to every
-    /// device the call reaches; the call stays in `Over(_)` until `dismiss`.
+    /// a normal hangup otherwise — the machine's `hang_up`. Returns the hangup to every device the
+    /// call reaches; the call stays in `Over(_)` until `dismiss`.
     pub fn end(&mut self, my_device: &str) -> Vec<SignalToSend> {
-        let Some(call) = &mut self.active else {
+        let Some(hangup) = self.machine.hang_up(now_ms()) else {
             return Vec::new();
         };
-        if matches!(call.phase, Phase::Over(_)) {
-            return Vec::new();
-        }
-        let reason = rule::local_hangup_reason(
-            rule_direction(call.direction),
-            call.phase == Phase::Incoming,
-        );
-        let targets = rule::targets(call.peer_device.as_deref(), &call.offered_devices, None);
-        finish(call, rule::EndReason::Hangup(reason));
-        let wire = hangup(&call.call_id, my_device, proto_reason(reason));
-        let route = rule::hangup_route(rule::HangupSide::Local, reason);
-        if targets.is_empty() {
+        self.local_hangup(hangup, my_device)
+    }
+
+    fn local_hangup(&mut self, h: machine::Hangup, my_device: &str) -> Vec<SignalToSend> {
+        let (peer, call_id) = (h.ended.peer_user_id.clone(), h.ended.call_id.clone());
+        self.ended(h.ended);
+        let wire = hangup(&call_id, my_device, proto_reason(h.reason));
+        if h.targets.is_empty() {
             // No device known yet (the offer is still going out): every device with a session.
             return vec![SignalToSend {
-                peer: call.peer.clone(),
+                peer,
                 signal: wire,
                 to_device: None,
-                route,
+                route: h.route,
             }];
         }
-        targets
+        h.targets
             .into_iter()
             .map(|device| SignalToSend {
-                peer: call.peer.clone(),
+                peer: peer.clone(),
                 signal: wire.clone(),
                 to_device: Some(device),
-                route,
+                route: h.route,
             })
             .collect()
     }
 
+    /// The earliest moment (Unix ms) [`Manager::tick`] has something to do.
+    pub fn next_deadline(&self) -> Option<i64> {
+        self.machine.next_deadline()
+    }
+
+    /// What the deadlines that passed by `now_ms` decided: an incoming call nobody answered ends
+    /// with our TIMEOUT (until now nothing ended it here, and it made every later caller busy).
+    /// An ICE restart waits for media (stage B).
+    pub fn tick(&mut self, now_ms: i64, my_device: &str) -> Vec<SignalToSend> {
+        match self.machine.tick(now_ms) {
+            Some(machine::Due::Unanswered(h)) => self.local_hangup(h, my_device),
+            Some(machine::Due::NoOffer(ended)) => {
+                self.ended(ended);
+                Vec::new()
+            }
+            Some(machine::Due::RestartIce) => {
+                self.machine.ice_restart_sent();
+                Vec::new()
+            }
+            None => Vec::new(),
+        }
+    }
+
     /// The person closed the ended call's outcome.
     pub fn dismiss(&mut self) {
-        self.active = None;
+        if !self.is_busy() {
+            self.active = None;
+        }
     }
 
     /// The history row for a call that just ended and was not yet recorded. `None` when there is
-    /// no call, it has not ended, it was already recorded, or it must not be recorded (taken on
-    /// another of our devices).
-    pub fn take_history_record(&mut self, now_ms: i64) -> Option<HistoryRecord> {
-        let call = self.active.as_mut()?;
-        if call.recorded || !matches!(call.phase, Phase::Over(_)) {
-            return None;
-        }
-        call.recorded = true;
-        let status = history_status(call)?;
-        Some(HistoryRecord {
-            id: call.call_id.clone(),
-            peer_user_id: call.peer.clone(),
-            direction: history_direction(call),
-            status,
-            started_at_ms: call.started_at_ms,
-            duration_seconds: i32::try_from(rule::duration_seconds(call.connected_at_ms, now_ms))
-                .unwrap_or(i32::MAX),
-        })
+    /// none, or it must not be recorded (taken on another of our devices). Its length is the
+    /// machine's, at the end.
+    pub fn take_history_record(&mut self, _now_ms: i64) -> Option<HistoryRecord> {
+        self.record.take()
     }
 }
 
 /// Release `devices`: tell each the call was taken elsewhere (E2EE, to that device alone).
-fn release(call: &Call, devices: &[String], my_device: &str) -> Vec<SignalToSend> {
+fn release(peer: &str, call_id: &str, devices: &[String], my_device: &str) -> Vec<SignalToSend> {
     devices
         .iter()
         .map(|device| SignalToSend {
-            peer: call.peer.clone(),
-            signal: hangup(&call.call_id, my_device, HangupReason::AcceptedElsewhere),
+            peer: peer.to_owned(),
+            signal: hangup(call_id, my_device, HangupReason::AcceptedElsewhere),
             to_device: Some(device.clone()),
             route: rule::hangup_route(
                 rule::HangupSide::Local,
@@ -471,66 +523,13 @@ fn release(call: &Call, devices: &[String], my_device: &str) -> Vec<SignalToSend
         .collect()
 }
 
-/// A hangup (or a busy) from one of the peer's devices, as the rule routes it.
-fn remote_hangup(
-    call: &mut Call,
-    from: &str,
-    reason: rule::HangupReason,
-    my_device: &str,
-) -> Vec<SignalToSend> {
-    match rule::on_hangup(
-        from,
-        reason,
-        call.peer_device.as_deref(),
-        &call.offered_devices,
-    ) {
-        rule::HangupDisposition::Ignore => Vec::new(),
-        rule::HangupDisposition::DropDevice { remaining } => {
-            call.offered_devices = remaining;
-            Vec::new()
-        }
-        rule::HangupDisposition::EndTakenElsewhere => {
-            finish(
-                call,
-                rule::EndReason::Hangup(rule::HangupReason::AcceptedElsewhere),
-            );
-            Vec::new()
-        }
-        rule::HangupDisposition::End { release: others } => {
-            finish(call, rule::EndReason::Hangup(reason));
-            let mut out = release(call, &others, my_device);
-            // The peer told us; the server has not heard, and without it keeps us "in a call"
-            // and refuses the peer's call-back as busy (iOS AC92380B). The rule says which paths.
-            let route = rule::hangup_route(rule::HangupSide::Remote, reason);
-            if route.e2ee || route.stream {
-                out.push(SignalToSend {
-                    peer: call.peer.clone(),
-                    signal: hangup(&call.call_id, my_device, proto_reason(reason)),
-                    to_device: None,
-                    route,
-                });
-            }
-            out
-        }
-    }
-}
-
-/// End the call for `reason`: the phase shows the rule's outcome.
-fn finish(call: &mut Call, reason: rule::EndReason) {
-    let connected = call
-        .connected_at_ms
-        .map(|_| rule::duration_seconds(call.connected_at_ms, now_ms()));
-    call.phase = Phase::Over(outcome_of(reason, connected));
-    call.end_reason = Some(reason);
-}
-
-/// The screen's outcome: the rule's, plus the one case the rule leaves to the screen — a call
+/// The screen's outcome: the machine's, plus the one case it leaves to the screen — a call
 /// another of our devices took, which is neither missed nor ended here.
-fn outcome_of(reason: rule::EndReason, connected_seconds: Option<u32>) -> Outcome {
-    if reason == rule::EndReason::Hangup(rule::HangupReason::AcceptedElsewhere) {
+fn outcome_of(ended: &machine::Ended) -> Outcome {
+    if ended.reason == rule::EndReason::Hangup(rule::HangupReason::AcceptedElsewhere) {
         return Outcome::AnsweredElsewhere;
     }
-    match rule::outcome(reason, connected_seconds) {
+    match ended.outcome {
         rule::Outcome::Ended { .. } => Outcome::Ended,
         rule::Outcome::Declined => Outcome::Declined,
         rule::Outcome::Busy => Outcome::Busy,
@@ -539,35 +538,8 @@ fn outcome_of(reason: rule::EndReason, connected_seconds: Option<u32>) -> Outcom
     }
 }
 
-/// The store's `CallStore.Status` code (completed 0, missed 1, declined 2, failed 3), by the
-/// rule. `None`: do not record (not ended, or taken on another of our devices).
-fn history_status(call: &Call) -> Option<i16> {
-    let reason = call.end_reason?;
-    let status = rule::history_status(
-        rule_direction(call.direction),
-        reason,
-        call.connected_at_ms.is_some(),
-    )?;
-    Some(i16::from(status.code()))
-}
-
-fn rule_direction(direction: Direction) -> rule::Direction {
-    match direction {
-        Direction::Outgoing => rule::Direction::Outgoing,
-        Direction::Incoming => rule::Direction::Incoming,
-    }
-}
-
 fn proto_reason(reason: rule::HangupReason) -> HangupReason {
     HangupReason::try_from(reason.wire()).unwrap_or(HangupReason::Unspecified)
-}
-
-/// The store's `CallRecord.Direction` code (outgoing 0, incoming 1).
-fn history_direction(call: &Call) -> i16 {
-    match call.direction {
-        Direction::Outgoing => 0,
-        Direction::Incoming => 1,
-    }
 }
 
 fn now_ms() -> i64 {
@@ -706,12 +678,28 @@ mod tests {
     use crate::proto::signaling::v1::web_rtc_signal::Signal as S;
 
     fn begin_outgoing(manager: &mut Manager) {
-        manager.begin_outgoing(
-            "c1".into(),
-            "peer".into(),
-            CallType::Audio,
-            "me",
-            "me@konstruct.cc",
+        manager
+            .begin_outgoing(
+                "c1".into(),
+                "peer".into(),
+                CallType::Audio,
+                "me",
+                "me@konstruct.cc",
+            )
+            .expect("nothing else is up");
+    }
+
+    /// Their call `call_id`, rung by its offer from `device`.
+    fn ring(manager: &mut Manager, call_id: &str, device: &str) {
+        assert_eq!(
+            manager.on_offer(
+                call_id.into(),
+                "peer".into(),
+                device.into(),
+                CallType::Audio,
+                "me"
+            ),
+            OfferDisposition::Ring
         );
     }
 
@@ -728,10 +716,7 @@ mod tests {
         let answer_sig = answer("c1", "peer-device", "peer@konstruct.cc", String::new());
         assert!(m.on_signal(&answer_sig, "peer-device", "me").is_empty());
         assert_eq!(m.active().unwrap().phase, Phase::Live);
-        assert_eq!(
-            m.active().unwrap().peer_device.as_deref(),
-            Some("peer-device")
-        );
+        assert_eq!(m.chosen_device(), Some("peer-device"));
     }
 
     #[test]
@@ -751,18 +736,13 @@ mod tests {
         assert_eq!(out[0].to_device.as_deref(), Some("device-2"));
         // Never on the stream: the server would end the call for the device that took it.
         assert_eq!(out[0].route, E2EE_ONLY);
-        assert_eq!(m.active().unwrap().peer_device.as_deref(), Some("device-1"));
+        assert_eq!(m.chosen_device(), Some("device-1"));
     }
 
     #[test]
     fn accepting_an_incoming_call_answers_and_goes_live() {
         let mut m = Manager::new();
-        m.begin_incoming(
-            "c1".into(),
-            "peer".into(),
-            "peer-device".into(),
-            CallType::Audio,
-        );
+        ring(&mut m, "c1", "peer-device");
         assert_eq!(m.active().unwrap().phase, Phase::Incoming);
 
         let out = m.accept("me", "me@konstruct.cc");
@@ -850,12 +830,7 @@ mod tests {
     #[test]
     fn an_offer_for_the_held_call_is_not_a_second_caller() {
         let mut m = Manager::new();
-        m.begin_incoming(
-            "c1".into(),
-            "peer".into(),
-            "peer-device".into(),
-            CallType::Audio,
-        );
+        ring(&mut m, "c1", "peer-device");
         assert_eq!(
             m.on_offer(
                 "c1".into(),
@@ -881,12 +856,7 @@ mod tests {
     #[test]
     fn declining_keeps_the_outcome_until_dismiss_and_does_not_block_a_new_call() {
         let mut m = Manager::new();
-        m.begin_incoming(
-            "c1".into(),
-            "peer".into(),
-            "peer-device".into(),
-            CallType::Audio,
-        );
+        ring(&mut m, "c1", "peer-device");
         let out = m.decline("me");
         assert_eq!(out.len(), 1);
         assert!(matches!(out[0].signal.signal, Some(S::Hangup(_))));
@@ -900,12 +870,7 @@ mod tests {
     #[test]
     fn a_call_taken_elsewhere_writes_no_history() {
         let mut m = Manager::new();
-        m.begin_incoming(
-            "c1".into(),
-            "peer".into(),
-            "peer-device".into(),
-            CallType::Audio,
-        );
+        ring(&mut m, "c1", "peer-device");
         let h = hangup("c1", "peer-device", HangupReason::AcceptedElsewhere);
         m.on_signal(&h, "peer-device", "me");
         assert_eq!(
@@ -915,27 +880,26 @@ mod tests {
         assert!(m.take_history_record(now_ms()).is_none());
     }
 
+    /// The row's status and direction, as the store keeps them.
+    fn row(m: &mut Manager) -> (i16, i16) {
+        let r = m.take_history_record(0).expect("a row");
+        (r.status, r.direction)
+    }
+
     #[test]
     fn history_status_maps_the_outcomes_as_ios_does() {
         // Incoming, declined by us → declined (2), direction incoming (1).
         let mut m = Manager::new();
-        m.begin_incoming(
-            "c1".into(),
-            "peer".into(),
-            "peer-device".into(),
-            CallType::Audio,
-        );
+        ring(&mut m, "c1", "peer-device");
         m.decline("me");
-        assert_eq!(history_status(m.active().unwrap()), Some(2));
-        assert_eq!(history_direction(m.active().unwrap()), 1);
+        assert_eq!(row(&mut m), (2, 1));
 
         // Outgoing, the peer declined → missed (1), direction outgoing (0).
         let mut m = Manager::new();
         begin_outgoing(&mut m);
         let h = hangup("c1", "peer-device", HangupReason::Declined);
         m.on_signal(&h, "peer-device", "me");
-        assert_eq!(history_status(m.active().unwrap()), Some(1));
-        assert_eq!(history_direction(m.active().unwrap()), 0);
+        assert_eq!(row(&mut m), (1, 0));
 
         // Connected and ended normally → completed (0); never connected → missed (1).
         let mut m = Manager::new();
@@ -944,13 +908,13 @@ mod tests {
         m.on_signal(&a, "peer-device", "me");
         let h = hangup("c1", "peer-device", HangupReason::Normal);
         m.on_signal(&h, "peer-device", "me");
-        assert_eq!(history_status(m.active().unwrap()), Some(0));
+        assert_eq!(row(&mut m).0, 0);
 
         let mut m = Manager::new();
         begin_outgoing(&mut m);
         let h = hangup("c1", "peer-device", HangupReason::Normal);
         m.on_signal(&h, "peer-device", "me");
-        assert_eq!(history_status(m.active().unwrap()), Some(1));
+        assert_eq!(row(&mut m).0, 1);
     }
 
     // ── The five places this client differed from iOS and Android (todo 295) ──────────────
@@ -989,7 +953,7 @@ mod tests {
         m.note_offered(&["d1".into(), "d2".into()]);
         m.on_signal(&busy("c1", "d1"), "d1", "me");
         assert_eq!(m.active().unwrap().phase, Phase::Calling);
-        assert_eq!(m.active().unwrap().offered_devices, ["d2"]);
+        assert_eq!(m.offered_devices(), ["d2"]);
         m.on_signal(&busy("c1", "d2"), "d2", "me");
         assert_eq!(m.active().unwrap().phase, Phase::Over(Outcome::Busy));
     }
@@ -1063,14 +1027,14 @@ mod tests {
             "me",
         );
         assert_eq!(m.active().unwrap().phase, Phase::Over(Outcome::Failed));
-        assert_eq!(history_status(m.active().unwrap()), Some(1));
+        assert_eq!(row(&mut m).0, 1);
     }
 
     /// Mutation: always a normal hangup — a ringing call we end is declined.
     #[test]
     fn ending_an_incoming_call_that_still_rings_declines_it() {
         let mut m = Manager::new();
-        m.begin_incoming("c1".into(), "peer".into(), "pd".into(), CallType::Audio);
+        ring(&mut m, "c1", "pd");
         let out = m.end("me");
         assert_eq!(hangup_reason(&out[0]), HangupReason::Declined as i32);
         assert_eq!(out[0].to_device.as_deref(), Some("pd"));
@@ -1093,7 +1057,7 @@ mod tests {
     #[test]
     fn taken_elsewhere_counts_only_from_the_calls_own_device() {
         let mut m = Manager::new();
-        m.begin_incoming("c1".into(), "peer".into(), "pd".into(), CallType::Audio);
+        ring(&mut m, "c1", "pd");
         m.on_signal(
             &hangup("c1", "other", HangupReason::AcceptedElsewhere),
             "other",
@@ -1127,7 +1091,7 @@ mod tests {
     #[test]
     fn ringing_moves_only_an_outgoing_call_that_is_calling() {
         let mut m = Manager::new();
-        m.begin_incoming("c1".into(), "peer".into(), "pd".into(), CallType::Audio);
+        ring(&mut m, "c1", "pd");
         m.on_signal(&ringing("c1", "pd"), "pd", "me");
         assert_eq!(m.active().unwrap().phase, Phase::Incoming);
     }
@@ -1143,19 +1107,35 @@ mod tests {
 
     /// Mutations: never write the row; write it twice; write it before the call ended.
     #[test]
-    fn an_ended_call_writes_its_row_once_with_its_length() {
+    fn an_ended_call_writes_its_row_once() {
         let mut m = Manager::new();
         begin_outgoing(&mut m);
         m.on_signal(&answer("c1", "pd", "peer", String::new()), "pd", "me");
         assert!(m.take_history_record(now_ms()).is_none(), "not over yet");
-        let answered = m.active().unwrap().connected_at_ms.unwrap();
         m.on_signal(&hangup("c1", "pd", HangupReason::Normal), "pd", "me");
-        let row = m.take_history_record(answered + 61_500).expect("a row");
+        let row = m.take_history_record(now_ms()).expect("a row");
         assert_eq!((row.id.as_str(), row.peer_user_id.as_str()), ("c1", "peer"));
-        assert_eq!(
-            (row.direction, row.status, row.duration_seconds),
-            (0, 0, 61)
-        );
+        // The length is the machine's, counted at the end: under a second here.
+        assert_eq!((row.direction, row.status, row.duration_seconds), (0, 0, 0));
         assert!(m.take_history_record(now_ms()).is_none(), "written once");
+    }
+
+    /// Nothing ended an unanswered incoming call here: it rang until the caller gave up and made
+    /// every later caller busy. The machine's deadline ends it with our TIMEOUT to its device.
+    ///
+    /// Mutations: `tick` ignores the unanswered deadline; no deadline armed.
+    #[test]
+    fn an_unanswered_call_ends_at_the_machines_deadline() {
+        let mut m = Manager::new();
+        ring(&mut m, "c1", "pd");
+        let due = m.next_deadline().expect("a ring deadline");
+        assert!(m.tick(due - 1, "me").is_empty());
+        let out = m.tick(due, "me");
+        assert_eq!(out.len(), 1);
+        assert_eq!(hangup_reason(&out[0]), HangupReason::Timeout as i32);
+        assert_eq!(out[0].to_device.as_deref(), Some("pd"));
+        assert_eq!(m.active().unwrap().phase, Phase::Over(Outcome::NoAnswer));
+        assert_eq!(row(&mut m), (1, 1));
+        assert!(!m.is_busy());
     }
 }
