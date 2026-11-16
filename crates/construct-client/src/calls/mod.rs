@@ -271,8 +271,9 @@ impl Manager {
             | machine::OfferStep::Hold
             | machine::OfferStep::ResumeAnswer
             | machine::OfferStep::Renegotiate => OfferDisposition::HeldCall,
-            machine::OfferStep::Fail(ended) => {
-                self.ended(ended);
+            // Unreached in stage A: every offer here is usable, and only an unusable one fails.
+            machine::OfferStep::Fail(failure) => {
+                self.ended(failure.ended);
                 OfferDisposition::HeldCall
             }
             // Ours gives way: their offer replaces it. The peer ignores our offer (it keeps its
@@ -448,25 +449,17 @@ impl Manager {
     fn local_hangup(&mut self, h: machine::Hangup, my_device: &str) -> Vec<SignalToSend> {
         let (peer, call_id) = (h.ended.peer_user_id.clone(), h.ended.call_id.clone());
         self.ended(h.ended);
-        let wire = hangup(&call_id, my_device, proto_reason(h.reason));
-        if h.targets.is_empty() {
-            // No device known yet (the offer is still going out): every device with a session.
-            return vec![SignalToSend {
-                peer,
-                signal: wire,
-                to_device: None,
-                route: h.route,
-            }];
-        }
-        h.targets
-            .into_iter()
-            .map(|device| SignalToSend {
-                peer: peer.clone(),
-                signal: wire.clone(),
-                to_device: Some(device),
-                route: h.route,
-            })
-            .collect()
+        hangup_signals(&peer, &call_id, my_device, h.reason, h.targets, h.route)
+    }
+
+    /// A failure of ours ended the call; the machine's hangup (`CONNECTION_FAILED`), when it
+    /// gives one, tells the peer (construct-core 0.76.0).
+    fn failed(&mut self, f: machine::Failure, my_device: &str) -> Vec<SignalToSend> {
+        let (peer, call_id) = (f.ended.peer_user_id.clone(), f.ended.call_id.clone());
+        self.ended(f.ended);
+        f.hangup.map_or_else(Vec::new, |h| {
+            hangup_signals(&peer, &call_id, my_device, h.reason, h.targets, h.route)
+        })
     }
 
     /// The earliest moment (Unix ms) [`Manager::tick`] has something to do.
@@ -480,10 +473,7 @@ impl Manager {
     pub fn tick(&mut self, now_ms: i64, my_device: &str) -> Vec<SignalToSend> {
         match self.machine.tick(now_ms) {
             Some(machine::Due::Unanswered(h)) => self.local_hangup(h, my_device),
-            Some(machine::Due::NoOffer(ended)) => {
-                self.ended(ended);
-                Vec::new()
-            }
+            Some(machine::Due::NoOffer(failure)) => self.failed(failure, my_device),
             Some(machine::Due::RestartIce) => {
                 self.machine.ice_restart_sent();
                 Vec::new()
@@ -536,6 +526,36 @@ fn outcome_of(ended: &machine::Ended) -> Outcome {
         rule::Outcome::NoAnswer => Outcome::NoAnswer,
         rule::Outcome::Failed => Outcome::Failed,
     }
+}
+
+/// Our hangup for `call_id`, one signal per target device.
+fn hangup_signals(
+    peer: &str,
+    call_id: &str,
+    my_device: &str,
+    reason: rule::HangupReason,
+    targets: Vec<String>,
+    route: rule::HangupRoute,
+) -> Vec<SignalToSend> {
+    let wire = hangup(call_id, my_device, proto_reason(reason));
+    if targets.is_empty() {
+        // No device known yet (the offer is still going out): every device with a session.
+        return vec![SignalToSend {
+            peer: peer.to_owned(),
+            signal: wire,
+            to_device: None,
+            route,
+        }];
+    }
+    targets
+        .into_iter()
+        .map(|device| SignalToSend {
+            peer: peer.to_owned(),
+            signal: wire.clone(),
+            to_device: Some(device),
+            route,
+        })
+        .collect()
 }
 
 fn proto_reason(reason: rule::HangupReason) -> HangupReason {
