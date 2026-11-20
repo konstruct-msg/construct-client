@@ -748,7 +748,7 @@ dependencies = [
 
 [[package]]
 name = "construct-core"
-version = "0.76.0"
+version = "0.77.0"
 dependencies = [
  "aes-gcm",
  "argon2",
