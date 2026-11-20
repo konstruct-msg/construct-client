@@ -3152,6 +3152,14 @@ impl Task {
                 self.ui_error(format!("[{code}] {message}"));
             }
 
+            // Answers to `SessionNeeded`, which this client does not send yet: a first send opens
+            // through `open_session` (construct-docs todo 305; Desktop adopts the event after Android).
+            Action::OpenInFlight { contact_id }
+            | Action::SessionHeld { contact_id }
+            | Action::SessionOpenedAtRisk { contact_id } => {
+                tracing::warn!(device = %contact_id, "answer to a SessionNeeded this client never sent");
+            }
+
             // ── Timers ──────────────────────────────────────────────────────────
             Action::ScheduleTimer { timer_id, delay_ms } => {
                 let tx = self.self_tx.clone();
@@ -4404,7 +4412,11 @@ mod crossing_open_tests {
         // We open to Bob before his message arrives.
         let (x3dh, kyber) = bundle_of(&mut bob);
         task.open_session(crate::grpc::FetchedPreKeyBundle {
-            bundle: SessionBundle { x3dh, kyber },
+            bundle: SessionBundle {
+                x3dh,
+                kyber,
+                stale_age_secs: None,
+            },
             device_id: bob_device.clone(),
             certificate: None,
         })

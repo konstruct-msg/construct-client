@@ -115,7 +115,12 @@ fn fetched_bundle(
         ));
     }
     Ok(FetchedPreKeyBundle {
-        bundle: SessionBundle { x3dh, kyber },
+        // No stale age: this client opens a first send itself (`open_session`), strictly.
+        bundle: SessionBundle {
+            x3dh,
+            kyber,
+            stale_age_secs: None,
+        },
         device_id,
         certificate: None,
     })
