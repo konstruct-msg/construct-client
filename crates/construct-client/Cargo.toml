@@ -84,6 +84,8 @@ construct-store = { path = "../../../construct-core/store", features = ["vendore
 
 [target.'cfg(target_os = "windows")'.dependencies]
 keyring = { version = "3", features = ["windows-native"] }
+# The entry's persistence, which keyring 3 does not let one choose (`windows_credential`).
+windows-sys = { version = "0.60", features = ["Win32_Foundation", "Win32_Security_Credentials"] }
 construct-store = { path = "../../../construct-core/store", features = ["vendored-openssl"] }
 
 [build-dependencies]

@@ -11,6 +11,7 @@ mod calls;
 mod contacts;
 mod identity;
 mod inbound;
+mod launch;
 mod linking;
 mod lock;
 mod messages;
@@ -22,8 +23,10 @@ mod tokens;
 mod transfer;
 mod veil;
 
+pub use crate::sealed_key::MIN_PASSPHRASE_LEN;
 pub(crate) use auth::AuthMsg;
 pub use contacts::{FindStarted, SearchResult};
+pub use launch::LaunchPassphrase;
 pub use lock::{AppLock, MIN_CODE_LEN};
 pub use profile::AvatarChange;
 pub use settings::{AccountSettings, InviteEntry, normalize_username};
@@ -191,6 +194,12 @@ pub enum ClientCommand {
         remove: bool,
         delay_secs: u32,
     },
+    /// Set, change (`new`) or remove (`new: None`) the passphrase asked for at each start. With
+    /// one set, `current` must be it.
+    SetLaunchPassphrase {
+        current: Option<Zeroizing<Vec<u8>>>,
+        new: Option<Zeroizing<Vec<u8>>>,
+    },
     /// A code handed in at the lock screen.
     UnlockApp(Zeroizing<String>),
     /// Write this device's history to a file sealed to `device_id`, another device of the
@@ -274,8 +283,11 @@ pub enum ClientEvent {
     Account(AccountInfo),
     /// Signed in and running; these are the stored contacts.
     Started(Vec<StoredContact>),
-    /// A new account is signed in and waits for [`ClientCommand::SetPassphrase`].
+    /// A new account — or a session from before the store — waits for
+    /// [`ClientCommand::SetPassphrase`].
     NeedsPassphrase,
+    /// The store waits for its launch passphrase: [`ClientCommand::Unlock`].
+    NeedsUnlock,
     /// Signing in failed. `no_session`: there was nothing on disk to restore.
     AuthFailed {
         reason: String,
@@ -365,6 +377,10 @@ pub enum ClientEvent {
     AppUnlocked(Result<(), String>),
     /// A change to the app lock was refused, and why.
     AppLockRefused(String),
+    /// How the store stands with a launch passphrase: after start and after each change.
+    LaunchPassphrase(LaunchPassphrase),
+    /// A change to the launch passphrase was refused, and why.
+    LaunchPassphraseRefused(String),
     /// The server did not delete the account; nothing was wiped. The reason, for the person.
     DeleteAccountFailed(String),
     /// Where the account's recovery key stands, for this device. Sent after each start and
@@ -666,6 +682,9 @@ impl Client {
                 remove,
                 delay_secs,
             } => self.set_app_lock(current, code, remove, delay_secs),
+            ClientCommand::SetLaunchPassphrase { current, new } => {
+                self.set_launch_passphrase(current, new)
+            }
             ClientCommand::UnlockApp(code) => self.unlock_app(code),
             ClientCommand::SetMediaPrefs(prefs) => self.set_media_prefs(prefs),
             ClientCommand::LoadStickers => self.load_stickers(),

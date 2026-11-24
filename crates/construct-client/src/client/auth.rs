@@ -124,10 +124,12 @@ impl Client {
         };
         match data.existing() {
             Some(KeyKeeping::KeyStore | KeyKeeping::KeyFile) => {
-                let session = data
-                    .open_store()
-                    .map_err(|e| format!("{e:#}"))
-                    .and_then(|store| self.adopt_store(store));
+                let opened = data.open_store().map_err(|e| format!("{e:#}"));
+                let session = match opened {
+                    Ok(Some(store)) => self.adopt_store(store),
+                    Ok(None) => return self.emit(ClientEvent::NeedsUnlock),
+                    Err(e) => Err(e),
+                };
                 match session {
                     Ok(session) => self.authenticate_saved(session),
                     Err(e) => self.fail(e),
@@ -138,7 +140,8 @@ impl Client {
                 Ok(Some(session)) => {
                     let key_file = self.no_encrypt;
                     match self.migrate_legacy(session, key_file, None) {
-                        Ok(session) => self.authenticate_saved(session),
+                        Ok(Some(session)) => self.authenticate_saved(session),
+                        Ok(None) => self.emit(ClientEvent::NeedsPassphrase),
                         Err(e) => self.fail(e),
                     }
                 }
@@ -160,18 +163,20 @@ impl Client {
             Err(e) => return self.emit(ClientEvent::UnlockFailed(e)),
         };
         let session = match data.existing() {
-            Some(KeyKeeping::Passphrase) => data
+            Some(KeyKeeping::Passphrase | KeyKeeping::KeyStore) => data
                 .open_store_with_passphrase(passphrase)
                 .map_err(|e| format!("{e:#}"))
                 .and_then(|store| self.adopt_store(store)),
             None => match config::open_session_key(passphrase)
                 .and_then(|sk| sk.map(|sk| config::load_session_encrypted(&sk)).transpose())
             {
-                Ok(Some(Some(session))) => self.migrate_legacy(session, false, Some(passphrase)),
+                Ok(Some(Some(session))) => self
+                    .migrate_legacy(session, false, Some(passphrase))
+                    .and_then(|s| s.ok_or_else(|| "no way to keep the store key".into())),
                 Ok(_) => Err("No session found".into()),
                 Err(_) => Err("Wrong passphrase or corrupted session".into()),
             },
-            Some(_) => Err("this store opens without a passphrase".into()),
+            Some(KeyKeeping::KeyFile) => Err("this store opens without a passphrase".into()),
         };
         match session {
             Ok(session) => {
@@ -183,37 +188,42 @@ impl Client {
         }
     }
 
-    /// A session from before the store: make the store (the OS key store keeps its key, else the
-    /// passphrase the session was under, else a key file), move the session in, delete the old
-    /// files. The old database is not carried over: its sessions reopen from the peers' next
-    /// messages, its history is gone (pre-release; TODO 218 stage 2).
-    fn migrate_legacy(
+    /// A session from before the store: make the store (the OS key store keeps its key, under the
+    /// passphrase the session was under if it had one; without an OS key store, that passphrase
+    /// makes the key), move the session in, delete the old files. `None`: there is neither, and
+    /// the session waits for [`super::ClientCommand::SetPassphrase`] — a key file beside the
+    /// database, which this fell back to, opens for whoever copies the directory. The old database
+    /// is not carried over: its sessions reopen from the peers' next messages, its history is gone
+    /// (pre-release; TODO 218 stage 2).
+    pub(super) fn migrate_legacy(
         &mut self,
         session: Session,
         key_file: bool,
         passphrase: Option<&[u8]>,
-    ) -> Result<Session, String> {
-        let data = self.data_dir()?;
-        let store = match data.create_store(key_file).map_err(|e| format!("{e:#}"))? {
-            Some(store) => store,
-            None => match passphrase {
-                Some(p) => data
-                    .create_store_with_passphrase(p)
-                    .map_err(|e| format!("{e:#}"))?,
-                None => data
-                    .create_store(true)
-                    .map_err(|e| format!("{e:#}"))?
-                    .ok_or("no way to keep the store key")?,
-            },
+    ) -> Result<Option<Session>, String> {
+        let made = self
+            .data_dir()?
+            .create_store_for_session(key_file, passphrase)
+            .map_err(|e| format!("{e:#}"))?;
+        let Some(store) = made else {
+            self.pending_session = Some(session);
+            return Ok(None);
         };
-        data.remove_legacy_database();
         self.store = Some(crate::local_store::LocalStore::new(store, &session.user_id));
         self.save_session(&session)?;
+        self.forget_legacy_session();
+        Ok(Some(session))
+    }
+
+    /// The session is in the store: its old file and the database before the store go.
+    fn forget_legacy_session(&mut self) {
+        if let Ok(data) = self.data_dir() {
+            data.remove_legacy_database();
+        }
         if let Err(e) = config::clear_session() {
             tracing::warn!(error = %e, "old session file not removed");
         }
         tracing::info!("session moved into the local store");
-        Ok(session)
     }
 
     /// Write the session into the store.
@@ -538,6 +548,7 @@ impl Client {
         });
         // Before the screens are drawn: a locked window shows nothing of the account.
         self.emit_app_lock();
+        self.emit_launch_passphrase();
         self.emit(ClientEvent::Started(contacts));
         self.emit_mailbox_gap();
         self.ensure_recovery_key();
@@ -575,7 +586,11 @@ impl Client {
         self.emit(ClientEvent::Account(self.account_info()));
         match self.current_session.clone() {
             Some(full) => self.start(full),
-            None => self.emit(ClientEvent::Started(Vec::new())),
+            // Not signed in yet: the session is from before the store (`migrate_legacy`).
+            None => {
+                self.forget_legacy_session();
+                self.authenticate_saved(session);
+            }
         }
     }
 
