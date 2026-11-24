@@ -59,7 +59,7 @@ A change on the delivery or crypto path answers three questions in its commit me
 - **No protocol here.** What the core decides is asked of it; look in `construct-core/src/construct_core.udl` and the crate API before writing one.
 - **Everything handed to the core is a device id; everything shown or addressed on the server is an account id.** `peers.rs` is the one map between them.
 - **Every send to another account is sealed.** There is no unsealed send path.
-- **The local store is `construct-store`'s; this repo has no schema.** `local_store.rs` maps calls onto it; `local_data.rs` owns the directory: one process at a time (`konstruct.lock`), the store key in the OS key store, else from a passphrase (Argon2id, salt beside the database), else a key file (`--no-encrypt`). Logout wipes the store and its key.
+- **The local store is `construct-store`'s; this repo has no schema.** `local_store.rs` maps calls onto it; `local_data.rs` owns the directory: one process at a time (`konstruct.lock`), the store key in the OS key store (sealed there under a launch passphrase, if one is set: `sealed_key.rs`), else from a passphrase (Argon2id, salt beside the database), else a key file (`--no-encrypt`). Logout wipes the store and its key.
 - **This repository is public.** No server host names, IPs or other people's personal data in files, commits or PRs.
 - **Interop checks** use recognisable test accounts (`examples/probe.rs`, one `HOME` per account). Before release test and production server are one machine (owner, 2026-10-23).
 

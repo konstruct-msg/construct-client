@@ -742,6 +742,7 @@ dependencies = [
  "tracing-subscriber",
  "uuid",
  "webpki-roots 0.26.11",
+ "windows-sys 0.60.2",
  "x25519-dalek",
  "zeroize",
 ]

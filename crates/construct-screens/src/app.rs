@@ -275,6 +275,10 @@ impl App {
                 self.unlock_screen.reset_for_mode(UnlockMode::SetNew);
                 self.screen = Screen::SetPassphrase;
             }
+            ClientEvent::NeedsUnlock => {
+                self.unlock_screen.reset_for_mode(UnlockMode::Unlock);
+                self.screen = Screen::Unlock;
+            }
             ClientEvent::SaveFailed(e) => {
                 self.finish_registration_screen();
                 self.screen = Screen::AuthError(e);
@@ -431,6 +435,9 @@ impl App {
             // The terminal has no lock screen yet; the desktop does.
             ClientEvent::AppLock(_) | ClientEvent::AppUnlocked(_) => {}
             ClientEvent::AppLockRefused(why) => self.status = why,
+            // Nor its setting; a store that has one is opened above.
+            ClientEvent::LaunchPassphrase(_) => {}
+            ClientEvent::LaunchPassphraseRefused(why) => self.status = why,
             // The terminal does not offer a code yet; the desktop does.
             ClientEvent::LinkOffer { .. } => {}
             ClientEvent::LinkOfferEnded(ended) => {

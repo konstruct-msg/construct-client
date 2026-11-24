@@ -5,7 +5,8 @@
 //! keeps only the 32-byte store key (decisions/local-store-in-the-core.md, p. 3):
 //!
 //! - **the OS key store** (`keyring`: Keychain, Secret Service, Credential Manager) — a random
-//!   key, nothing to type;
+//!   key, nothing to type — or, with a launch passphrase, that key sealed under it
+//!   (`sealed_key`), and then opening takes both;
 //! - **a passphrase** when there is no key store: the key is Argon2id(passphrase, salt), the salt
 //!   in a file beside the database;
 //! - **a key file** beside the database for `--no-encrypt` (development and the headless probe):
@@ -22,6 +23,8 @@ use construct_store::{KEY_LEN, Store};
 use rand::RngCore;
 use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
+
+use crate::sealed_key;
 
 const STORE_FILE: &str = "store.db";
 const SALT_FILE: &str = "store.salt";
@@ -41,6 +44,7 @@ pub enum KeyKeeping {
 #[derive(Debug)]
 pub struct DataDir {
     dir: PathBuf,
+    keys: KeyStore,
     _lock: File,
 }
 
@@ -53,6 +57,10 @@ impl DataDir {
 
     /// Lock `dir`, creating it. Fails when another process holds it.
     pub fn open(dir: &Path) -> Result<Self> {
+        Self::open_with(dir, KeyStore::Os)
+    }
+
+    pub(crate) fn open_with(dir: &Path, keys: KeyStore) -> Result<Self> {
         std::fs::create_dir_all(dir)?;
         restrict(dir, 0o700);
         let lock = File::create(dir.join(LOCK_FILE))?;
@@ -61,6 +69,7 @@ impl DataDir {
         }
         Ok(Self {
             dir: dir.to_path_buf(),
+            keys,
             _lock: lock,
         })
     }
@@ -89,26 +98,121 @@ impl DataDir {
         existing_in(&self.dir)
     }
 
-    /// Open the store with the key the OS key store or the key file holds.
-    pub fn open_store(&self) -> Result<Store> {
+    /// Open the store with the key the OS key store or the key file holds. `None` when the key
+    /// in the OS key store is sealed under a launch passphrase: the caller asks for it.
+    pub fn open_store(&self) -> Result<Option<Store>> {
         let key = match self.existing() {
-            Some(KeyKeeping::KeyStore) => keystore_get(&self.store_path())?
-                .context("the store key is not in the OS key store")?,
+            Some(KeyKeeping::KeyStore) => match self.entry()? {
+                sealed_key::Entry::Bare(key) => key,
+                sealed_key::Entry::Sealed(_) => return Ok(None),
+            },
             Some(KeyKeeping::KeyFile) => read_key_file(&self.dir.join(KEY_FILE))?,
             Some(KeyKeeping::Passphrase) => bail!("this store is opened with its passphrase"),
             None => bail!("there is no store here"),
         };
-        Ok(Store::open(self.store_path(), key.as_slice())?)
+        Ok(Some(Store::open(self.store_path(), key.as_slice())?))
     }
 
-    /// Open a passphrase-kept store.
+    /// Open a store that takes a passphrase: its key is derived from it, or sealed under it in
+    /// the OS key store.
     pub fn open_store_with_passphrase(&self, passphrase: &[u8]) -> Result<Store> {
-        let salt = std::fs::read(self.dir.join(SALT_FILE)).context("no passphrase salt")?;
-        let key = crate::config::derive_master_key(passphrase, &salt)?;
+        let kept = self.existing();
+        let key = match kept {
+            Some(KeyKeeping::Passphrase) => {
+                let salt = std::fs::read(self.dir.join(SALT_FILE)).context("no passphrase salt")?;
+                let key = crate::config::derive_master_key(passphrase, &salt)?;
+                Zeroizing::new(key.to_vec())
+            }
+            Some(KeyKeeping::KeyStore) => match self.entry()? {
+                sealed_key::Entry::Sealed(sealed) => {
+                    sealed_key::open(&sealed, passphrase)?.context("Wrong passphrase")?
+                }
+                sealed_key::Entry::Bare(_) => bail!("this store opens without a passphrase"),
+            },
+            Some(KeyKeeping::KeyFile) => bail!("this store opens without a passphrase"),
+            None => bail!("there is no store here"),
+        };
         Store::open(self.store_path(), key.as_slice()).map_err(|e| match e {
-            construct_store::StoreError::WrongKey => anyhow::anyhow!("Wrong passphrase"),
+            construct_store::StoreError::WrongKey if kept == Some(KeyKeeping::Passphrase) => {
+                anyhow::anyhow!("Wrong passphrase")
+            }
             e => e.into(),
         })
+    }
+
+    /// Set, change (`new`) or remove (`new: None`) the launch passphrase of a store whose key the
+    /// OS key store keeps. With one set, `current` must be it. One write of the entry: the store
+    /// key itself stays as it is, so whoever took it before still has it.
+    pub fn set_launch_passphrase(&self, current: Option<&[u8]>, new: Option<&[u8]>) -> Result<()> {
+        if self.existing() != Some(KeyKeeping::KeyStore) {
+            bail!("the OS key store does not keep the key of this store");
+        }
+        let length = |p: &[u8]| std::str::from_utf8(p).map_or(p.len(), |s| s.chars().count());
+        if new.is_some_and(|p| length(p) < sealed_key::MIN_PASSPHRASE_LEN) {
+            bail!(
+                "A passphrase has at least {} characters",
+                sealed_key::MIN_PASSPHRASE_LEN
+            );
+        }
+        let (key, before) = match self.entry()? {
+            sealed_key::Entry::Bare(key) => (key.clone(), key),
+            sealed_key::Entry::Sealed(sealed) => {
+                let current = current.context("The current passphrase is needed")?;
+                let key = sealed_key::open(&sealed, current)?
+                    .context("The current passphrase is wrong")?;
+                (key, Zeroizing::new(sealed))
+            }
+        };
+        let after = match new {
+            Some(passphrase) => Zeroizing::new(sealed_key::seal(&key, passphrase)?),
+            None => key,
+        };
+        self.keys.set(&self.store_path(), &after).inspect_err(|_| {
+            // Written but not read back the same: what was there opened the store.
+            if let Err(e) = self.keys.set(&self.store_path(), &before) {
+                tracing::error!(error = %e, "the store key's entry could not be put back");
+            }
+        })
+    }
+
+    /// Make the store of a session from before it, under the passphrase that session had, if any:
+    /// its key sealed in the OS key store, or made from it where there is none. `None`: there is
+    /// neither. That passphrase was chosen before there was a shortest length; it stays as it is.
+    pub fn create_store_for_session(
+        &self,
+        key_file: bool,
+        passphrase: Option<&[u8]>,
+    ) -> Result<Option<Store>> {
+        match (self.create_store(key_file)?, passphrase) {
+            (Some(store), Some(p)) if !key_file => {
+                if let Err(e) = self.seal_new_store(p) {
+                    drop(store);
+                    // Left, the next start would find a store with no session in it.
+                    self.wipe(None)?;
+                    return Err(e);
+                }
+                Ok(Some(store))
+            }
+            (Some(store), _) => Ok(Some(store)),
+            (None, Some(p)) => Ok(Some(self.create_store_with_passphrase(p)?)),
+            (None, None) => Ok(None),
+        }
+    }
+
+    fn seal_new_store(&self, passphrase: &[u8]) -> Result<()> {
+        let sealed_key::Entry::Bare(key) = self.entry()? else {
+            bail!("the key of this store is already sealed");
+        };
+        let sealed = sealed_key::seal(&key, passphrase)?;
+        self.keys.set(&self.store_path(), &sealed)
+    }
+
+    fn entry(&self) -> Result<sealed_key::Entry> {
+        let entry = self
+            .keys
+            .get(&self.store_path())?
+            .context("the store key is not in the OS key store")?;
+        sealed_key::read(entry)
     }
 
     /// Make a new store whose key the OS key store keeps, or — `key_file` — a key file. `None`
@@ -124,7 +228,7 @@ impl DataDir {
             let path = self.dir.join(KEY_FILE);
             std::fs::write(&path, key.as_slice())?;
             restrict(&path, 0o600);
-        } else if let Err(e) = keystore_set(&self.store_path(), key.as_slice()) {
+        } else if let Err(e) = self.keys.set(&self.store_path(), key.as_slice()) {
             tracing::warn!(error = %e, "OS key store unavailable; a passphrase will keep the key");
             return Ok(None);
         }
@@ -167,7 +271,7 @@ impl DataDir {
                 _ => {}
             }
         }
-        keystore_delete(&self.store_path());
+        self.keys.delete(&self.store_path());
         Ok(())
     }
 }
@@ -212,29 +316,110 @@ fn keystore_entry(store_path: &Path) -> Result<keyring::Entry> {
     Ok(keyring::Entry::new(KEYRING_SERVICE, &user)?)
 }
 
-fn keystore_get(store_path: &Path) -> Result<Option<Zeroizing<Vec<u8>>>> {
-    match keystore_entry(store_path)?.get_secret() {
-        Ok(key) => Ok(Some(Zeroizing::new(key))),
-        Err(keyring::Error::NoEntry) => Ok(None),
-        Err(e) => Err(e.into()),
-    }
+/// Where the store key is kept. Tests put their own in place of the system's.
+#[derive(Debug, Clone)]
+pub(crate) enum KeyStore {
+    Os,
+    /// Entries in memory, by store path.
+    #[cfg(test)]
+    Memory(std::sync::Arc<std::sync::Mutex<std::collections::HashMap<PathBuf, Vec<u8>>>>),
+    /// A system without one.
+    #[cfg(test)]
+    Absent,
 }
 
-fn keystore_set(store_path: &Path, key: &[u8]) -> Result<()> {
-    keystore_entry(store_path)?.set_secret(key)?;
-    // Read it back: a key store that accepts a write and loses it would orphan the store.
-    match keystore_get(store_path)? {
-        Some(read) if read.as_slice() == key => Ok(()),
-        _ => bail!("the OS key store did not keep the key"),
-    }
-}
-
-fn keystore_delete(store_path: &Path) {
-    if let Ok(entry) = keystore_entry(store_path) {
-        match entry.delete_credential() {
-            Ok(()) | Err(keyring::Error::NoEntry) => {}
-            Err(e) => tracing::warn!(error = %e, "store key not deleted from the OS key store"),
+impl KeyStore {
+    fn get(&self, store_path: &Path) -> Result<Option<Zeroizing<Vec<u8>>>> {
+        match self {
+            Self::Os => {
+                let entry = keystore_entry(store_path)?;
+                match entry.get_secret() {
+                    Ok(key) => {
+                        let key = Zeroizing::new(key);
+                        keep_on_this_machine(&entry, &key);
+                        Ok(Some(key))
+                    }
+                    Err(keyring::Error::NoEntry) => Ok(None),
+                    Err(e) => Err(e.into()),
+                }
+            }
+            #[cfg(test)]
+            Self::Memory(entries) => Ok(entries
+                .lock()
+                .unwrap()
+                .get(store_path)
+                .cloned()
+                .map(Zeroizing::new)),
+            #[cfg(test)]
+            Self::Absent => bail!("no key store here"),
         }
+    }
+
+    fn set(&self, store_path: &Path, secret: &[u8]) -> Result<()> {
+        match self {
+            Self::Os => write_entry(&keystore_entry(store_path)?, secret)?,
+            #[cfg(test)]
+            Self::Memory(entries) => {
+                entries
+                    .lock()
+                    .unwrap()
+                    .insert(store_path.to_path_buf(), secret.to_vec());
+            }
+            #[cfg(test)]
+            Self::Absent => bail!("no key store here"),
+        }
+        // Read it back: a key store that accepts a write and loses it would orphan the store.
+        match self.get(store_path)? {
+            Some(read) if read.as_slice() == secret => Ok(()),
+            _ => bail!("the OS key store did not keep the key"),
+        }
+    }
+
+    fn delete(&self, store_path: &Path) {
+        match self {
+            Self::Os => {
+                if let Ok(entry) = keystore_entry(store_path) {
+                    match entry.delete_credential() {
+                        Ok(()) | Err(keyring::Error::NoEntry) => {}
+                        Err(e) => {
+                            tracing::warn!(error = %e, "store key not deleted from the OS key store")
+                        }
+                    }
+                }
+            }
+            #[cfg(test)]
+            Self::Memory(entries) => drop(entries.lock().unwrap().remove(store_path)),
+            #[cfg(test)]
+            Self::Absent => {}
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn write_entry(entry: &keyring::Entry, secret: &[u8]) -> Result<()> {
+    Ok(entry.set_secret(secret)?)
+}
+
+#[cfg(windows)]
+fn write_entry(entry: &keyring::Entry, secret: &[u8]) -> Result<()> {
+    crate::windows_credential::write(entry, secret)
+}
+
+#[cfg(not(windows))]
+fn keep_on_this_machine(_: &keyring::Entry, _: &[u8]) {}
+
+/// An entry an earlier build wrote roams with the profile: write it again as local. Failing to
+/// changes nothing for opening the store, so it is only logged.
+#[cfg(windows)]
+fn keep_on_this_machine(entry: &keyring::Entry, secret: &[u8]) {
+    use crate::windows_credential::{is_local, write};
+    match is_local(entry) {
+        Ok(true) => {}
+        Ok(false) => match write(entry, secret) {
+            Ok(()) => tracing::info!("the store key's entry no longer roams"),
+            Err(e) => tracing::warn!(error = %e, "the store key's entry still roams"),
+        },
+        Err(e) => tracing::warn!(error = %e, "whether the store key's entry roams is unknown"),
     }
 }
 
@@ -280,6 +465,110 @@ mod tests {
         assert!(data.open_store_with_passphrase(b"wrong").is_err());
         let store = data.open_store_with_passphrase(b"correct horse").unwrap();
         assert_eq!(store.get("k").unwrap().as_deref(), Some(&b"v"[..]));
+    }
+
+    fn memory() -> KeyStore {
+        KeyStore::Memory(Default::default())
+    }
+
+    /// A store the key store keeps the key of, with `k` = `v` in it.
+    fn kept(name: &str, keys: &KeyStore) -> (PathBuf, DataDir) {
+        let dir = temp_dir(name);
+        let data = DataDir::open_with(&dir, keys.clone()).unwrap();
+        let store = data.create_store(false).unwrap().unwrap();
+        store.put("k", b"v").unwrap();
+        (dir, data)
+    }
+
+    fn holds_v(store: Store) -> bool {
+        store.get("k").unwrap().as_deref() == Some(&b"v"[..])
+    }
+
+    #[test]
+    fn with_a_launch_passphrase_the_key_store_alone_does_not_open_the_store() {
+        let keys = memory();
+        let (dir, data) = kept("launch", &keys);
+        assert!(holds_v(data.open_store().unwrap().unwrap()));
+
+        data.set_launch_passphrase(None, Some(b"correct horse"))
+            .unwrap();
+
+        // What a process that reads the directory and the entry has: no key in either.
+        let entry = keys.get(&dir.join(STORE_FILE)).unwrap().unwrap();
+        for key in entry.windows(KEY_LEN) {
+            assert!(Store::open(dir.join(STORE_FILE), key).is_err());
+        }
+        assert!(!dir.join(KEY_FILE).exists() && !dir.join(SALT_FILE).exists());
+        assert!(data.open_store().unwrap().is_none());
+        assert!(data.open_store_with_passphrase(b"wrong horse").is_err());
+        assert!(holds_v(
+            data.open_store_with_passphrase(b"correct horse").unwrap()
+        ));
+    }
+
+    #[test]
+    fn the_passphrase_alone_does_not_open_a_copied_directory() {
+        let (_dir, data) = kept("copied", &memory());
+        data.set_launch_passphrase(None, Some(b"correct horse"))
+            .unwrap();
+        let copy = temp_dir("copy");
+        std::fs::copy(data.store_path(), copy.join(STORE_FILE)).unwrap();
+        // The other machine's key store knows nothing of it.
+        let there = DataDir::open_with(&copy, memory()).unwrap();
+        assert!(there.open_store_with_passphrase(b"correct horse").is_err());
+        assert!(there.open_store().is_err());
+    }
+
+    #[test]
+    fn a_launch_passphrase_changes_and_goes_only_with_the_current_one() {
+        let (_dir, data) = kept("change", &memory());
+        let (first, second) = (&b"correct horse"[..], &b"battery staple"[..]);
+        data.set_launch_passphrase(None, Some(first)).unwrap();
+
+        assert!(data.set_launch_passphrase(None, Some(second)).is_err());
+        assert!(data.set_launch_passphrase(Some(second), None).is_err());
+        assert!(holds_v(data.open_store_with_passphrase(first).unwrap()));
+
+        data.set_launch_passphrase(Some(first), Some(second))
+            .unwrap();
+        assert!(data.open_store_with_passphrase(first).is_err());
+        assert!(holds_v(data.open_store_with_passphrase(second).unwrap()));
+
+        data.set_launch_passphrase(Some(second), None).unwrap();
+        assert!(holds_v(data.open_store().unwrap().unwrap()));
+    }
+
+    #[test]
+    fn a_short_launch_passphrase_is_refused_and_nothing_changes() {
+        let (_dir, data) = kept("short", &memory());
+        for short in ["1234567", "пароль7"] {
+            let set = data.set_launch_passphrase(None, Some(short.as_bytes()));
+            assert!(set.is_err(), "{short}");
+        }
+        assert!(holds_v(data.open_store().unwrap().unwrap()));
+    }
+
+    #[test]
+    fn a_store_the_key_store_does_not_keep_takes_no_launch_passphrase() {
+        let dir = temp_dir("file-kept");
+        let data = DataDir::open_with(&dir, memory()).unwrap();
+        drop(data.create_store(true).unwrap().unwrap());
+        let refused = data.set_launch_passphrase(None, Some(b"correct horse"));
+        assert!(refused.unwrap_err().to_string().contains("does not keep"));
+        assert!(data.open_store().unwrap().is_some());
+    }
+
+    /// Moving a session that had a passphrase used to drop it where there is a key store.
+    #[test]
+    fn a_session_moved_into_a_store_keeps_its_passphrase() {
+        for keys in [memory(), KeyStore::Absent] {
+            let data = DataDir::open_with(&temp_dir("moved"), keys).unwrap();
+            let store = data.create_store_for_session(false, Some(b"old")).unwrap();
+            store.unwrap().put("k", b"v").unwrap();
+            assert!(!matches!(data.open_store(), Ok(Some(_))));
+            assert!(data.open_store_with_passphrase(b"new").is_err());
+            assert!(holds_v(data.open_store_with_passphrase(b"old").unwrap()));
+        }
     }
 
     #[test]
@@ -347,11 +636,39 @@ mod tests {
         drop(store);
         assert_eq!(data.existing(), Some(KeyKeeping::KeyStore));
 
-        let store = data.open_store().unwrap();
+        let store = data.open_store().unwrap().expect("no passphrase yet");
         assert_eq!(store.get("k").unwrap().as_deref(), Some(&b"v"[..]));
+        drop(store);
+
+        // Sealed, the entry is longer than a key and still kept as it is.
+        data.set_launch_passphrase(None, Some(b"correct horse"))
+            .unwrap();
+        assert!(data.open_store().unwrap().is_none());
+        let store = data.open_store_with_passphrase(b"correct horse").unwrap();
 
         data.wipe(Some(crate::local_store::LocalStore::new(store, "me")))
             .unwrap();
-        assert!(keystore_get(&dir.join(STORE_FILE)).unwrap().is_none());
+        assert!(KeyStore::Os.get(&dir.join(STORE_FILE)).unwrap().is_none());
+    }
+
+    /// An entry `keyring` wrote (the builds before this one) roams; reading it makes it local.
+    /// Named so the desktop's CI filter runs it.
+    #[cfg(windows)]
+    #[test]
+    #[ignore]
+    fn the_os_key_store_entry_stays_on_this_machine() {
+        use crate::windows_credential::is_local;
+        let path = temp_dir("roaming").join(STORE_FILE);
+        let entry = keystore_entry(&path).unwrap();
+        entry.set_secret(&[7u8; KEY_LEN]).unwrap();
+        assert!(!is_local(&entry).unwrap(), "keyring wrote it to roam");
+        let read = KeyStore::Os.get(&path).unwrap().unwrap();
+        assert_eq!(read.as_slice(), [7u8; KEY_LEN]);
+        assert!(is_local(&entry).unwrap());
+
+        KeyStore::Os.set(&path, &[8u8; KEY_LEN]).unwrap();
+        assert!(is_local(&entry).unwrap());
+        KeyStore::Os.delete(&path);
+        assert!(KeyStore::Os.get(&path).unwrap().is_none());
     }
 }

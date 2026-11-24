@@ -35,6 +35,7 @@ mod prekeys;
 pub mod profile;
 mod proto;
 pub mod recovery;
+mod sealed_key;
 mod sealing;
 pub mod stickers;
 mod streaming;
@@ -43,6 +44,8 @@ mod trust;
 pub mod veil;
 #[cfg(feature = "voice")]
 pub mod voice;
+#[cfg(windows)]
+mod windows_credential;
 
 mod client;
 pub use client::*;
