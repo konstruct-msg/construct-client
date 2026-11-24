@@ -321,7 +321,8 @@ pub async fn submit_join_request(client: &GrpcClient, join: &JoinRequest) -> Res
 /// Where a join request stands.
 pub enum JoinStatus {
     Pending,
-    Approved(AuthTokens),
+    /// A device of the account now; its tokens come from signing in with its own key.
+    Approved,
     Rejected,
     Expired,
 }
@@ -346,7 +347,7 @@ pub async fn check_join_request(
     Ok(
         match Status::try_from(resp.status).unwrap_or(Status::Pending) {
             Status::Pending => JoinStatus::Pending,
-            Status::Approved => JoinStatus::Approved(tokens_from(resp.tokens)?),
+            Status::Approved => JoinStatus::Approved,
             Status::Rejected => JoinStatus::Rejected,
             Status::Expired => JoinStatus::Expired,
         },

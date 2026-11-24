@@ -468,7 +468,7 @@ impl Client {
             }
             let _ = events.send(ClientEvent::LinkCode(prep.qr.clone()));
             let device_id = prep.request.device_id.clone();
-            let tokens = match crate::auth::wait_for_approval(&grpc, &device_id).await {
+            let tokens = match crate::auth::wait_for_approval(&grpc, &prep.session_secrets).await {
                 Ok(tokens) => tokens,
                 Err(e) => return drop(events.send(ClientEvent::LinkFailed(format!("{e:#}")))),
             };

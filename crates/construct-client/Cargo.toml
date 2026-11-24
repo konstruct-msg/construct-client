@@ -95,5 +95,7 @@ chacha20poly1305 = "0.10"
 rcgen = "0.13"
 # Voice notes read back by independent parsers: an MP4 reader and a decoder.
 mp4 = "0.14"
+# A clock the tests move: the waits of joining an account.
+tokio = { version = "1", features = ["test-util"] }
 symphonia = { version = "0.6", default-features = false, features = ["aac", "isomp4"] }
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
