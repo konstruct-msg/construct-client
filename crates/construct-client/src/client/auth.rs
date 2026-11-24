@@ -349,7 +349,8 @@ impl Client {
                         .session
                         .clone()
                         .expect("link_existing_device always returns session");
-                    let link_cursor = crate::auth::link_cursor(&result.access_token);
+                    let link_cursor =
+                        construct_core::session_token::start_cursor(&result.access_token);
                     AuthMsg::Success(Box::new(AuthSuccess {
                         user_id: result.user_id,
                         device_id: result.device_id,
@@ -487,7 +488,7 @@ impl Client {
             session.access_token = tokens.access_token.clone();
             session.refresh_token = tokens.refresh_token;
             session.expires_at = tokens.expires_at;
-            let link_cursor = crate::auth::link_cursor(&tokens.access_token);
+            let link_cursor = construct_core::session_token::start_cursor(&tokens.access_token);
             let _ = inbox.send(Inbox::Auth(AuthMsg::Success(Box::new(AuthSuccess {
                 user_id: tokens.user_id,
                 device_id,

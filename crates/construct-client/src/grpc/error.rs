@@ -4,6 +4,7 @@
 //! dragging `anyhow` into the public surface.
 
 use construct_core::rule_state::device_refusal;
+use construct_core::rule_state::send_failure::SendError;
 use thiserror::Error;
 
 #[derive(Error, Debug)]
@@ -93,6 +94,16 @@ impl GrpcError {
             self,
             Self::PermissionDenied(_) | Self::Status { code: 7, .. }
         )
+    }
+
+    /// The failure as the core's rules take it (construct-rules `send_failure`).
+    pub fn as_send_error(&self) -> SendError {
+        match self {
+            Self::Transport(_) | Self::Tls(_) => SendError::NoAnswer,
+            Self::Status { code, .. } => SendError::Status(*code),
+            Self::Unauthenticated { .. } => SendError::Status(device_refusal::UNAUTHENTICATED),
+            Self::PermissionDenied(_) => SendError::Status(7),
+        }
     }
 
     /// Transport failure — retry on a fresh connection. Not an auth signal.
