@@ -4,6 +4,7 @@
 
 use anyhow::{Context, Result};
 
+use construct_core::rule_state::device_join::{End, Join, Step};
 use construct_core::{
     crypto::{
         SuiteID,
@@ -16,7 +17,7 @@ use tokio::sync::mpsc;
 use tokio::time::{Duration, sleep};
 
 use crate::config::Session;
-use crate::grpc::{AuthTokens, GrpcClient, GrpcError, JoinStatus};
+use crate::grpc::{AuthTokens, GrpcClient, GrpcError};
 
 /// Each step of registration, sent to the UI as it progresses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -283,7 +284,9 @@ async fn sign_in(
         .duration_since(std::time::UNIX_EPOCH)
         .map_err(GrpcError::transport)?
         .as_secs() as i64;
-    let signature = key.sign(format!("{device_id}{timestamp}").as_bytes());
+    let signature = key.sign(&construct_core::device_id::sign_in_message(
+        device_id, timestamp,
+    ));
     crate::grpc::authenticate_device(client, device_id, timestamp, &signature.to_bytes()).await
 }
 
@@ -301,32 +304,21 @@ pub struct JoinPrep {
     pub qr: String,
 }
 
-/// How long the server holds a join request.
-const JOIN_TTL: Duration = Duration::from_secs(10 * 60);
-const JOIN_POLL: Duration = Duration::from_secs(3);
-
 /// Make the keys of a device that will join an account, as iOS's `prepareLinkIdentity` does: the
 /// classic keys, then the hybrid signature key, all kept in one key record. The QR carries
 /// `SHA256(identity ‖ hybrid)`; the phone vouches for this device only if the keys it later finds
 /// in the directory match.
 pub fn prepare_join() -> Result<JoinPrep> {
-    use base64::Engine;
-
     let keys = new_device_keys(None)?;
     let device_id = keys.session_secrets.device_id.clone();
-    let fingerprint = construct_core::history::discovery::qr_fingerprint(
-        &keys.identity_public,
-        &keys.hybrid_public,
-    );
     let device_name = format!("Konstruct on {}", os_label());
     let platform = std::env::consts::OS.to_string();
-    let pubkey = base64::engine::general_purpose::STANDARD.encode(&keys.identity_public);
-    let qr = format!(
-        "konstruct://link-to-me?id={device_id}&pubkey={}&fp={}&name={}&platform={}",
-        percent_encode(&pubkey),
-        hex::encode(fingerprint),
-        percent_encode(&device_name),
-        percent_encode(&platform),
+    let identity: &[u8; 32] = keys.identity_public.as_slice().try_into()?;
+    let qr = construct_core::device_link_qr::join_request(
+        identity,
+        &keys.hybrid_public,
+        &device_name,
+        &platform,
     );
 
     Ok(JoinPrep {
@@ -427,67 +419,42 @@ pub async fn wait_for_approval(client: &GrpcClient, session: &Session) -> Result
     .await
 }
 
-/// Ask until the join request is approved, refused or expired. An approval is remembered: the
-/// server forgets it sooner than the code expires, and a sign-in that did not get through is
-/// tried again.
+/// Asks and signs in as the core's rule says (construct-rules `device_join`).
 async fn join<S, T>(status: impl Fn() -> S, sign_in: impl Fn() -> T) -> Result<AuthTokens>
 where
-    S: Future<Output = Result<JoinStatus, GrpcError>>,
+    S: Future<Output = Result<i32, GrpcError>>,
     T: Future<Output = Result<AuthTokens, GrpcError>>,
 {
-    let deadline = tokio::time::Instant::now() + JOIN_TTL;
-    let mut approved = false;
-    while tokio::time::Instant::now() < deadline {
-        if !approved {
-            match status().await {
-                Ok(JoinStatus::Approved) => approved = true,
-                Ok(JoinStatus::Rejected) => anyhow::bail!("The phone declined this device"),
-                Ok(JoinStatus::Expired) => anyhow::bail!("The link code expired; show a new one"),
-                Ok(JoinStatus::Pending) => {}
-                Err(e) => tracing::warn!(error = %e, "join request status unavailable"),
-            }
-        }
-        if approved {
-            match sign_in().await {
-                Ok(tokens) => return Ok(tokens),
-                Err(e) if sign_in_is_refused(&e) => {
-                    anyhow::bail!("The phone let this device in, but signing in was refused: {e}")
+    let started = tokio::time::Instant::now();
+    let now_ms = || started.elapsed().as_millis() as i64;
+    let mut wait = Join::new(now_ms());
+    loop {
+        match wait.next(now_ms()) {
+            Step::Wait(ms) => sleep(Duration::from_millis(ms as u64)).await,
+            Step::Ask => match status().await {
+                Ok(status) => wait.on_status(status, now_ms()),
+                Err(e) => {
+                    tracing::warn!(error = %e, "join request status unavailable");
+                    wait.on_status_failed(now_ms());
                 }
-                Err(e) => tracing::warn!(error = %e, "joined; sign-in did not get through"),
-            }
+            },
+            Step::SignIn => match sign_in().await {
+                Ok(tokens) => return Ok(tokens),
+                Err(e) => {
+                    tracing::warn!(error = %e, "join: not signed in");
+                    wait.on_sign_in_failed(e.as_send_error(), now_ms());
+                }
+            },
+            Step::Ended(end) => anyhow::bail!(match end {
+                End::Rejected => "The phone declined this device",
+                End::Expired => "The link code expired; show a new one",
+                End::SignInRefused =>
+                    "The phone let this device in, but signing in was refused. Check this device's date and time, then show a new code",
+                End::LetInUnreachable =>
+                    "The phone let this device in, but the server could not be reached",
+            }),
         }
-        sleep(JOIN_POLL).await;
     }
-    if approved {
-        anyhow::bail!("The phone let this device in, but the server could not be reached")
-    }
-    anyhow::bail!("The link code expired; show a new one")
-}
-
-/// The same answer would come again: a clock out by minutes (INVALID_ARGUMENT), a wrong key.
-fn sign_in_is_refused(error: &GrpcError) -> bool {
-    matches!(
-        error,
-        GrpcError::Status { code: 3, .. }
-            | GrpcError::Unauthenticated { .. }
-            | GrpcError::PermissionDenied(_)
-    )
-}
-
-/// The stream position a linked device starts from: its token's issue time. What the mailbox
-/// held before that was sealed to keys this device never had (iOS `DeviceLinkOutcome`).
-pub fn link_cursor(access_token: &str) -> Option<String> {
-    use base64::Engine;
-    let payload = access_token.split('.').nth(1)?;
-    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .decode(payload.trim_end_matches('='))
-        .ok()?;
-    // JSON by rule 6's exception: the token's payload is the server's format, read, never kept.
-    let iat = serde_json::from_slice::<serde_json::Value>(&bytes)
-        .ok()?
-        .get("iat")?
-        .as_i64()?;
-    Some(format!("{}-0", iat.checked_mul(1000)?))
 }
 
 fn os_label() -> &'static str {
@@ -497,18 +464,6 @@ fn os_label() -> &'static str {
         "macos" => "macOS",
         other => other,
     }
-}
-
-/// Percent-encode everything but RFC 3986 unreserved characters.
-fn percent_encode(s: &str) -> String {
-    s.bytes()
-        .map(|b| match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
-                (b as char).to_string()
-            }
-            _ => format!("%{b:02X}"),
-        })
-        .collect()
 }
 
 #[cfg(test)]
@@ -581,16 +536,6 @@ mod tests {
         assert_eq!(new_device_keys(None).unwrap().link_key_proof, None);
     }
 
-    #[test]
-    fn a_linked_device_starts_reading_at_its_token_issue_time() {
-        use base64::Engine;
-        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
-            .encode(br#"{"sub":"u","iat":1792780000}"#);
-        let token = format!("h.{payload}.s");
-        assert_eq!(link_cursor(&token).as_deref(), Some("1792780000000-0"));
-        assert_eq!(link_cursor("not-a-jwt"), None);
-    }
-
     fn tokens() -> AuthTokens {
         AuthTokens {
             user_id: "u".into(),
@@ -600,9 +545,14 @@ mod tests {
         }
     }
 
+    const PENDING: i32 = 0;
+    const APPROVED: i32 = 1;
+    const REJECTED: i32 = 2;
+    const EXPIRED: i32 = 3;
+
     /// Runs [`join`] over the answers, the last of each repeated; counts the calls of each.
     async fn joined(
-        statuses: Vec<fn() -> Result<JoinStatus, GrpcError>>,
+        statuses: Vec<fn() -> Result<i32, GrpcError>>,
         sign_ins: Vec<fn() -> Result<AuthTokens, GrpcError>>,
     ) -> (Result<AuthTokens>, usize, usize) {
         use std::cell::Cell;
@@ -619,80 +569,70 @@ mod tests {
         (result, asked.get(), signed.get())
     }
 
+    /// The calls and the clock reach the rule; the rule itself is tested in construct-rules.
     #[tokio::test(start_paused = true)]
-    async fn a_joined_device_signs_in_only_after_the_approval() {
+    async fn it_asks_and_signs_in_once_let_in() {
+        let began = tokio::time::Instant::now();
         let (result, asked, signed) = joined(
             vec![
-                || Ok(JoinStatus::Pending),
+                || Ok(PENDING),
                 || Err(GrpcError::transport("reset")),
-                || Ok(JoinStatus::Approved),
+                || Ok(APPROVED),
             ],
             vec![|| Ok(tokens())],
         )
         .await;
         assert_eq!(result.unwrap().access_token, "a");
         assert_eq!((asked, signed), (3, 1));
+        assert_eq!(began.elapsed(), Duration::from_secs(9));
     }
 
-    /// The server forgets an approval after two minutes; the device does not.
+    /// What a call answered reaches the rule. Mutations that redden it: any error as no answer; as
+    /// a refusal.
     #[tokio::test(start_paused = true)]
-    async fn a_sign_in_that_did_not_get_through_is_tried_again_without_asking() {
-        let (result, asked, signed) = joined(
-            vec![|| Ok(JoinStatus::Approved), || Ok(JoinStatus::Expired)],
-            vec![
-                || Err(GrpcError::transport("reset")),
-                || Err(GrpcError::status(14, "unavailable")),
-                || Ok(tokens()),
-            ],
-        )
-        .await;
-        assert!(result.is_ok());
-        assert_eq!((asked, signed), (1, 3));
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn a_refused_sign_in_ends_the_wait() {
+    async fn a_sign_in_is_tried_again_unless_refused() {
         let refusals: [fn() -> Result<AuthTokens, GrpcError>; 3] = [
             || Err(GrpcError::status(3, "Timestamp expired")),
             || Err(GrpcError::unauthenticated("signature")),
             || Err(GrpcError::permission_denied("no")),
         ];
         for refusal in refusals {
-            let (result, _, signed) =
-                joined(vec![|| Ok(JoinStatus::Approved)], vec![refusal]).await;
+            let (result, asked, signed) = joined(
+                vec![|| Ok(APPROVED), || Ok(EXPIRED)],
+                vec![
+                    || Err(GrpcError::transport("reset")),
+                    || Err(GrpcError::tls("reset")),
+                    || Err(GrpcError::status(14, "unavailable")),
+                    refusal,
+                ],
+            )
+            .await;
             assert!(result.unwrap_err().to_string().contains("was refused"));
-            assert_eq!(signed, 1);
+            assert_eq!((asked, signed), (1, 4));
         }
     }
 
     #[tokio::test(start_paused = true)]
     async fn a_wait_that_ends_says_why() {
-        let end = |status: fn() -> Result<JoinStatus, GrpcError>| async move {
-            let (result, _, signed) = joined(vec![status], vec![|| Ok(tokens())]).await;
-            (result.unwrap_err().to_string(), signed)
-        };
-        assert_eq!(
-            end(|| Ok(JoinStatus::Rejected)).await,
-            ("The phone declined this device".into(), 0)
-        );
-        for status in [
-            (|| Ok(JoinStatus::Expired)) as fn() -> Result<JoinStatus, GrpcError>,
-            || Ok(JoinStatus::Pending),
-        ] {
-            assert_eq!(
-                end(status).await,
-                ("The link code expired; show a new one".into(), 0)
-            );
-        }
-        let (result, _, _) = joined(
-            vec![|| Ok(JoinStatus::Approved)],
-            vec![|| Err(GrpcError::transport("reset"))],
-        )
-        .await;
-        assert!(
-            result
+        let end = |status: fn() -> Result<i32, GrpcError>,
+                   sign_in: fn() -> Result<AuthTokens, GrpcError>| async move {
+            joined(vec![status], vec![sign_in])
+                .await
+                .0
                 .unwrap_err()
                 .to_string()
+        };
+        assert_eq!(
+            end(|| Ok(REJECTED), || Ok(tokens())).await,
+            "The phone declined this device"
+        );
+        assert_eq!(
+            end(|| Ok(EXPIRED), || Err(GrpcError::unauthenticated("no"))).await,
+            "The link code expired; show a new one"
+        );
+        assert!(
+            end(|| Ok(APPROVED), || Err(GrpcError::transport("reset")))
+                .await
                 .contains("could not be reached")
         );
     }

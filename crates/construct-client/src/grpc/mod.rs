@@ -38,7 +38,7 @@ pub use account::{
     username_refusal,
 };
 pub use auth::{
-    AuthTokens, JoinRequest, JoinStatus, LinkResult, approve_join_request, authenticate_device,
+    AuthTokens, JoinRequest, LinkResult, approve_join_request, authenticate_device,
     check_join_request, confirm_device_link, device_link_result, device_public_keys,
     get_pow_challenge, get_recovery_status, initiate_device_link, publish_device_certificate,
     refresh_token, register_device, set_recovery_key, submit_join_request,

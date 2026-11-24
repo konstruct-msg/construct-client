@@ -9,6 +9,7 @@
 use construct_core::crypto::device_certificate::{
     DeviceKeys, DeviceVerdict, LinkEvidence, OfferedDevice,
 };
+use construct_core::device_link_qr::{self, LinkQr};
 use construct_core::orchestration::orchestrator::Orchestrator;
 
 use crate::grpc::FetchedPreKeyBundle;
@@ -21,21 +22,20 @@ pub struct LinkCode {
     pub secret: Option<Vec<u8>>,
 }
 
-/// `konstruct://link?token=…&fp=…&s=…`, or a bare token. A code whose secret is malformed is
-/// still a link code, without the secret — the device links, unvouched, as iOS does.
+/// The code as the core reads it, or a bare token. A code whose secret is malformed is still a
+/// link code, without the secret — the device links, unvouched, as iOS does.
 pub fn parse_link_code(code: &str) -> Option<LinkCode> {
-    let code = code.trim();
-    let Some(query) = code.strip_prefix("konstruct://link?") else {
-        let bare = !code.is_empty() && !code.contains("://") && !code.contains(char::is_whitespace);
-        return bare.then(|| LinkCode {
-            token: code.to_string(),
-            secret: None,
+    if let Some(LinkQr::Offer { token, secret, .. }) = device_link_qr::read(code) {
+        return Some(LinkCode {
+            token,
+            secret: secret.map(Into::into),
         });
-    };
-    let token = query_value(query, "token").filter(|t| !t.is_empty())?;
-    Some(LinkCode {
-        token: token.to_string(),
-        secret: query_value(query, "s").and_then(hex32),
+    }
+    let code = code.trim();
+    let bare = !code.is_empty() && !code.contains("://") && !code.contains(char::is_whitespace);
+    bare.then(|| LinkCode {
+        token: code.to_string(),
+        secret: None,
     })
 }
 
@@ -48,33 +48,25 @@ pub struct JoinCode {
     pub fingerprint: Option<Vec<u8>>,
 }
 
-/// `konstruct://link-to-me?id=…&fp=…`, or a bare device id (approved, never vouched for).
+/// The code as the core reads it, or a bare device id (approved, never vouched for).
 pub fn parse_join_code(code: &str) -> Option<JoinCode> {
-    let code = code.trim();
-    let Some(query) = code.strip_prefix("konstruct://link-to-me?") else {
-        let bare = !code.is_empty() && code.chars().all(|c| c.is_ascii_hexdigit());
-        return bare.then(|| JoinCode {
-            device_id: code.to_string(),
-            fingerprint: None,
+    if let Some(LinkQr::JoinRequest {
+        device_id,
+        fingerprint,
+        ..
+    }) = device_link_qr::read(code)
+    {
+        return Some(JoinCode {
+            device_id,
+            fingerprint: fingerprint.map(Into::into),
         });
-    };
-    let device_id = query_value(query, "id").filter(|id| !id.is_empty())?;
-    Some(JoinCode {
-        device_id: device_id.to_string(),
-        fingerprint: query_value(query, "fp").and_then(hex32),
+    }
+    let code = code.trim();
+    let bare = !code.is_empty() && code.chars().all(|c| c.is_ascii_hexdigit());
+    bare.then(|| JoinCode {
+        device_id: code.to_string(),
+        fingerprint: None,
     })
-}
-
-fn query_value<'a>(query: &'a str, name: &str) -> Option<&'a str> {
-    query
-        .split('&')
-        .filter_map(|pair| pair.split_once('='))
-        .find(|(key, _)| *key == name)
-        .map(|(_, value)| value)
-}
-
-fn hex32(value: &str) -> Option<Vec<u8>> {
-    hex::decode(value).ok().filter(|bytes| bytes.len() == 32)
 }
 
 /// What the link code showed about the device being vouched for.
@@ -230,12 +222,17 @@ mod tests {
 
     #[test]
     fn a_join_code_gives_the_device_and_its_fingerprint() {
-        let code = parse_join_code(&format!(
-            "konstruct://link-to-me?id=00ff&pubkey=x%2B&fp={S}&name=a&platform=linux"
-        ))
-        .expect("a join code");
-        assert_eq!(code.device_id, "00ff");
-        assert_eq!(code.fingerprint, Some(vec![1u8; 32]));
+        let (identity, hybrid) = ([5u8; 32], [6u8; 64]);
+        let code = device_link_qr::join_request(&identity, &hybrid, "a", "linux");
+        assert_eq!(
+            parse_join_code(&code),
+            Some(JoinCode {
+                device_id: construct_core::device_id::derive_device_id(&identity),
+                fingerprint: Some(
+                    construct_core::history::discovery::qr_fingerprint(&identity, &hybrid).into()
+                ),
+            })
+        );
         assert_eq!(
             parse_join_code("00ff"),
             Some(JoinCode {

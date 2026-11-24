@@ -318,23 +318,11 @@ pub async fn submit_join_request(client: &GrpcClient, join: &JoinRequest) -> Res
     Ok(())
 }
 
-/// Where a join request stands.
-pub enum JoinStatus {
-    Pending,
-    /// A device of the account now; its tokens come from signing in with its own key.
-    Approved,
-    Rejected,
-    Expired,
-}
-
-/// `DeviceLinkService.CheckJoinRequestStatus`.
-pub async fn check_join_request(
-    client: &GrpcClient,
-    device_id: &str,
-) -> Result<JoinStatus, GrpcError> {
+/// `DeviceLinkService.CheckJoinRequestStatus`: the number of the status, for the core's
+/// `device_join`. An approved device's tokens come from signing in with its own key.
+pub async fn check_join_request(client: &GrpcClient, device_id: &str) -> Result<i32, GrpcError> {
     use crate::proto::services::v1::{
         CheckJoinRequestStatusRequest, CheckJoinRequestStatusResponse,
-        check_join_request_status_response::Status,
     };
     let req = CheckJoinRequestStatusRequest {
         pending_device_id: device_id.to_string(),
@@ -344,14 +332,7 @@ pub async fn check_join_request(
         .await?;
     let resp = CheckJoinRequestStatusResponse::decode(bytes.as_slice())
         .map_err(|e| GrpcError::transport(format!("CheckJoinRequestStatus decode: {e}")))?;
-    Ok(
-        match Status::try_from(resp.status).unwrap_or(Status::Pending) {
-            Status::Pending => JoinStatus::Pending,
-            Status::Approved => JoinStatus::Approved,
-            Status::Rejected => JoinStatus::Rejected,
-            Status::Expired => JoinStatus::Expired,
-        },
-    )
+    Ok(resp.status)
 }
 
 fn tokens_from(

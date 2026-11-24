@@ -70,12 +70,16 @@ async fn offer(
         .await
         .map_err(|e| format!("no link code: {e}"))?;
     let mut secret =
-        Zeroizing::new(vec![0u8; construct_core::crypto::device_certificate::LINK_SECRET_LEN]);
-    rand::rngs::OsRng.fill_bytes(&mut secret);
+        Zeroizing::new([0u8; construct_core::crypto::device_certificate::LINK_SECRET_LEN]);
+    rand::rngs::OsRng.fill_bytes(&mut secret[..]);
     let fingerprint =
         hybrid.map(|h| construct_core::history::discovery::qr_fingerprint(identity, h));
     let _ = events.send(ClientEvent::LinkOffer {
-        code: link_code(&token, fingerprint.as_ref().map(|f| &f[..]), &secret),
+        code: Zeroizing::new(construct_core::device_link_qr::offer(
+            &token,
+            fingerprint.as_ref(),
+            &secret,
+        )),
         expires_at,
     });
     loop {
@@ -101,18 +105,6 @@ async fn offer(
     }
 }
 
-/// `konstruct://link?token=…&fp=…&s=…`, as iOS shows it. `fp` pins this device's keys for the
-/// new one; `s` is the secret the new device proves its keys under. Neither reaches the server.
-pub fn link_code(token: &str, fingerprint: Option<&[u8]>, secret: &[u8]) -> Zeroizing<String> {
-    let fp = fingerprint
-        .map(|f| format!("&fp={}", hex::encode(f)))
-        .unwrap_or_default();
-    Zeroizing::new(format!(
-        "konstruct://link?token={token}{fp}&s={}",
-        hex::encode(secret)
-    ))
-}
-
 fn now_secs() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -121,28 +113,4 @@ fn now_secs() -> i64 {
 
 fn short(id: &str) -> &str {
     &id[..8.min(id.len())]
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn a_code_shown_here_reads_back_as_the_new_device_reads_it() {
-        let secret = [7u8; 32];
-        let code = link_code("tok_en-1", Some(&[1u8; 32]), &secret);
-        let parsed = crate::device_certs::parse_link_code(&code).expect("a link code");
-        assert_eq!(parsed.token, "tok_en-1");
-        assert_eq!(parsed.secret.as_deref(), Some(&secret[..]));
-        assert!(code.contains(&format!("fp={}", hex::encode([1u8; 32]))));
-        let without = link_code("t", None, &secret);
-        assert!(!without.contains("fp="));
-        assert_eq!(
-            crate::device_certs::parse_link_code(&without)
-                .unwrap()
-                .secret
-                .as_deref(),
-            Some(&secret[..])
-        );
-    }
 }
