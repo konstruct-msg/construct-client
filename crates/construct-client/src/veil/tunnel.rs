@@ -1,45 +1,58 @@
 //! The tunnel: construct-veil's coordinator in this process, one session at a time, its local
 //! port where [`crate::grpc::route`] sends the connections.
 
-use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use construct_veil::veil::{
-    MethodSet, NetworkFingerprint, PersistentScores, VeilConfig, VeilCoordinator, VeilFrontAuthV3,
-    VeilFrontObfuscator,
+    DialObserver, MethodSet, VeilConfig, VeilCoordinator, VeilFrontAuthV3, VeilFrontObfuscator,
 };
 use zeroize::Zeroizing;
 
 use super::trust::Front;
 
-/// The coordinator scores methods per network; a desktop has one method and no network label
-/// worth keeping apart, so all its networks are one.
-const NETWORK: &[u8] = b"desktop";
-
 pub struct Tunnel {
     coordinator: Arc<VeilCoordinator>,
+    /// Who hears what the dials of the session come to: whoever started it last.
+    heard: Arc<Mutex<Option<DialObserver>>>,
+}
+
+impl Default for Tunnel {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Tunnel {
-    /// A coordinator with veil-front, scoring kept in `scores` (a file of its own beside the
-    /// data; `None`: in memory).
-    pub async fn new(scores: Option<&Path>) -> Result<Self, String> {
+    /// A coordinator with veil-front.
+    pub fn new() -> Self {
         super::install_chrome_hello();
-        let path = scores.map_or(":memory:".to_owned(), |p| p.display().to_string());
-        let scores = PersistentScores::open_default(&path)
-            .await
-            .map_err(|e| format!("VEIL scores: {e}"))?;
-        let mut coordinator = VeilCoordinator::new(VeilConfig::default(), scores);
+        let mut coordinator = VeilCoordinator::new(VeilConfig::default());
         coordinator.register(Box::new(VeilFrontObfuscator::new()));
-        Ok(Self {
+        let heard: Arc<Mutex<Option<DialObserver>>> = Default::default();
+        let to = heard.clone();
+        coordinator.observe_dials(Arc::new(move |relay, outcome| {
+            let observer = to.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            if let Some(observer) = observer {
+                observer(relay, outcome);
+            }
+        }));
+        Self {
             coordinator: Arc::new(coordinator),
-        })
+            heard,
+        }
     }
 
     /// Open a session to `front`, ending the one before; the local port gRPC goes to.
-    /// `veil_sk` signs the TLS exporter for a key-bound capability (AUTH v3).
-    pub async fn start(&self, front: &Front, veil_sk: &[u8; 32]) -> Result<u16, String> {
+    /// `veil_sk` signs the TLS exporter for a key-bound capability (AUTH v3). `on_dial` hears what
+    /// each dial of this session comes to, the first one included.
+    pub async fn start(
+        &self,
+        front: &Front,
+        veil_sk: &[u8; 32],
+        on_dial: DialObserver,
+    ) -> Result<u16, String> {
         self.coordinator.stop().await;
+        *self.heard.lock().unwrap_or_else(|e| e.into_inner()) = Some(on_dial);
         let (ticket, auth_v3) = match front.version {
             2 => (
                 String::new(),
@@ -54,7 +67,6 @@ impl Tunnel {
             .coordinator
             .start_session_with_params(
                 front.relay.clone(),
-                NetworkFingerprint::new(NETWORK.to_vec()),
                 MethodSet::all(),
                 front.sni.clone(),
                 front.spki.clone(),
@@ -68,9 +80,5 @@ impl Tunnel {
 
     pub async fn stop(&self) {
         self.coordinator.stop().await;
-    }
-
-    pub async fn is_alive(&self) -> bool {
-        self.coordinator.is_alive().await
     }
 }

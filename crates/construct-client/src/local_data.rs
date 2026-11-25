@@ -32,6 +32,10 @@ const KEY_FILE: &str = "store.key";
 const LOCK_FILE: &str = "konstruct.lock";
 const KEYRING_SERVICE: &str = "Konstruct";
 
+/// 2027-05-31 (Unix seconds).
+#[cfg_attr(not(test), allow(dead_code))]
+const VEIL_SCORES_UNTIL: u64 = 1_811_721_600;
+
 /// How the store key of a directory is kept.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KeyKeeping {
@@ -46,6 +50,21 @@ pub struct DataDir {
     dir: PathBuf,
     keys: KeyStore,
     _lock: File,
+}
+
+/// construct-veil before 4.0.0 kept a record of networks and methods here, and nothing reads it
+/// since (construct-docs `decisions/veil-keeps-no-network-history.md`). Removed until
+/// [`VEIL_SCORES_UNTIL`]; `removing_the_veil_scores_has_an_end` fails after it (rule 11).
+fn remove_veil_scores(dir: &Path) {
+    for suffix in ["", "-wal", "-shm", "-journal"] {
+        let file = dir.join(format!("veil-scores.sqlite{suffix}"));
+        match std::fs::remove_file(&file) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                tracing::warn!("{} not removed: {e}", file.display())
+            }
+            _ => {}
+        }
+    }
 }
 
 impl DataDir {
@@ -67,6 +86,7 @@ impl DataDir {
         if lock.try_lock().is_err() {
             bail!("Konstruct is already open in another window or terminal");
         }
+        remove_veil_scores(dir);
         Ok(Self {
             dir: dir.to_path_buf(),
             keys,
@@ -81,11 +101,6 @@ impl DataDir {
     /// Where fetched attachments are kept, still encrypted (`media::MediaCache`).
     pub fn media_dir(&self) -> PathBuf {
         self.dir.join("media")
-    }
-
-    /// construct-veil's per-network method scores (its own SQLite file; nothing secret).
-    pub fn veil_scores_path(&self) -> PathBuf {
-        self.dir.join("veil-scores.sqlite")
     }
 
     /// Where sticker packs are kept (`stickers::Library`): public files, checked by hash.
@@ -442,6 +457,39 @@ mod tests {
             std::env::temp_dir().join(format!("construct-client-{name}-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    /// Opening the directory takes the old record of networks with it, its journals too, and
+    /// nothing else.
+    #[test]
+    fn the_veil_scores_of_an_earlier_build_are_removed() {
+        let dir = temp_dir("scores");
+        let gone = ["", "-wal", "-shm", "-journal"].map(|s| format!("veil-scores.sqlite{s}"));
+        for name in gone
+            .iter()
+            .map(String::as_str)
+            .chain(["veil-scores.sqlite-x"])
+        {
+            std::fs::write(dir.join(name), b"x").unwrap();
+        }
+        DataDir::open(&dir).unwrap();
+        for name in &gone {
+            assert!(!dir.join(name).exists(), "{name}");
+        }
+        assert!(dir.join("veil-scores.sqlite-x").exists());
+    }
+
+    /// Rule 11: the removal is temporary, and this fails on the day it should be gone.
+    #[test]
+    fn removing_the_veil_scores_has_an_end() {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        assert!(
+            now < VEIL_SCORES_UNTIL,
+            "2027-05-31 has passed: remove remove_veil_scores and this test"
+        );
     }
 
     #[test]
