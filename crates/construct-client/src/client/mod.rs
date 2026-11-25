@@ -535,6 +535,8 @@ pub(crate) struct Client {
     veil_status: Option<veil::Status>,
     /// A link's front before there is an account (VEIL armed).
     armed: Option<crate::veil::trust::Front>,
+    /// The front pins a dial has disputed, for the life of the process.
+    veil_disputes: crate::veil::trust::Disputes,
     /// The tunnel, made once and kept: its coordinator outlives a change of mode.
     veil_tunnel:
         std::sync::Arc<tokio::sync::Mutex<Option<std::sync::Arc<crate::veil::tunnel::Tunnel>>>>,
@@ -584,6 +586,7 @@ impl Client {
             veil: None,
             veil_status: None,
             armed: None,
+            veil_disputes: Default::default(),
             veil_tunnel: Default::default(),
             pending_link: None,
             pending_username: None,

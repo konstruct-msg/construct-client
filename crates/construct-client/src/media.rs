@@ -322,6 +322,8 @@ mod tests {
 
     #[tokio::test]
     async fn a_cached_blob_that_does_not_open_is_dropped() {
+        // The fetch goes along the process's route, which other tests move.
+        let _turn = crate::grpc::route::TEST_LOCK.lock().await;
         let (dir, cache) = temp_cache();
         let sealed = construct_core::media::seal_media(b"the picture").unwrap();
         let mut blob = sealed.blob.clone();

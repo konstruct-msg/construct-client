@@ -7,7 +7,7 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::veil::transport_route::{Lane, RpcFailure, StreamFailure};
+use construct_core::rule_state::transport_route::{Lane, RpcFailure, StreamFailure};
 use std::sync::{LazyLock, RwLock};
 use std::time::Duration;
 
@@ -55,11 +55,11 @@ pub(crate) fn current() -> (Route, u64) {
     (*route, GENERATION.load(Ordering::SeqCst))
 }
 
-/// What happened to a call or to the message stream, for the VEIL router
-/// (`veil::transport_route`): its inputs, as iOS's router gets them from its channels.
+/// What happened to a call or to the message stream, for the VEIL router (construct-rules
+/// `transport_route`): its inputs, as iOS's router gets them from its channels.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Report {
-    RpcSucceeded { lane: Lane, latency_ms: u32 },
+    RpcSucceeded { lane: Lane },
     RpcFailed { lane: Lane, failure: RpcFailure },
     StreamOpened,
     StreamFailed { failure: StreamFailure },
@@ -103,13 +103,16 @@ pub(crate) fn report(report: Report, since: u64) {
 
 /// A failed call, as the router weighs it. A refused local port is our proxy gone, not the
 /// front; a call that never came back is a timeout; the server answering with a status is the
-/// application, not the path.
+/// application, not the path; its edge answering 5xx for it is neither.
 pub(crate) fn classify(e: &super::GrpcError) -> Option<RpcFailure> {
     use super::GrpcError as E;
     Some(match e {
         E::Unauthenticated { .. } => RpcFailure::AuthRejected,
         E::PermissionDenied(_) | E::Status { .. } => RpcFailure::ApplicationError,
         E::Tls(_) => RpcFailure::TransportUnknown,
+        E::Transport(m) if edge_status(m).is_some_and(|s| (500..600).contains(&s)) => {
+            RpcFailure::ServerNotReady
+        }
         E::Transport(m) if m.contains("VEIL is on") => return None,
         E::Transport(m) if m.contains("route changed") => RpcFailure::TransientCancellation,
         E::Transport(m) if m.starts_with("VEIL tunnel") && !m.contains("no answer") => {
@@ -118,6 +121,17 @@ pub(crate) fn classify(e: &super::GrpcError) -> Option<RpcFailure> {
         E::Transport(m) if m.contains("timed out") => RpcFailure::StreamTimeout,
         E::Transport(_) => RpcFailure::TransportUnknown,
     })
+}
+
+/// The HTTP status of an answer that had no gRPC status: `HTTP 502 Bad Gateway from '/x'`.
+fn edge_status(m: &str) -> Option<u16> {
+    m.split_once("HTTP ")?.1.get(..3)?.parse().ok()
+}
+
+/// Whether a stream that did not open says anything about the path. The edge answering 5xx does
+/// not: counted, a deploy's 502s move the direct path to VEIL (iOS `streamFailureReachesRouter`).
+pub(crate) fn stream_failure_counts(e: &super::GrpcError) -> bool {
+    classify(e).is_some_and(|f| f != RpcFailure::ServerNotReady)
 }
 
 /// The route, once it is not closed — or still closed after `wait`.
@@ -181,6 +195,34 @@ mod tests {
             classify(&GrpcError::tls("eof")),
             Some(RpcFailure::TransportUnknown)
         );
+    }
+
+    /// The server's edge answering 5xx, on a call or on the stream, blames nobody; another status
+    /// of it, or a status the server itself sent, is what it was.
+    #[test]
+    fn an_edge_that_answers_for_a_restarting_service_blames_nobody() {
+        for m in [
+            "HTTP 500 Internal Server Error from '/x'",
+            "HTTP 502 Bad Gateway from '/x'",
+            "MessageStream HTTP 599 <unknown>",
+        ] {
+            let e = GrpcError::transport(m);
+            assert_eq!(classify(&e), Some(RpcFailure::ServerNotReady), "{m}");
+            assert!(!stream_failure_counts(&e), "{m}");
+        }
+        for m in [
+            "HTTP 404 Not Found from '/x'",
+            "HTTP 600 from '/x'",
+            "recv_response '/x': HTTP/2 stream reset",
+            "HTTP ",
+        ] {
+            let e = GrpcError::transport(m);
+            assert_eq!(classify(&e), Some(RpcFailure::TransportUnknown), "{m}");
+            assert!(stream_failure_counts(&e), "{m}");
+        }
+        assert!(!stream_failure_counts(&GrpcError::transport(
+            "VEIL is on and no front is available"
+        )));
     }
 
     /// A failure across a disruption of our own is not reported — it is our reconnect, not a

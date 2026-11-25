@@ -14,7 +14,7 @@ use super::connection::{H2Session, connect_h2, connect_h2c};
 use super::error::GrpcError;
 use super::framing::{decode_frame, encode_frame};
 use super::route::{self, Route};
-use crate::veil::transport_route::Lane;
+use construct_core::rule_state::transport_route::Lane;
 
 pub(crate) type H2SendReq = h2::client::SendRequest<Bytes>;
 
@@ -132,18 +132,11 @@ impl GrpcClient {
     /// Unary gRPC call. `path` is `/package.Service/Method`.
     /// One retry after a transport error (new session); auth errors are not retried.
     pub async fn unary(&self, path: &str, request_bytes: &[u8]) -> Result<Vec<u8>, GrpcError> {
-        let started = std::time::Instant::now();
         let since = route::disruptions();
         let result = self.unary_retrying(path, request_bytes).await;
         let lane = self.inner.lane;
         match &result {
-            Ok(_) => route::report(
-                route::Report::RpcSucceeded {
-                    lane,
-                    latency_ms: started.elapsed().as_millis().min(u32::MAX as u128) as u32,
-                },
-                since,
-            ),
+            Ok(_) => route::report(route::Report::RpcSucceeded { lane }, since),
             Err(e) => {
                 if let Some(failure) = route::classify(e) {
                     route::report(route::Report::RpcFailed { lane, failure }, since);

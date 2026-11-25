@@ -8,9 +8,10 @@
 //!   (decisions/veil-on-never-goes-direct.md): with no front up, requests fail instead of
 //!   leaving the tunnel.
 //!
-//! When to go through a front and when to come back is `veil::transport_route` — the reducer
-//! iOS and Android run on the same vectors — driven by what calls and the message stream report
-//! (`grpc::route::report`); the router here carries out what it decides.
+//! When to go through a front, when to leave it and when to come back is the core's rule
+//! (construct-rules `transport_route`), driven by what calls and the message stream report
+//! (`grpc::route::report`) and by what each dial to a front came to; the router here carries out
+//! what it decides.
 //!
 //! Fronts come signed (`veil::trust`): issued to this device with its capability while it is
 //! signed in — in any mode, so they are there before the mode is turned on — or from a
@@ -30,11 +31,12 @@ use construct_core::cfe::CfeMessageType;
 use super::{Client, ClientEvent};
 use crate::grpc::route::{self, Route};
 use crate::local_store::LocalStore;
-use crate::veil::transport_route::{
-    Config, Effect, Event, Mode, State, StreamMethod, Target, initial, reduce,
-};
-use crate::veil::trust::{self, Front};
+use crate::veil::trust::{self, Disputes, Front};
 use crate::veil::tunnel::Tunnel;
+use construct_core::rule_state::transport_route::{
+    Config, Effect, Event, Mode, State, Via, initial, reduce,
+};
+use construct_veil::veil::{DialObserver, DialOutcome};
 
 const KEY_MODE: &str = "veil.mode";
 const KEY_SK: &str = "veil.sk";
@@ -321,7 +323,13 @@ impl Client {
             return;
         };
         let status = self.veil_status();
-        let task = tokio::spawn(provision(self.grpc.clone(), store, status)).abort_handle();
+        let task = tokio::spawn(provision(
+            self.grpc.clone(),
+            store,
+            self.veil_disputes.clone(),
+            status,
+        ))
+        .abort_handle();
         self.veil.get_or_insert_with(Default::default).provisioner = Some(task);
     }
 
@@ -396,7 +404,7 @@ impl Client {
         let Some(store) = self.store.clone() else {
             return self.arm_veil(&link);
         };
-        match trust::import_link(&link, &fronts(&store), now()) {
+        match trust::import_link(&link, &fronts(&store), &self.veil_disputes, now()) {
             Ok(front) => {
                 register(std::slice::from_ref(&front));
                 tracing::info!(front = %host(&front.relay), "VEIL front added from a link");
@@ -417,7 +425,7 @@ impl Client {
     /// No account yet: a link's front carries what comes before one — registering, linking.
     /// Nothing goes anywhere else while it is armed.
     fn arm_veil(&mut self, link: &str) {
-        let front = match trust::import_link(link, &[], now()) {
+        let front = match trust::import_link(link, &[], &self.veil_disputes, now()) {
             Ok(front) => front,
             Err(e) => {
                 return self.emit(ClientEvent::Notice(format!(
@@ -496,10 +504,10 @@ impl Client {
             source,
             sk,
             holder: self.veil_tunnel.clone(),
-            scores: self.data.as_ref().map(|d| d.veil_scores_path()),
             status,
             clients: (self.grpc.clone(), self.anonymous.clone()),
             demoted: Default::default(),
+            disputes: self.veil_disputes.clone(),
             starting: false,
             tx,
         };
@@ -511,12 +519,20 @@ impl Client {
 /// answer to something it set going.
 enum Input {
     Report((route::Report, bool)),
-    Started { relay: String, port: u16 },
-    StartFailed(String),
+    Started {
+        relay: String,
+        port: u16,
+    },
+    StartFailed,
+    /// A dial to this front ended; whether it came up.
+    Dialed {
+        relay: String,
+        up: bool,
+    },
     CooldownElapsed,
 }
 
-/// Carries out what `veil::transport_route` decides: starts and stops the tunnel, points the
+/// Carries out what the core's rule decides: starts and stops the tunnel, points the
 /// route, drops connections, keeps score of fronts that failed.
 struct Router {
     mode: Mode,
@@ -524,11 +540,11 @@ struct Router {
     source: FrontSource,
     sk: zeroize::Zeroizing<[u8; 32]>,
     holder: Arc<tokio::sync::Mutex<Option<Arc<Tunnel>>>>,
-    scores: Option<std::path::PathBuf>,
     status: Status,
     clients: (crate::grpc::GrpcClient, crate::grpc::GrpcClient),
     /// Rotations each front caused: fewer first when a start picks one.
     demoted: std::collections::HashMap<String, u32>,
+    disputes: Disputes,
     starting: bool,
     tx: tokio::sync::mpsc::UnboundedSender<Input>,
 }
@@ -545,7 +561,7 @@ impl Router {
         mut inputs: tokio::sync::mpsc::UnboundedReceiver<Input>,
         mut reports: tokio::sync::mpsc::UnboundedReceiver<(route::Report, bool)>,
     ) {
-        self.state = initial(self.mode, false, true);
+        self.state = initial(self.mode, true);
         // Starting direct (Auto): a session a router before this one left up goes now.
         if self.state != State::VeilProbing
             && let Some(t) = self.holder.lock().await.as_ref()
@@ -581,26 +597,11 @@ impl Router {
     }
 
     fn event(&mut self, input: Input) -> Option<Event> {
-        let via = |veil: bool, state: &State| match (veil, state) {
-            (true, State::VeilActive { relay, port, .. }) => Target::Veil {
-                port: *port,
-                relay: relay.clone(),
-            },
-            (true, _) => Target::Veil {
-                port: 0,
-                relay: String::new(),
-            },
-            (false, _) => Target::Direct,
-        };
         Some(match input {
             Input::Report((r, veil)) => {
-                let via = via(veil, &self.state);
+                let via = if veil { Via::Veil } else { Via::Direct };
                 match r {
-                    route::Report::RpcSucceeded { lane, latency_ms } => Event::RpcSucceeded {
-                        via,
-                        latency_ms,
-                        lane,
-                    },
+                    route::Report::RpcSucceeded { lane } => Event::RpcSucceeded { via, lane },
                     route::Report::RpcFailed { lane, failure } => Event::RpcFailed {
                         failure,
                         via,
@@ -608,23 +609,8 @@ impl Router {
                         foreground: true,
                         lane,
                     },
-                    route::Report::StreamOpened => Event::StreamOpened {
-                        method: if veil {
-                            StreamMethod::Veil
-                        } else {
-                            StreamMethod::H2
-                        },
-                        via,
-                    },
-                    route::Report::StreamFailed { failure } => Event::StreamFailed {
-                        method: if veil {
-                            StreamMethod::Veil
-                        } else {
-                            StreamMethod::H2
-                        },
-                        failure,
-                        via,
-                    },
+                    route::Report::StreamOpened => Event::StreamOpened { via },
+                    route::Report::StreamFailed { failure } => Event::StreamFailed { failure, via },
                 }
             }
             Input::Started { relay, port } => {
@@ -635,13 +621,12 @@ impl Router {
                     restarted: false,
                 }
             }
-            Input::StartFailed(reason) => {
+            Input::StartFailed => {
                 self.starting = false;
-                Event::ProxyStartFailed {
-                    relay: None,
-                    reason,
-                }
+                Event::ProxyStartFailed
             }
+            Input::Dialed { relay, up: true } => Event::FrontDialed { relay },
+            Input::Dialed { relay, up: false } => Event::FrontDialFailed { relay },
             Input::CooldownElapsed => Event::CooldownElapsed,
         })
     }
@@ -656,9 +641,9 @@ impl Router {
                         b.invalidate().await;
                     });
                 }
-                Effect::SetVeilPort(Some(port)) => route::set_route(Route::Veil { port }),
+                Effect::SetVeilPort { port: Some(port) } => route::set_route(Route::Veil { port }),
                 // Away from the tunnel: direct under Auto, nowhere under On.
-                Effect::SetVeilPort(None) => route::set_route(if self.mode == Mode::On {
+                Effect::SetVeilPort { port: None } => route::set_route(if self.mode == Mode::On {
                     Route::Closed
                 } else {
                     Route::Direct
@@ -670,11 +655,11 @@ impl Router {
                     }
                 }
                 Effect::RequestProxyStart => self.start(),
-                Effect::DemoteRelay(relay) => {
+                Effect::DemoteRelay { relay } => {
                     tracing::info!(front = %host(&relay), "VEIL front demoted");
                     *self.demoted.entry(relay).or_default() += 1;
                 }
-                Effect::ScheduleCooldownEnd(at_ms) => {
+                Effect::ScheduleCooldownEnd { at_ms } => {
                     let tx = self.tx.clone();
                     let wait = Duration::from_millis((at_ms - now_ms()).max(0) as u64);
                     tokio::spawn(async move {
@@ -686,8 +671,7 @@ impl Router {
         }
     }
 
-    /// Try the live fronts, the least demoted first, newest first among equals; the first that
-    /// answers is the tunnel.
+    /// Try the live fronts in [`dial_order`]; the first that answers is the tunnel.
     fn start(&mut self) {
         if self.starting {
             return;
@@ -698,33 +682,22 @@ impl Router {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .usable();
-        fronts.sort_by_key(|f| self.demoted.get(&f.relay).copied().unwrap_or(0));
-        let (holder, scores, sk, tx) = (
+        dial_order(&mut fronts, &self.demoted, &self.disputes);
+        let (holder, disputes, sk, tx) = (
             self.holder.clone(),
-            self.scores.clone(),
+            self.disputes.clone(),
             self.sk.clone(),
             self.tx.clone(),
         );
         tokio::spawn(async move {
-            let tunnel = {
-                let mut held = holder.lock().await;
-                if held.is_none() {
-                    match Tunnel::new(scores.as_deref()).await {
-                        Ok(t) => *held = Some(Arc::new(t)),
-                        Err(e) => {
-                            let _ = tx.send(Input::StartFailed(e));
-                            return;
-                        }
-                    }
-                }
-                held.clone().expect("set above")
-            };
-            if fronts.is_empty() {
-                let _ = tx.send(Input::StartFailed("no front".into()));
-                return;
-            }
+            let tunnel = holder
+                .lock()
+                .await
+                .get_or_insert_with(|| Arc::new(Tunnel::new()))
+                .clone();
             for front in &fronts {
-                match tunnel.start(front, &sk).await {
+                let on_dial = dial_observer(front.clone(), disputes.clone(), tx.clone());
+                match tunnel.start(front, &sk, on_dial).await {
                     Ok(port) => {
                         tracing::info!(front = %host(&front.relay), port, "VEIL tunnel up");
                         let _ = tx.send(Input::Started {
@@ -738,7 +711,8 @@ impl Router {
                     }
                 }
             }
-            let _ = tx.send(Input::StartFailed("no front answered".into()));
+            tracing::info!(fronts = fronts.len(), "no VEIL front answered");
+            let _ = tx.send(Input::StartFailed);
         });
     }
 
@@ -763,6 +737,43 @@ impl Router {
     }
 }
 
+/// The order fronts are dialled in: those whose key is disputed last, then the least demoted
+/// first, newest first among equals (as they come).
+fn dial_order(
+    fronts: &mut [Front],
+    demoted: &std::collections::HashMap<String, u32>,
+    disputes: &Disputes,
+) {
+    fronts.sort_by_key(|f| {
+        (
+            disputes.disputed(f),
+            demoted.get(&f.relay).copied().unwrap_or(0),
+        )
+    });
+}
+
+/// Hears the dials of a session to `front`: the pin's dispute is kept, the router is told. A dial
+/// to another address is a session that ended before this one.
+fn dial_observer(
+    front: Front,
+    disputes: Disputes,
+    tx: tokio::sync::mpsc::UnboundedSender<Input>,
+) -> DialObserver {
+    Arc::new(move |relay, outcome| {
+        if relay != front.relay {
+            return;
+        }
+        if outcome == DialOutcome::PinMismatch {
+            tracing::warn!(front = %host(relay), "VEIL front answered under another key");
+        }
+        disputes.dialed(relay, &front.spki, outcome);
+        let _ = tx.send(Input::Dialed {
+            relay: relay.to_owned(),
+            up: outcome == DialOutcome::Up,
+        });
+    })
+}
+
 /// A state for the log: the front by its label, not its name.
 struct Brief<'a>(&'a State);
 
@@ -780,23 +791,27 @@ impl std::fmt::Debug for Brief<'_> {
 /// While signed in, in any mode: a key-bound capability for this device and the fronts that come
 /// with it, renewed before it ends. Whatever route is up carries the request — direct, or the
 /// tunnel; with the mode on and no tunnel, it waits.
-async fn provision(grpc: crate::grpc::GrpcClient, store: LocalStore, status: Status) {
+///
+/// A front whose key is disputed does not count as one held: its coordinates are asked for again,
+/// once, and then no sooner than in an hour.
+async fn provision(
+    grpc: crate::grpc::GrpcClient,
+    store: LocalStore,
+    disputes: Disputes,
+    status: Status,
+) {
     let sk = match veil_sk(&store) {
         Ok(sk) => sk,
         Err(e) => return tracing::warn!("{e}"),
     };
     let pk = veil_pk(&sk);
     loop {
-        let fresh = fronts(&store)
-            .iter()
-            .any(|f| f.version == 2 && f.not_after - now() > RENEW_BEFORE);
-        if fresh {
-            tokio::time::sleep(ISSUE_RECHECK).await;
+        let held = fronts(&store);
+        if holds_fresh(&held, &disputes, now()) {
+            let _ = tokio::time::timeout(ISSUE_RECHECK, disputes.raised()).await;
             continue;
         }
-        // The server picks the front by the address asked for, one this device holds. No front
-        // is built in: the first comes in a link or a voucher, and this renews and widens it.
-        let Some(relay_address) = fronts(&store).first().map(|f| f.relay.clone()) else {
+        let Some(relay_address) = asked_for(&held, &disputes) else {
             tokio::time::sleep(ISSUE_RETRY).await;
             continue;
         };
@@ -832,7 +847,7 @@ async fn provision(grpc: crate::grpc::GrpcClient, store: LocalStore, status: Sta
                     }))
                     .enumerate()
                 {
-                    match trust::accept_entry(&e, &known, &pk, now) {
+                    match trust::accept_entry(&e, &known, &disputes, &pk, now) {
                         Ok(f) => accepted.push(f),
                         Err(why) => tracing::warn!(entry = i, "VEIL front refused: {why}"),
                     }
@@ -844,6 +859,9 @@ async fn provision(grpc: crate::grpc::GrpcClient, store: LocalStore, status: Sta
                 let held = merge(&store, accepted).len();
                 tracing::info!(fronts = held, "VEIL capability issued");
                 status.update(|s| s.fronts = held);
+                // What was issued may still leave none that is fresh: every one disputed under
+                // the key the server also has. Asking on would be a loop of requests.
+                tokio::time::sleep(ISSUE_RECHECK).await;
             }
             Err(e) => {
                 tracing::debug!("VEIL capability not issued yet: {e}");
@@ -852,3 +870,24 @@ async fn provision(grpc: crate::grpc::GrpcClient, store: LocalStore, status: Sta
         }
     }
 }
+
+/// Whether this device holds a capability of its own with a while to live, for a front whose key
+/// nothing disputes.
+fn holds_fresh(fronts: &[Front], disputes: &Disputes, now: i64) -> bool {
+    fronts
+        .iter()
+        .any(|f| f.version == 2 && f.not_after - now > RENEW_BEFORE && !disputes.disputed(f))
+}
+
+/// The front to ask by: the server picks one by its address, which this device must hold. No front
+/// is built in: the first comes in a link or a voucher, and asking renews and widens it.
+fn asked_for(fronts: &[Front], disputes: &Disputes) -> Option<String> {
+    fronts
+        .iter()
+        .find(|f| !disputes.disputed(f))
+        .or(fronts.first())
+        .map(|f| f.relay.clone())
+}
+
+#[cfg(test)]
+mod tests;

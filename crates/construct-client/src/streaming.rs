@@ -215,8 +215,8 @@ async fn run_worker(
             }
             Err(e) => {
                 warn!("MessageStream open failed: {e}");
-                use crate::veil::transport_route::StreamFailure;
-                if crate::grpc::route::classify(&e).is_some() {
+                use construct_core::rule_state::transport_route::StreamFailure;
+                if crate::grpc::route::stream_failure_counts(&e) {
                     let failure = if e.to_string().contains("timed out") {
                         StreamFailure::OpenTimeout
                     } else {
@@ -299,7 +299,8 @@ async fn run_worker(
         // The loop leaves only when the stream died under us (a command returns instead).
         crate::grpc::route::report(
             crate::grpc::route::Report::StreamFailed {
-                failure: crate::veil::transport_route::StreamFailure::MidSessionUnknown,
+                failure:
+                    construct_core::rule_state::transport_route::StreamFailure::MidSessionUnknown,
             },
             disruptions,
         );

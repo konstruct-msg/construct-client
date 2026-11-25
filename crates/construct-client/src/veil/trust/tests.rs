@@ -84,6 +84,7 @@ fn an_issued_front_passes_every_gate_or_is_refused() {
     let front = accept_entry_with(
         &entry("front.example:443", SPKI, &cap, 2, &sig),
         &[],
+        &Disputes::default(),
         &our_pk,
         NOW,
         &key,
@@ -100,6 +101,7 @@ fn an_issued_front_passes_every_gate_or_is_refused() {
         accept_entry_with(
             &entry("evil.example:443", SPKI, &cap, 2, &sig),
             &[],
+            &Disputes::default(),
             &our_pk,
             NOW,
             &key
@@ -111,6 +113,7 @@ fn an_issued_front_passes_every_gate_or_is_refused() {
         accept_entry_with(
             &entry("front.example:443", SPKI, &cap, 2, &sig),
             &[],
+            &Disputes::default(),
             &our_pk,
             NOW,
             &[1; 32]
@@ -122,6 +125,7 @@ fn an_issued_front_passes_every_gate_or_is_refused() {
         accept_entry_with(
             &entry("front.example:443", SPKI, &cap, 2, &sig),
             &[],
+            &Disputes::default(),
             &[8; 32],
             NOW,
             &key
@@ -134,6 +138,7 @@ fn an_issued_front_passes_every_gate_or_is_refused() {
         accept_entry_with(
             &entry("front.example:443", SPKI, &old, 2, &sig),
             &[],
+            &Disputes::default(),
             &our_pk,
             NOW,
             &key
@@ -147,6 +152,7 @@ fn an_issued_front_passes_every_gate_or_is_refused() {
         accept_entry_with(
             &entry("front.example:443", SPKI, &forged, 2, &sig),
             &[],
+            &Disputes::default(),
             &our_pk,
             NOW,
             &key
@@ -162,12 +168,121 @@ fn an_issued_front_passes_every_gate_or_is_refused() {
         accept_entry_with(
             &entry("front.example:443", SPKI, &cap, 2, &sig),
             &[known],
+            &Disputes::default(),
             &our_pk,
             NOW,
             &key
         ),
         Err(Refused::SpkiChanged)
     );
+}
+
+/// A known front takes a new key only once a dial to it has met another one, and only signed; the
+/// front under the new key is no longer disputed.
+#[test]
+fn a_front_whose_key_is_disputed_is_learned_again_signed() {
+    let our_pk = [9; 32];
+    let cap = bound(our_pk, (NOW + 3600) as u64);
+    let sig = sign(&canonical_tuple(
+        "front.example:443",
+        "cdn.example",
+        SPKI,
+        NOW + 3600,
+    ));
+    let key = issuer_key();
+    let old = Front {
+        relay: "Front.example:443".into(),
+        sni: "cdn.example".into(),
+        spki: "cd".repeat(32),
+        not_after: NOW + 3600,
+        capability: String::new(),
+        version: 2,
+    };
+    let take = |disputes: &Disputes, sig: &str| {
+        accept_entry_with(
+            &entry("front.example:443", SPKI, &cap, 2, sig),
+            std::slice::from_ref(&old),
+            disputes,
+            &our_pk,
+            NOW,
+            &key,
+        )
+    };
+    let disputes = Disputes::default();
+    disputes.dialed(&old.relay, &old.spki, DialOutcome::Failed);
+    assert_eq!(
+        take(&disputes, &sig),
+        Err(Refused::SpkiChanged),
+        "no answer is not another key"
+    );
+    disputes.dialed(&old.relay, &old.spki, DialOutcome::PinMismatch);
+    assert_eq!(take(&disputes, &sign(b"other")), Err(Refused::BadSignature));
+    let front = take(&disputes, &sig).expect("learned again");
+    assert!(disputes.disputed(&old) && !disputes.disputed(&front));
+
+    // A link is held to the same.
+    let cap = base64::engine::general_purpose::STANDARD.encode(bearer((NOW + 7200) as u64));
+    let link = link(serde_json::json!({
+        "relay": "front.example:443",
+        "spki": SPKI,
+        "capability": cap,
+        "exp": NOW + 3600,
+    }));
+    let known = std::slice::from_ref(&old);
+    assert_eq!(
+        import_link_with(&link, known, &Disputes::default(), NOW, &key),
+        Err(Refused::SpkiChanged)
+    );
+    assert!(import_link_with(&link, known, &disputes, NOW, &key).is_ok());
+}
+
+/// A dispute is of one pin at one address: a dial that meets the pin ends it, a dial to the same
+/// address under another pin does not.
+#[test]
+fn a_dispute_ends_when_a_dial_meets_the_key() {
+    let front = Front {
+        relay: "front.example:443".into(),
+        sni: String::new(),
+        spki: SPKI.into(),
+        not_after: NOW,
+        capability: String::new(),
+        version: 2,
+    };
+    let disputes = Disputes::default();
+    disputes.dialed(
+        "FRONT.example:443",
+        &SPKI.to_uppercase(),
+        DialOutcome::PinMismatch,
+    );
+    assert!(disputes.disputed(&front));
+    let elsewhere = Front {
+        relay: "other.example:443".into(),
+        ..front.clone()
+    };
+    assert!(!disputes.disputed(&elsewhere));
+    disputes.dialed(&front.relay, &"cd".repeat(32), DialOutcome::Up);
+    disputes.dialed(&front.relay, SPKI, DialOutcome::Failed);
+    assert!(disputes.disputed(&front));
+    disputes.dialed(&front.relay, SPKI, DialOutcome::Up);
+    assert!(!disputes.disputed(&front));
+}
+
+/// A new dispute wakes whoever waits for one, once: the same key met again does not.
+#[tokio::test]
+async fn a_new_dispute_is_told_once() {
+    let disputes = Disputes::default();
+    let told = async |d: &Disputes| {
+        tokio::time::timeout(std::time::Duration::from_millis(20), d.raised())
+            .await
+            .is_ok()
+    };
+    assert!(!told(&disputes).await);
+    disputes.dialed("a:443", SPKI, DialOutcome::PinMismatch);
+    assert!(told(&disputes).await);
+    disputes.dialed("a:443", SPKI, DialOutcome::PinMismatch);
+    assert!(!told(&disputes).await);
+    disputes.dialed("a:443", &"cd".repeat(32), DialOutcome::PinMismatch);
+    assert!(told(&disputes).await);
 }
 
 fn link(fields: serde_json::Value) -> String {
@@ -194,7 +309,8 @@ fn a_config_link_is_taken_only_as_signed() {
     });
     let key = issuer_key();
     let good = link(fields.clone());
-    let front = import_link_with(&good, &[], NOW, &key).expect("a signed link");
+    let front =
+        import_link_with(&good, &[], &Disputes::default(), NOW, &key).expect("a signed link");
     assert_eq!(front.sni, "front.example");
     assert_eq!(front.version, 1);
     assert_eq!(
@@ -209,7 +325,7 @@ fn a_config_link_is_taken_only_as_signed() {
         .chunks(20)
         .map(|c| c.iter().collect::<String>() + "\n")
         .collect();
-    assert!(import_link_with(&wrapped, &[], NOW, &key).is_ok());
+    assert!(import_link_with(&wrapped, &[], &Disputes::default(), NOW, &key).is_ok());
 
     // A field changed after signing.
     let mut object: BTreeMap<String, serde_json::Value> =
@@ -218,7 +334,7 @@ fn a_config_link_is_taken_only_as_signed() {
     let tampered = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .encode(serde_json::to_vec(&object).unwrap());
     assert_eq!(
-        import_link_with(&tampered, &[], NOW, &key),
+        import_link_with(&tampered, &[], &Disputes::default(), NOW, &key),
         Err(Refused::BadSignature)
     );
 
@@ -226,7 +342,7 @@ fn a_config_link_is_taken_only_as_signed() {
     let mut stale = fields;
     stale["exp"] = (NOW - 1).into();
     assert_eq!(
-        import_link_with(&link(stale), &[], NOW, &key),
+        import_link_with(&link(stale), &[], &Disputes::default(), NOW, &key),
         Err(Refused::Expired)
     );
 }

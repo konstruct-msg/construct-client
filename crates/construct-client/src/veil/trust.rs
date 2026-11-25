@@ -5,12 +5,15 @@
 //! client pins, `relayConfigSigningKey`: as an entry point the server issues with a capability,
 //! or in a `konstruct://veil-config` link someone hands over. Its capability carries the same
 //! issuer's signature and a validity window, checked here as the relay checks it. A front this
-//! device already knows keeps its key: an entry naming the same address with another SPKI is
-//! refused, whatever signs it.
+//! device already knows keeps its key, whatever signs another, until a dial to it has met another
+//! key ([`Disputes`]); the rule is the core's (construct-rules `veil_fronts`).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
+use std::sync::{Arc, Mutex};
 
 use base64::Engine;
+use construct_core::rule_state::veil_fronts::{HeldPin, PinVerdict, judge_pin};
+use construct_veil::veil::DialOutcome;
 use construct_veil_protocol::{Capability, CapabilityV2};
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use serde::{Deserialize, Serialize};
@@ -50,6 +53,48 @@ impl Front {
     }
 }
 
+/// The pins a dial found something else behind: a front's address, and the key it did not have.
+/// Held for the life of the process — whether a network forges certificates is the network's doing
+/// (construct-docs `no-client-side-network-learning.md`) — and cleared by a dial that meets the key.
+#[derive(Debug, Clone, Default)]
+pub struct Disputes {
+    pins: Arc<Mutex<HashMap<String, String>>>,
+    raised: Arc<tokio::sync::Notify>,
+}
+
+impl Disputes {
+    /// What a dial to `relay`, pinned to `spki`, came to.
+    pub fn dialed(&self, relay: &str, spki: &str, outcome: DialOutcome) {
+        let (relay, spki) = (relay.to_ascii_lowercase(), spki.to_ascii_lowercase());
+        let mut pins = self.pins.lock().unwrap_or_else(|e| e.into_inner());
+        match outcome {
+            DialOutcome::PinMismatch => {
+                if pins.insert(relay, spki.clone()) != Some(spki) {
+                    self.raised.notify_one();
+                }
+            }
+            DialOutcome::Up => {
+                if pins.get(&relay) == Some(&spki) {
+                    pins.remove(&relay);
+                }
+            }
+            DialOutcome::Failed => {}
+        }
+    }
+
+    /// Whether this front's pin is disputed; a front under a newer key is not.
+    pub fn disputed(&self, front: &Front) -> bool {
+        let pins = self.pins.lock().unwrap_or_else(|e| e.into_inner());
+        pins.get(&front.relay.to_ascii_lowercase())
+            .is_some_and(|spki| front.spki.eq_ignore_ascii_case(spki))
+    }
+
+    /// Returns when a pin becomes disputed, or has since the last call.
+    pub async fn raised(&self) {
+        self.raised.notified().await;
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Refused {
     BadSignature,
@@ -57,7 +102,7 @@ pub enum Refused {
     Expired,
     /// A key-bound capability for another device's key.
     NotOurKey,
-    /// The address is known here with another key.
+    /// The address is known here with another key, and no dial has met another one there.
     SpkiChanged,
     Malformed(&'static str),
 }
@@ -157,19 +202,22 @@ pub struct Entry<'a> {
 }
 
 /// An issued entry point, through iOS's gates: its coordinates are signed, its capability is the
-/// issuer's and live (and ours, if key-bound), and an address already known here keeps its key.
+/// issuer's and live (and ours, if key-bound), and an address already known here keeps its key
+/// unless that key is disputed.
 pub fn accept_entry(
     e: &Entry<'_>,
     known: &[Front],
+    disputes: &Disputes,
     our_pk: &[u8; 32],
     now: i64,
 ) -> Result<Front, Refused> {
-    accept_entry_with(e, known, our_pk, now, &relay_config_signing_key())
+    accept_entry_with(e, known, disputes, our_pk, now, &relay_config_signing_key())
 }
 
 fn accept_entry_with(
     e: &Entry<'_>,
     known: &[Front],
+    disputes: &Disputes,
     our_pk: &[u8; 32],
     now: i64,
     key: &[u8; 32],
@@ -185,7 +233,7 @@ fn accept_entry_with(
         return Err(Refused::BadSignature);
     }
     let not_after = check_capability(e.capability, e.version, Some(our_pk), now, key)?;
-    pinned_alike(known, e.relay, e.spki)?;
+    pin_of_signed(known, disputes, e.relay, e.spki)?;
     Ok(Front {
         relay: e.relay.to_owned(),
         sni: e.sni.to_owned(),
@@ -200,23 +248,43 @@ fn valid_spki(spki: &str) -> bool {
     spki.len() == 64 && spki.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
-fn pinned_alike(known: &[Front], relay: &str, spki: &str) -> Result<(), Refused> {
-    match known.iter().find(|f| f.relay.eq_ignore_ascii_case(relay)) {
-        Some(f) if !f.spki.eq_ignore_ascii_case(spki) => Err(Refused::SpkiChanged),
-        _ => Ok(()),
+/// The pin of coordinates whose signature and window were checked: the core's rule. There is no
+/// public anchor on this client, every front is learned.
+fn pin_of_signed(
+    known: &[Front],
+    disputes: &Disputes,
+    relay: &str,
+    spki: &str,
+) -> Result<(), Refused> {
+    let held = known.iter().find(|f| f.relay.eq_ignore_ascii_case(relay));
+    let pin = held.map(|f| HeldPin {
+        spki: &f.spki,
+        disputed: disputes.disputed(f),
+    });
+    match judge_pin(None, pin, spki, true) {
+        PinVerdict::Same | PinVerdict::Learn | PinVerdict::Repin => Ok(()),
+        PinVerdict::Malformed => Err(Refused::Malformed("coordinates")),
+        PinVerdict::DiffersFromAnchor | PinVerdict::DiffersFromHeld => Err(Refused::SpkiChanged),
+        PinVerdict::Unsigned => Err(Refused::BadSignature),
     }
 }
 
 /// A `konstruct://veil-config?d=<base64url JSON>` link, a bare blob, or one pasted with spaces:
 /// the front it names, checked (`VeilConfigImporter.parseAndVerify`). The whole object minus
 /// `signature` is signed, as canonical JSON.
-pub fn import_link(input: &str, known: &[Front], now: i64) -> Result<Front, Refused> {
-    import_link_with(input, known, now, &relay_config_signing_key())
+pub fn import_link(
+    input: &str,
+    known: &[Front],
+    disputes: &Disputes,
+    now: i64,
+) -> Result<Front, Refused> {
+    import_link_with(input, known, disputes, now, &relay_config_signing_key())
 }
 
 fn import_link_with(
     input: &str,
     known: &[Front],
+    disputes: &Disputes,
     now: i64,
     key: &[u8; 32],
 ) -> Result<Front, Refused> {
@@ -260,7 +328,7 @@ fn import_link_with(
         1
     };
     let not_after = check_capability(&blob, version, None, now, key)?;
-    pinned_alike(known, relay, spki)?;
+    pin_of_signed(known, disputes, relay, spki)?;
     Ok(Front {
         relay: relay.to_owned(),
         sni: sni.to_owned(),
